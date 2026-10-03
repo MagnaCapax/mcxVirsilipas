@@ -104,8 +104,24 @@ switch ($model) {
         header('Content-Type: application/json');
         echo json_encode(['id' => ['PRIVATE-DETAIL'], 'choices' => [['index' => 0, 'message' => ['role' => 'assistant',
             'content' => ['private_account' => 'PRIVATE-DETAIL'],
-            'tool_calls' => [['index' => 0, 'id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => ['note' => 'PRIVATE-DETAIL']]]]],
+            'tool_calls' => [['index' => 0, 'id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => ['note' => 'PRIVATE-DETAIL']]],
+                ['index' => 1, 'id' => 'c2', 'type' => 'function', 'function' => ['name' => 'g', 'arguments' => '{}']]]],
             'finish_reason' => 'tool_calls']], 'usage' => $usage(1)]);
+        exit;
+    case 'scenario-incomplete-message':
+        header('Content-Type: application/json');
+        // Two choices, neither a usable answer: a partial tool call and null-only content.
+        echo '{"choices":[{"index":0,"message":{"tool_calls":[{"index":0}]}},{"index":1,"message":{"role":"assistant","content":null}}],"usage":' . json_encode($usage(1)) . '}';
+        exit;
+    case 'scenario-done-first':
+        header('Content-Type: text/event-stream');
+        echo "data: [DONE]\n\n" . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => 'late']]], 'usage' => $usage(1)]) . "\n\n";
+        exit;
+    case 'scenario-after-done':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'first']]], 'usage' => $usage(1)]);
+        echo "data: [DONE]\n\n";
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'AFTER-DONE']]], 'usage' => $usage(2)]);
         exit;
     case 'scenario-truncated':
         header('Content-Type: application/json');

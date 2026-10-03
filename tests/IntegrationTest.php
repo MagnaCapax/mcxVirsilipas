@@ -61,7 +61,8 @@ function testIntegrationFinalOnlyUsageStreamDebitsExactly(): void
 function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
     foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
-        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502], ['list-message', false, 502], ['empty-tool-call', false, 502], ['empty-tool-call', true, 502]] as [$model, $stream, $status]) {
+        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502], ['list-message', false, 502], ['empty-tool-call', false, 502], ['empty-tool-call', true, 502],
+        ['incomplete-message', false, 502], ['done-first', true, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));
@@ -140,6 +141,16 @@ function testIntegrationWrongTypedResponseValuesNeverReachTheClient(): void
     same(['index' => 0, 'id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f']], $msg['tool_calls'][0], 'object arguments dropped');
     check(!isset($msg['content']), 'object content dropped');
     settled($ref);
+}
+
+function testIntegrationNothingAfterTheTerminalMarkerIsRelayedOrCharged(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('after-done', true), $key);
+    same(200, $r['status']);
+    check(str_contains($r['body'], 'first') && !str_contains($r['body'], 'AFTER-DONE'), 'the event after [DONE] is not relayed');
+    settled($ref);
+    same(12, lastUsage($ref)['charged'], 'charged the usage seen before [DONE] (11 + 1), not the late report');
 }
 
 function testIntegrationHangUpWithoutUsageIsChargedAtMostTheReservation(): void

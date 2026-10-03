@@ -334,17 +334,31 @@ final class Proxy
     }
 
     /**
-     * A completion with at least one usable choice: a message or delta object carrying at least
-     * one valid field (a role-only first stream delta counts). What a 200 must carry.
+     * What a 200 must carry. A stream starts on a choice whose delta has at least one valid field
+     * (a role-only first delta counts). A non-stream answer must be complete: a message with
+     * non-empty text, reasoning or refusal, or a tool call with id, type, function name and
+     * arguments. Reasoning counts because an answer whose max_tokens went to reasoning is real,
+     * paid output.
      */
-    private static function hasChoices(mixed $j): bool
+    private static function hasChoices(mixed $j, bool $complete): bool
     {
         if (!is_array($j) || isset($j['error'])) {
             return false;
         }
         foreach (self::choices($j['choices'] ?? null) as $c) {
-            if (($c['message'] ?? []) !== [] || ($c['delta'] ?? []) !== []) {
+            if (!$complete && (($c['message'] ?? []) !== [] || ($c['delta'] ?? []) !== [])) {
                 return true;
+            }
+            $m = $c['message'] ?? [];
+            foreach (['content', 'reasoning_content', 'refusal'] as $k) {
+                if ($complete && is_string($m[$k] ?? null) && $m[$k] !== '') {
+                    return true;
+                }
+            }
+            foreach ($complete ? ($m['tool_calls'] ?? []) : [] as $t) {
+                if (isset($t['id'], $t['type'], $t['function']['name'], $t['function']['arguments'])) {
+                    return true;
+                }
             }
         }
         return false;
@@ -426,11 +440,11 @@ final class Proxy
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
         $handle = static function (string $event) use (&$s, $alias, $reserved): string {
             $e = self::parseEvent($event);
-            if ($e === null) {
-                return '';
+            if ($e === null || $s['done']) {
+                return ''; // nothing after the terminal marker is relayed or counted
             }
             if ($e['done']) {
-                $s['done'] = true;
+                $s['done'] = true; // a [DONE] before any choice leaves the stream unstarted: a 502, no charge
                 return "data: [DONE]\n\n";
             }
             $j = $e['json'];
@@ -451,7 +465,7 @@ final class Proxy
                 $s['unmetered'] = 0;
                 $s['over'] = $u['total'] > $reserved;
             }
-            if (self::hasChoices($j)) {
+            if (self::hasChoices($j, false)) {
                 $s['start'] = true;
             } elseif (!$s['started']) {
                 return ''; // nothing is relayed before the first event with a choice; its usage is kept
@@ -543,7 +557,7 @@ final class Proxy
         }
 
         $json = (!$stream && $curlErr === 0 && $status >= 200 && $status <= 299) ? json_decode($s['full'], true) : null;
-        if (self::hasChoices($json)) {
+        if (self::hasChoices($json, true)) {
             http_response_code(200);
             header('Content-Type: application/json');
             echo json_encode(self::publicView($json, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

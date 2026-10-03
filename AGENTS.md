@@ -19,7 +19,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 2. Every lease is settled at most once. An expired, unsettled lease stays charged at its reservation; a late settle returns the difference once.
 3. A grant is applied once per `grant_id`; reusing a `grant_id` for anything else is a conflict. Balances stay far inside the 64-bit range.
 4. No transaction or statement is open while a request streams.
-5. The client never gets a 200 unless the upstream answered 2xx with a completion that has a usable choice (a message or delta object), or a stream whose first relayed event has one.
+5. The client never gets a 200 unless the upstream answered 2xx with a usable answer (non-empty text, reasoning or refusal, or a complete tool call), or a stream whose first relayed event has a delta with a valid field. Nothing after a stream's [DONE] is relayed or charged.
 6. Missing or malformed usage is never read as zero; it is charged an upper bound, capped and flagged. Usage is exact only with all three integer counts and a total at least prompt plus completion. In a stream, only a report that advances the total covers the text delivered before it.
 7. Only allowlisted request fields and text content go upstream; the prompt bound counts every forwarded byte.
 8. Responses are rebuilt from allowlisted fields, each value of its expected type: the alias and the three standard usage counts. Upstream error text, costs, provider fields and model ids never reach the client.
