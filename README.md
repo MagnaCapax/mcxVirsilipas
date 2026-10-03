@@ -53,6 +53,16 @@ Point your web server at `public/index.php` for every path. The config path can 
 
 The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, stop the php-fpm pool or block the port. To stop one customer, disable their key.
 
+### Backups
+
+The database holds every balance, so back it up. Do not copy the file while the proxy runs: in WAL mode recent writes live in the `-wal` file, and a plain copy can miss them or be inconsistent. Use SQLite's online backup instead, which is safe while requests are running:
+
+```sh
+sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).sqlite'"
+```
+
+To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
+
 ## Endpoints
 
 Customer side, authenticated with `Authorization: Bearer <key>`:
@@ -94,6 +104,12 @@ php tests/run.php integration
 
 The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time.
 
+## Attribution
+
+Author: Aleksi Ursin / MCX (with Väinämöinen) — [Pulsed Media](https://pulsedmedia.com)
+
+"OpenAI-compatible" describes the API format this proxy speaks. OpenAI is a trademark of OpenAI; this project is not affiliated with or endorsed by OpenAI.
+
 ## License
 
-Apache License 2.0. See LICENSE and NOTICE.
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

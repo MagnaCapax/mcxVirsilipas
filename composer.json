@@ -3,6 +3,13 @@
   "description": "Small PHP proxy that meters LLM tokens per API key against a prepaid, never-expiring balance",
   "type": "project",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/MagnaCapax/mcxVirsilipas",
+  "authors": [
+    {
+      "name": "Aleksi Ursin / MCX (with Väinämöinen)",
+      "homepage": "https://pulsedmedia.com"
+    }
+  ],
   "require": {
     "php": ">=8.2",
     "ext-curl": "*",

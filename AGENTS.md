@@ -8,7 +8,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 
 - **License:** Apache-2.0. New files carry no per-file headers; LICENSE and NOTICE cover the project.
 - **No dependencies.** PHP >= 8.2 with `curl` and `pdo_sqlite`. Do not add Composer packages.
-- **Provider-agnostic.** No upstream vendor, hostname or product name in code, docs, tests or commit messages. The upstream and model list live only in the deployer's config.
+- **Provider-agnostic.** Never say which upstream a deployment uses: no upstream vendor, hostname, model id or product name in code, docs, tests or commit messages. The upstream and model list live only in the deployer's config. Naming the API format ("OpenAI-compatible") is fine; it is not a provider choice.
 - **Privacy.** Never log or store request or response bodies, not even in error paths. Usage rows hold counts only.
 - **Fail closed.** Any doubt about the key, the balance or the database means the request is refused.
 - **Keep it small.** Each feature has to earn its lines. If something can be done by the firewall, the web server or the billing system, leave it there.
@@ -40,4 +40,4 @@ tests/             plain PHP runner (php tests/run.php), fake upstream, end-to-e
 
 ## Before you change behaviour
 
-Run `php tests/run.php`. Add a test for any change to metering, settling, grants or error handling. Never weaken the invariants above to make a test pass.
+Run `php tests/run.php` (CI runs the same suite on every push). Add a test for any change to metering, settling, grants or error handling. Never weaken the invariants above to make a test pass. When behaviour changes, update README.md in the same commit.
