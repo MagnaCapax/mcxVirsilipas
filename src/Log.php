@@ -11,7 +11,8 @@ namespace MagnaCapax\Virsilipas;
  *
  * Records hold event names, counts, statuses and billing references only. They never hold
  * request or response bodies, prompts, keys, the admin token, upstream error text or client
- * addresses. Logging is best effort: a failed write never fails or delays a request.
+ * addresses. Logging is best effort: a failed write never fails or delays a request. A daily
+ * file that group or others can read is never appended to; its records go to error_log.
  */
 final class Log
 {
@@ -42,14 +43,27 @@ final class Log
         if ($line === false) {
             return;
         }
-        if (self::$dir !== null) {
-            $umask = umask(0077);
-            $ok = @file_put_contents(self::$dir . '/' . gmdate('Ymd') . '.jsonl', $line . "\n", FILE_APPEND | LOCK_EX);
-            umask($umask);
-            if ($ok !== false) {
-                return;
-            }
+        if (self::$dir !== null && self::append(self::$dir . '/' . gmdate('Ymd') . '.jsonl', $line . "\n")) {
+            return;
         }
         error_log('virsilipas ' . $line);
+    }
+
+    /** Appends to a new (created 0600) or private daily file; false if it cannot, never throws. */
+    private static function append(string $file, string $data): bool
+    {
+        $umask = umask(0077);
+        try {
+            clearstatcache(true, $file);
+            $perms = @fileperms($file);
+            if ($perms !== false && ($perms & 0077) !== 0) {
+                return false; // readable by others: never append to it
+            }
+            return @file_put_contents($file, $data, FILE_APPEND | LOCK_EX) !== false;
+        } catch (\Throwable) {
+            return false;
+        } finally {
+            umask($umask);
+        }
     }
 }

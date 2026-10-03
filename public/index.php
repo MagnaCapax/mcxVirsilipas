@@ -34,13 +34,15 @@ try {
         default => throw new HttpError(404, 'not found'),
     };
 } catch (HttpError $e) {
-    Log::write('info', 'refused', ['path' => $path, 'status' => $e->status, 'reason' => $e->getMessage()]);
+    // The reason is one of the proxy's fixed messages; the request path is client text and is not logged.
+    Log::write('info', 'refused', ['status' => $e->status, 'reason' => $e->getMessage()]);
     if (!headers_sent()) {
         $e->send();
     }
 } catch (\Throwable $e) {
-    // Fail closed. Log the class and message only: never request or response bodies.
-    Log::write('error', 'exception', ['class' => get_class($e), 'message' => $e->getMessage()]);
+    // Fail closed. Log the class and the code location only: an exception message can carry
+    // data. `bin/virsilipas` prints configuration errors in full.
+    Log::write('error', 'exception', ['class' => get_class($e), 'at' => basename($e->getFile()) . ':' . $e->getLine()]);
     if (!headers_sent()) {
         (new HttpError(500, 'internal error', 'api_error'))->send();
     }

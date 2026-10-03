@@ -156,7 +156,8 @@ if ($o['processes'] === 1) {
 $elapsed = microtime(true) - $t0;
 
 $ok = array_values(array_filter($results, static fn ($r) => $r['status'] === 200));
-$statusCounts = array_count_values(array_map(static fn ($r) => (string) $r['status'], $results));
+// An object even when the only status is 0 (transport failure), which json_encode would make a list.
+$statusCounts = (object) array_count_values(array_map(static fn ($r) => (string) $r['status'], $results));
 $tokens = array_sum(array_map(static fn ($r) => $r['tokens'] ?? 0, $ok));
 $ledgerExact = null;
 if ($before !== null) {

@@ -30,7 +30,9 @@ jobs:
           php -l bin/virsilipas > /dev/null
 
       - name: Test suite (unit, end-to-end and load smoke)
-        run: php tests/run.php 2>&1 | tee test-output.log
+        run: |
+          set -o pipefail
+          php tests/run.php 2>&1 | tee test-output.log
 
       - name: Upload test output
         if: failure()

@@ -66,10 +66,10 @@ final class Proxy
             $this->config->leaseSeconds,
         );
 
-        Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
-            'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
         $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
         try {
+            Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
+                'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
             $body = self::rewrite($req, $this->config->models[$alias], $lease['max_tokens'], $stream, $this->config->streamOptions);
             $result = $this->forward($body, $stream, $alias, $lease['reserved']);
         } finally {

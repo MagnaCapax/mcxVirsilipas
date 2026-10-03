@@ -24,7 +24,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 7. Only allowlisted request fields and text content go upstream; the prompt bound counts every forwarded byte.
 8. Responses are rebuilt from allowlisted fields, each value of its expected type: the alias and the three standard usage counts. Upstream error text, costs, provider fields and model ids never reach the client.
 9. Lease ids are never reused (`AUTOINCREMENT`).
-10. Log records hold event names, counts, statuses and billing references only: never request or response bodies, prompts, keys, the admin token, upstream error text or client addresses. A failed log write never fails a request.
+10. Log records hold event names, counts, statuses and billing references only: never request or response bodies, prompts, keys, the admin token, upstream error text, request paths, exception messages or client addresses. A failed log write never fails a request.
 
 ## Layout
 

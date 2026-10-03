@@ -339,6 +339,7 @@ function testIntegrationLogsRecordEventsButNeverBodiesOrKeys(): void
     $body = ['model' => 'ok', 'stream' => true, 'messages' => [['role' => 'user', 'content' => $secret]]];
     same(200, http('POST', '/v1/chat/completions', $body, $key)['status']);
     same(401, http('POST', '/admin/grants', ['ref' => $ref, 'grant_id' => 'g', 'tokens' => 1], 'wrong-admin-token')['status']);
+    same(404, http('GET', "/v1/$key/$secret", null, $key)['status']); // client text in the path is not logged
     settled($ref);
     for ($i = 0; $i < 50; $i++) { // the record is written just after the settlement settled() waits for
         $log = implode('', array_map('file_get_contents', glob(Harness::get()['dir'] . '/logs/*.jsonl')));
@@ -352,6 +353,7 @@ function testIntegrationLogsRecordEventsButNeverBodiesOrKeys(): void
     same(1, count($mine), 'one request record for the request');
     same(['info', 'ok', true, true, false], [$mine[0]['level'], $mine[0]['alias'], $mine[0]['stream'], $mine[0]['delivered'], $mine[0]['estimated']]);
     check(in_array('admin_auth_failed', array_column($records, 'event'), true), 'a failed admin authentication is logged');
+    check(in_array(404, array_column(array_filter($records, static fn ($r) => ($r['event'] ?? '') === 'refused'), 'status'), true), 'the 404 is logged');
     check(!str_contains($log, $secret), 'the prompt never reaches the log');
     check(!str_contains($log, $key) && !str_contains($log, 'wrong-admin-token'), 'no key or token reaches the log');
     check(!str_contains($log, 'hello world') && !str_contains($log, 'PRIVATE-DETAIL'), 'no response text reaches the log');
@@ -382,4 +384,22 @@ function testIntegrationLoadSmokeUnderParallelStreams(): void
     proc_close($p);
     $r = json_decode($m[1] ?? 'null', true);
     check(($r['status_counts']['429'] ?? 0) > 0 && $r['ledger_exact'] === true, 'cap refusals are 429 and the ledger stays exact: ' . json_encode($r));
+}
+
+/** A run where every request fails to connect: a tagged fail line, status_counts keyed "0", exit 1. */
+function testIntegrationBenchReportsTransportFailuresAsAStatusMap(): void
+{
+    $s = stream_socket_server('tcp://127.0.0.1:0');
+    $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
+    fclose($s); // nothing listens on this port now
+    $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+    $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', "--url=http://127.0.0.1:$port", '--requests=2', '--no-ledger-check', '--timeout=5'],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    $out = stream_get_contents($pipes[1]);
+    stream_get_contents($pipes[2]);
+    $code = proc_close($p);
+    check(preg_match('/^\[virsilipas-bench\] (\{.*\})$/m', $out, $m) === 1, "one result line expected, got: $out");
+    check(str_contains($m[1], '"status_counts":{"0":2}'), "status_counts stays an object: {$m[1]}");
+    same(['fail', 2], [json_decode($m[1], true)['status'], json_decode($m[1], true)['errors']]);
+    same(1, $code);
 }

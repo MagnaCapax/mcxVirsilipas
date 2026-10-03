@@ -91,20 +91,20 @@ Request and response bodies are never stored or logged. The usage table holds to
 
 ## Logging
 
-Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMMDD.jsonl`, a new file each UTC day, appended under a lock so parallel workers never interleave. Without `log_dir`, the same lines go to PHP's `error_log`. Every record has `ts`, `level` and `event`, plus counts, statuses and billing references; never bodies, prompts, keys, the admin token, upstream error text or client addresses. A failed log write never affects a request.
+Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMMDD.jsonl`, a new file each UTC day, appended under a lock so parallel workers never interleave. Without `log_dir`, the same lines go to PHP's `error_log`. Every record has `ts`, `level` and `event`, plus counts, statuses and billing references; never bodies, prompts, keys, the admin token, upstream error text, request paths or client addresses. A failed log write never affects a request. New daily files are created with mode 600, and a daily file that group or others can read is never appended to (its records go to `error_log` instead).
 
 | `log_level` | Adds | Events |
 |---|---|---|
-| `error` | unexpected failures | `exception` |
+| `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
 | `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (4xx with path and reason), `key_create`, `key_active`, `grant` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `key_create`, `key_active`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
 The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
 
 ## Parallelism
 
-Each request runs in its own php-fpm worker for its whole duration, so `pm.max_children` is the proxy's global concurrency limit; `max_concurrent_per_key` stops one key from taking more than its share, and an upstream that is busy returns 429 to the client without a charge. The ledger is one SQLite file in WAL mode: every write is a short transaction, nothing is held open while a request streams, and other writers wait up to 10 seconds. Measured with the load tool below on the PHP built-in server: 30 concurrent streams on 6 keys, 600 requests, no errors, no locked-database waits, and every key debited exactly what was reported to it.
+Each request holds one php-fpm worker for its whole duration, so `pm.max_children` caps how many requests the proxy serves at once; `max_concurrent_per_key` stops one key from taking more than its share, and an upstream that is busy returns 429 to the client without a charge. The ledger is one SQLite file in WAL mode: every write is a short transaction, nothing is held open while a request streams, and other writers wait up to 10 seconds. Measured with the load tool below on the PHP built-in server: 30 concurrent streams on 6 keys, 600 requests, no errors (no locked-database failures among them), and every key debited exactly what was reported to it. Size `pm.max_children` for your own peak and measure it with the tool on your deployment.
 
 ## Load testing
 
