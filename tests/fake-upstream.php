@@ -113,6 +113,32 @@ switch ($model) {
         // Two choices, neither a usable answer: a partial tool call and null-only content.
         echo '{"choices":[{"index":0,"message":{"tool_calls":[{"index":0}]}},{"index":1,"message":{"role":"assistant","content":null}}],"usage":' . json_encode($usage(1)) . '}';
         exit;
+    case 'scenario-blank-tool':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [
+            ['index' => 0, 'message' => ['tool_calls' => [['id' => '', 'type' => 'function', 'function' => ['name' => '', 'arguments' => '']]]]],
+            ['index' => 1, 'message' => ['tool_calls' => [['id' => 'c', 'type' => 'other', 'function' => ['name' => 'f', 'arguments' => '{}']]]]],
+        ], 'usage' => $usage(1)]);
+        exit;
+    case 'scenario-stream-message':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'hi']]], 'usage' => $usage(1)]);
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-invalid-prelude':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => ['a' => ['index' => 0, 'delta' => ['content' => str_repeat('X', 1000)]]]]); // not a list: dropped
+        $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant']]]]);
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'ok']]]]);
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-done-hang':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'ok']]], 'usage' => $usage(1)]);
+        echo "data: [DONE]\n\n";
+        flush();
+        sleep(3); // an upstream that keeps the connection open after its terminal marker
+        exit;
     case 'scenario-done-first':
         header('Content-Type: text/event-stream');
         echo "data: [DONE]\n\n" . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => 'late']]], 'usage' => $usage(1)]) . "\n\n";

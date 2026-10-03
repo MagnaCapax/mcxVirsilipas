@@ -346,17 +346,21 @@ final class Proxy
             return false;
         }
         foreach (self::choices($j['choices'] ?? null) as $c) {
-            if (!$complete && (($c['message'] ?? []) !== [] || ($c['delta'] ?? []) !== [])) {
-                return true;
+            if (!$complete) {
+                if (($c['delta'] ?? []) !== []) {
+                    return true; // a stream starts only on a delta, never on a non-stream message
+                }
+                continue;
             }
             $m = $c['message'] ?? [];
             foreach (['content', 'reasoning_content', 'refusal'] as $k) {
-                if ($complete && is_string($m[$k] ?? null) && $m[$k] !== '') {
-                    return true;
+                if (($m[$k] ?? '') !== '') {
+                    return true; // typed() already guarantees string or null
                 }
             }
-            foreach ($complete ? ($m['tool_calls'] ?? []) : [] as $t) {
-                if (isset($t['id'], $t['type'], $t['function']['name'], $t['function']['arguments'])) {
+            foreach ($m['tool_calls'] ?? [] as $t) {
+                if (($t['id'] ?? '') !== '' && ($t['type'] ?? '') === 'function'
+                    && ($t['function']['name'] ?? '') !== '' && ($t['function']['arguments'] ?? '') !== '') {
                     return true;
                 }
             }
@@ -452,8 +456,16 @@ final class Proxy
                 $s['bad'] = !$s['started'];
                 return '';
             }
-            foreach ((is_array($j['choices'] ?? null) ? $j['choices'] : []) as $choice) {
-                $n = self::textBytes(is_array($choice) ? ($choice['delta'] ?? null) : null);
+            if (self::hasChoices($j, false)) {
+                $s['start'] = true;
+            }
+            // Nothing is relayed before the first event with a usable delta; such events add no
+            // bytes to the charge (their usage, if valid, is still kept). Bytes are counted from
+            // the rebuilt event the client receives, never from raw upstream text.
+            $relay = $s['started'] || $s['start'];
+            $view = self::publicView($j, $alias);
+            foreach ($relay ? ($view['choices'] ?? []) : [] as $choice) {
+                $n = self::textBytes($choice['delta'] ?? null);
                 $s['bytes'] += $n;
                 $s['unmetered'] += $n;
             }
@@ -465,12 +477,7 @@ final class Proxy
                 $s['unmetered'] = 0;
                 $s['over'] = $u['total'] > $reserved;
             }
-            if (self::hasChoices($j, false)) {
-                $s['start'] = true;
-            } elseif (!$s['started']) {
-                return ''; // nothing is relayed before the first event with a choice; its usage is kept
-            }
-            return 'data: ' . json_encode(self::publicView($j, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n";
+            return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };
 
         $ch = curl_init($this->config->upstreamUrl);
@@ -515,7 +522,7 @@ final class Proxy
                 }
                 if (!$s['started']) {
                     if (!$s['start']) {
-                        return $len; // nothing to relay yet
+                        return $s['done'] ? 0 : $len; // nothing to relay yet ([DONE] first: stop, it is a 502)
                     }
                     $s['started'] = true;
                     while (ob_get_level() > 0) {
@@ -534,7 +541,9 @@ final class Proxy
                     $s['aborted'] = true;
                     return 0; // a short write makes curl stop the upstream request
                 }
-                return $s['over'] ? 0 : $len; // usage past the reservation: stop paying for more
+                // Usage past the reservation: stop paying for more. [DONE]: the answer is complete, so
+                // do not hold the worker and the key's concurrency slot while the upstream lingers.
+                return ($s['over'] || $s['done']) ? 0 : $len;
             },
         ]);
         curl_exec($ch);

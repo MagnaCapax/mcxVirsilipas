@@ -62,7 +62,7 @@ function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
     foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
         ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502], ['list-message', false, 502], ['empty-tool-call', false, 502], ['empty-tool-call', true, 502],
-        ['incomplete-message', false, 502], ['done-first', true, 502]] as [$model, $stream, $status]) {
+        ['incomplete-message', false, 502], ['done-first', true, 502], ['blank-tool', false, 502], ['stream-message', true, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));
@@ -151,6 +151,30 @@ function testIntegrationNothingAfterTheTerminalMarkerIsRelayedOrCharged(): void
     check(str_contains($r['body'], 'first') && !str_contains($r['body'], 'AFTER-DONE'), 'the event after [DONE] is not relayed');
     settled($ref);
     same(12, lastUsage($ref)['charged'], 'charged the usage seen before [DONE] (11 + 1), not the late report');
+}
+
+function testIntegrationDroppedEventsAddNothingToTheCharge(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('invalid-prelude', true), $key);
+    same(200, $r['status']);
+    check(!str_contains($r['body'], 'XXXX'), 'the malformed event is not relayed');
+    settled($ref);
+    $u = lastUsage($ref);
+    same(1, $u['estimated'], 'no usage: an upper bound');
+    check($u['charged'] < 1000, "the 1,000 dropped bytes are not charged: got {$u['charged']}");
+}
+
+function testIntegrationTheUpstreamIsLeftAtTheTerminalMarker(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $t = microtime(true);
+    $r = http('POST', '/v1/chat/completions', msg('done-hang', true), $key);
+    $elapsed = microtime(true) - $t;
+    same(200, $r['status']);
+    check($elapsed < 2.0, sprintf('the request ends at [DONE], not when the upstream closes 3 s later: took %.1f s', $elapsed));
+    settled($ref);
+    same(12, lastUsage($ref)['charged']);
 }
 
 function testIntegrationHangUpWithoutUsageIsChargedAtMostTheReservation(): void
