@@ -172,6 +172,24 @@ function testReadableWalOrWorldWritableDirectoryIsRefused(): void
     chmod($dir, 0700);
 }
 
+function testNewDatabaseFilesArePrivateUnderAPermissiveUmask(): void
+{
+    $dir = tempDir();
+    chmod($dir, 0755);
+    $old = umask(0022);
+    try {
+        $l = new Ledger("$dir/ledger.sqlite");
+        $l->migrate();
+        $l->createKey('a'); // a write, so the WAL and shared-memory files exist
+        foreach (['ledger.sqlite', 'ledger.sqlite-wal', 'ledger.sqlite-shm'] as $f) {
+            same('600', decoct(fileperms("$dir/$f") & 0777), "$f is private");
+        }
+        same(0022, umask(), 'the caller umask is restored');
+    } finally {
+        umask($old);
+    }
+}
+
 function throwsRuntime(callable $fn): string
 {
     try {

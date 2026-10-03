@@ -35,10 +35,17 @@ final class Ledger
                 throw new \RuntimeException("ledger file $f is accessible to other users; chmod 600 it");
             }
         }
-        $this->db = new \PDO('sqlite:' . $path, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
-        $this->db->exec('PRAGMA busy_timeout = 10000');
-        $this->db->exec('PRAGMA journal_mode = WAL');
-        $this->db->exec('PRAGMA foreign_keys = ON');
+        // A new database is created private whatever the caller's umask; SQLite creates its -wal
+        // and -shm files with the database file's permissions, so they stay private too.
+        $umask = umask(0077);
+        try {
+            $this->db = new \PDO('sqlite:' . $path, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $this->db->exec('PRAGMA busy_timeout = 10000');
+            $this->db->exec('PRAGMA journal_mode = WAL');
+            $this->db->exec('PRAGMA foreign_keys = ON');
+        } finally {
+            umask($umask);
+        }
     }
 
     public function migrate(): void
