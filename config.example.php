@@ -30,7 +30,7 @@ return [
 
     // Merged into every streaming request. include_usage is required; add provider-specific
     // options here, e.g. 'continuous_usage_stats' => true on upstreams that support it, so a
-    // client that hangs up is charged exactly for what it received.
+    // client that hangs up is charged by the upstream's own running count, not an upper bound.
     'stream_options' => ['include_usage' => true],
 
     // sha256 hex of the admin token used by billing: printf %s "$TOKEN" | sha256sum

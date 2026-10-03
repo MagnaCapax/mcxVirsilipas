@@ -45,7 +45,9 @@ function configArrayFor(string $dir, array $overrides = []): array
         'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
         'upstream_key_file' => "$dir/upstream.key",
         'upstream_timeout' => 30,
-        'models' => ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage', 'busy' => 'scenario-429', 'slow' => 'scenario-slow'],
+        'models' => ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage', 'busy' => 'scenario-429', 'slow' => 'scenario-slow',
+            'empty-usage' => 'scenario-empty-usage', 'json-error' => 'scenario-json-error', 'truncated' => 'scenario-truncated',
+            'redirect' => 'scenario-redirect', 'big-delta' => 'scenario-big-delta', 'no-done' => 'scenario-no-done'],
         'max_tokens_cap' => 1000,
         'max_concurrent_per_key' => 5,
         'lease_seconds' => 60,
@@ -220,4 +222,15 @@ function fundedKey(int $tokens): array
     $key = $ledger->createKey($ref);
     $ledger->grant($ref, "g-$ref", $tokens);
     return [$ref, $key];
+}
+
+/** The newest usage row for a ref (token counts and flags only). */
+function lastUsage(string $ref): array
+{
+    $db = new \PDO('sqlite:' . Harness::get()['dir'] . '/ledger.sqlite');
+    $st = $db->prepare('SELECT u.* FROM usage u JOIN keys k ON k.id = u.key_id WHERE k.ref = ? ORDER BY u.id DESC LIMIT 1');
+    $st->execute([$ref]);
+    $row = $st->fetch(\PDO::FETCH_ASSOC);
+    check($row !== false, "no usage row for $ref");
+    return array_map(static fn ($v) => is_numeric($v) ? (int) $v : $v, $row);
 }

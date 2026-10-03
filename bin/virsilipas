@@ -58,8 +58,8 @@ function arg(array $a, int $i): string
 function intArg(array $a, int $i): int
 {
     $v = arg($a, $i);
-    if (!preg_match('/^-?[0-9]+$/', $v)) {
-        throw new \InvalidArgumentException('tokens must be an integer');
+    if (!preg_match('/^-?[0-9]{1,16}$/', $v)) {
+        throw new \InvalidArgumentException('tokens must be an integer of at most 16 digits');
     }
     return (int) $v;
 }

@@ -2,6 +2,9 @@
 
 declare(strict_types=1);
 
+// The ledger holds every customer's balance and usage: files this process creates are private to it.
+umask(0077);
+
 // Zero-dependency autoloader for the MagnaCapax\Virsilipas namespace (Composer works too).
 spl_autoload_register(static function (string $class): void {
     $prefix = 'MagnaCapax\\Virsilipas\\';

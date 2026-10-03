@@ -2,6 +2,24 @@
 
 declare(strict_types=1);
 
+use MagnaCapax\Virsilipas\Ledger;
+
+/** @return array{0: Ledger, 1: int} a ledger and the id of a key 'a' funded with $tokens */
+function fundedLedger(int $tokens): array
+{
+    $l = freshLedger();
+    $k = $l->createKey('a');
+    if ($tokens !== 0) {
+        $l->grant('a', 'g0', $tokens);
+    }
+    return [$l, $l->findKey($k)['id']];
+}
+
+function meta(): array
+{
+    return ['model' => 'm', 'prompt' => 1, 'completion' => 1, 'status' => 200, 'aborted' => false, 'estimated' => false];
+}
+
 function testGrantIsAppliedOncePerGrantId(): void
 {
     $l = freshLedger();
@@ -12,18 +30,37 @@ function testGrantIsAppliedOncePerGrantId(): void
     same(['applied' => true, 'balance' => 700], $l->grant('a', 'refund-1', -100), 'negative grant');
 }
 
-function testGrantRejectsZeroAndUnknownRef(): void
+function testGrantIdReusedForSomethingElseIsAConflict(): void
 {
     $l = freshLedger();
     $l->createKey('a');
+    $l->createKey('b');
+    $l->grant('a', 'inv-1', 500);
+    same(409, throwsHttp(fn () => $l->grant('b', 'inv-1', 500))[0], 'other ref');
+    same(409, throwsHttp(fn () => $l->grant('a', 'inv-1', 999))[0], 'other amount');
+    same(0, $l->status('b')['balance']);
+}
+
+function testGrantRejectsZeroOutOfRangeAndUnknownRef(): void
+{
+    [$l] = fundedLedger(0);
     same(400, throwsHttp(fn () => $l->grant('a', 'g', 0))[0]);
+    same(400, throwsHttp(fn () => $l->grant('a', 'g', PHP_INT_MAX))[0]);
     same(404, throwsHttp(fn () => $l->grant('nobody', 'g', 5))[0]);
+    for ($i = 0; $i < 1000; $i++) {
+        try {
+            $l->grant('a', "big-$i", Ledger::MAX_GRANT);
+        } catch (\MagnaCapax\Virsilipas\HttpError $e) {
+            same(400, $e->status, 'balance range');
+            break;
+        }
+    }
+    check($l->status('a')['balance'] <= 1_000_000_000_000_000_000, 'balance stayed in range');
 }
 
 function testDuplicateRefIsRefused(): void
 {
-    $l = freshLedger();
-    $l->createKey('a');
+    [$l] = fundedLedger(0);
     same(409, throwsHttp(fn () => $l->createKey('a'))[0]);
 }
 
@@ -38,95 +75,83 @@ function testKeyIsStoredHashedAndFound(): void
 
 function testReserveClampsMaxTokensToBalance(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 150);
-    $keyId = $l->findKey($k)['id'];
-    $r = $l->reserve($keyId, 50, 1000, 4000, 4, 60);
-    same(100, $r['max_tokens'], 'clamped to balance minus prompt estimate');
+    [$l, $id] = fundedLedger(150);
+    $r = $l->reserve($id, 50, 1000, 4000, 4, 60);
+    same(100, $r['max_tokens'], 'clamped to balance minus prompt bound');
     same(150, $r['reserved']);
-    same(0, $l->status('a')['balance']);
-    same(1, $l->status('a')['in_flight']);
-    $r2 = (function () use ($l) { $k = $l->createKey('b'); $l->grant('b', 'gb', 100000); return $l->reserve($l->findKey($k)['id'], 50, null, 4000, 4, 60); })();
-    same(4000, $r2['max_tokens'], 'no max_tokens requested: the cap applies');
+    same(['ref' => 'a', 'balance' => 0, 'active' => true, 'in_flight' => 1], $l->status('a'));
+    [$l2, $id2] = fundedLedger(100000);
+    same(4000, $l2->reserve($id2, 50, null, 4000, 4, 60)['max_tokens'], 'no max_tokens requested: the cap applies');
 }
 
-function testReserveRefusesWhenExhausted(): void
+function testReserveRefusesWhenTooLow(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 40);
-    $keyId = $l->findKey($k)['id'];
-    same(402, throwsHttp(fn () => $l->reserve($keyId, 40, null, 1000, 4, 60))[0], 'prompt alone uses the balance');
-    $l->grant('a', 'g2', -100);
-    same(402, throwsHttp(fn () => $l->reserve($keyId, 1, null, 1000, 4, 60))[0], 'negative balance');
+    [$l, $id] = fundedLedger(40);
+    same(402, throwsHttp(fn () => $l->reserve($id, 40, null, 1000, 4, 60))[0], 'prompt bound alone uses the balance');
 }
 
-function testSettleRefundsUnusedReservationAndLogsUsage(): void
+function testSettleChargesReportedRefundsRestAndWritesOneUsageRow(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 1000);
-    $keyId = $l->findKey($k)['id'];
-    $r = $l->reserve($keyId, 20, 200, 1000, 4, 60);
+    [$l, $id] = fundedLedger(1000);
+    $r = $l->reserve($id, 20, 200, 1000, 4, 60);
     same(780, $l->status('a')['balance']);
-    $l->settle($r['lease_id'], $keyId, 57, ['model' => 'm', 'prompt' => 30, 'completion' => 27, 'cached' => 0, 'status' => 200, 'aborted' => false, 'estimated' => false]);
+    same(true, $l->settle($r['lease_id'], $id, 57, meta()));
     same(943, $l->status('a')['balance'], '1000 - 57');
+    same(false, $l->settle($r['lease_id'], $id, 57, meta()), 'second settle is a no-op');
+    same(943, $l->status('a')['balance']);
     same(0, $l->status('a')['in_flight']);
+}
+
+function testChargeNeverExceedsTheReservation(): void
+{
+    [$l, $id] = fundedLedger(100);
+    $r = $l->reserve($id, 10, 90, 1000, 4, 60);
+    $l->settle($r['lease_id'], $id, 10000, meta());
+    same(0, $l->status('a')['balance'], 'over-reported usage is capped; the balance never goes negative');
 }
 
 function testConcurrencyLimitPerKey(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 100000);
-    $keyId = $l->findKey($k)['id'];
-    $l->reserve($keyId, 10, 10, 1000, 2, 60);
-    $l->reserve($keyId, 10, 10, 1000, 2, 60);
-    same(429, throwsHttp(fn () => $l->reserve($keyId, 10, 10, 1000, 2, 60))[0]);
+    [$l, $id] = fundedLedger(100000);
+    $l->reserve($id, 10, 10, 1000, 2, 60);
+    $l->reserve($id, 10, 10, 1000, 2, 60);
+    same(429, throwsHttp(fn () => $l->reserve($id, 10, 10, 1000, 2, 60))[0]);
 }
 
-function testExpiredLeaseIsRefundedAndLateSettleChargesUsageOnly(): void
+function testExpiredLeaseStaysChargedAndALateSettleCorrectsItOnce(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 100);
-    $keyId = $l->findKey($k)['id'];
-    $r = $l->reserve($keyId, 10, 90, 1000, 1, 1); // reserves the whole balance, lease lives 1 s
-    same(0, $l->status('a')['balance']);
+    [$l, $id] = fundedLedger(100);
+    $r = $l->reserve($id, 10, 50, 1000, 1, 1); // reserves 60, lease lives 1 s, limit 1 in flight
     sleep(2);
-    // The dead lease must not block the key: it is reaped (refunded) even though this reserve is refused for concurrency later.
-    $r2 = $l->reserve($keyId, 10, 20, 1000, 1, 60);
-    same(70, $l->status('a')['balance'], 'old reservation refunded, new one taken');
-    // The first request settles late: only its usage is debited.
-    $l->settle($r['lease_id'], $keyId, 15, ['model' => 'm', 'prompt' => 10, 'completion' => 5, 'cached' => 0, 'status' => 200, 'aborted' => false, 'estimated' => false]);
+    same(['ref' => 'a', 'balance' => 40, 'active' => true, 'in_flight' => 0], $l->status('a'), 'expired: not in flight, still charged');
+    $r2 = $l->reserve($id, 10, 20, 1000, 1, 60); // the dead lease no longer blocks concurrency
+    same(10, $l->status('a')['balance']);
+    same(true, $l->settle($r['lease_id'], $id, 15, meta()), 'late settle of the dead lease');
+    same(55, $l->status('a')['balance'], '60 reserved, 15 charged, 45 returned');
+    same(false, $l->settle($r['lease_id'], $id, 15, meta()));
     same(55, $l->status('a')['balance']);
     unset($r2);
 }
 
-function testReapSurvivesARefusal(): void
-{
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 100);
-    $keyId = $l->findKey($k)['id'];
-    $l->reserve($keyId, 10, 90, 1000, 4, 1);
-    sleep(2);
-    // This request is refused (prompt larger than the balance), but the dead lease's refund must stick.
-    same(402, throwsHttp(fn () => $l->reserve($keyId, 500, null, 1000, 4, 60))[0]);
-    same(100, $l->status('a')['balance']);
-    same(0, $l->status('a')['in_flight']);
-}
-
 function testDisabledKeyIsRefusedAndCanBeReenabled(): void
 {
-    $l = freshLedger();
-    $k = $l->createKey('a');
-    $l->grant('a', 'g', 100);
-    $keyId = $l->findKey($k)['id'];
+    [$l, $id] = fundedLedger(100);
     $l->setActive('a', false);
-    same(403, throwsHttp(fn () => $l->reserve($keyId, 1, 1, 1000, 4, 60))[0]);
+    same(403, throwsHttp(fn () => $l->reserve($id, 1, 1, 1000, 4, 60))[0]);
     $l->setActive('a', true);
-    same(1, $l->reserve($keyId, 1, 1, 1000, 4, 60)['max_tokens']);
+    same(1, $l->reserve($id, 1, 1, 1000, 4, 60)['max_tokens']);
     same(404, throwsHttp(fn () => $l->setActive('nobody', true))[0]);
+}
+
+function testWorldReadableDatabaseIsRefused(): void
+{
+    $path = tempDir() . '/ledger.sqlite';
+    (new Ledger($path))->migrate();
+    chmod($path, 0644);
+    try {
+        new Ledger($path);
+        throw new \RuntimeException('opened a world-readable database');
+    } catch (\RuntimeException $e) {
+        check(str_contains($e->getMessage(), 'other users'), 'refusal names the problem');
+    }
 }

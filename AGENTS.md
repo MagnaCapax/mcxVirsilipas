@@ -15,13 +15,15 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 
 ## Invariants the tests protect
 
-1. A key never spends more than its balance. Reservation clamps `max_tokens` and is atomic (`BEGIN IMMEDIATE`).
-2. Every reservation is settled exactly once: returned in full, minus what the upstream reported.
-3. A grant is applied once per `grant_id`.
+1. A key never spends more than its balance. Reservation clamps `max_tokens` and is atomic (`BEGIN IMMEDIATE`); the charge never exceeds the reservation.
+2. Every lease is settled at most once. An expired, unsettled lease stays charged at its reservation; a late settle returns the difference once.
+3. A grant is applied once per `grant_id`; reusing a `grant_id` for anything else is a conflict. Balances stay far inside the 64-bit range.
 4. No transaction or statement is open while a request streams.
-5. The client never gets a 200 unless the upstream answered 2xx.
-6. Lease ids are never reused (`AUTOINCREMENT`), so a late settle cannot close another request's lease.
-7. Refunding expired leases happens in its own transaction, so a refused request cannot roll it back.
+5. The client never gets a 200 unless the upstream answered 2xx with a valid completion or a valid first stream event.
+6. Missing or malformed usage is never read as zero; it is charged an upper bound, capped and flagged.
+7. Only allowlisted request fields and text content go upstream; the prompt bound counts every forwarded byte.
+8. Responses carry the alias and the three standard usage counts only. Upstream error text, costs and model ids never reach the client.
+9. Lease ids are never reused (`AUTOINCREMENT`).
 
 ## Layout
 

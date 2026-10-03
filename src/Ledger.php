@@ -10,13 +10,25 @@ namespace MagnaCapax\Virsilipas;
  *
  * Every write is a short BEGIN IMMEDIATE transaction. Nothing is held open while a
  * request streams, so a slow client never blocks other keys.
+ *
+ * A lease's reservation is taken from the balance when the request starts and stays
+ * taken until the request is settled. A lease that outlives its request (its worker
+ * died) stops counting against concurrency when it expires, but its reservation stays
+ * charged: the request may already have been answered. A late settle still corrects it.
  */
 final class Ledger
 {
+    /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
+    public const MAX_GRANT = 1_000_000_000_000_000;
+    private const MAX_BALANCE = 1_000_000_000_000_000_000;
+
     private \PDO $db;
 
     public function __construct(string $path)
     {
+        if (is_file($path) && (fileperms($path) & 0007) !== 0) {
+            throw new \RuntimeException('ledger database is accessible to other users; chmod 600 it');
+        }
         $this->db = new \PDO('sqlite:' . $path, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
         $this->db->exec('PRAGMA busy_timeout = 10000');
         $this->db->exec('PRAGMA journal_mode = WAL');
@@ -41,30 +53,36 @@ final class Ledger
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS leases (
-                -- AUTOINCREMENT: a lease id is never reused, so a late settle can never close another request's lease
+                -- AUTOINCREMENT: a lease id is never reused, so a settle can only ever close its own lease
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_id INTEGER NOT NULL REFERENCES keys(id),
                 reserved INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                settled INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS leases_key ON leases(key_id);
+            CREATE INDEX IF NOT EXISTS leases_open ON leases(key_id, settled, expires_at);
             CREATE TABLE IF NOT EXISTS usage (
                 id INTEGER PRIMARY KEY,
                 ts INTEGER NOT NULL,
                 key_id INTEGER NOT NULL REFERENCES keys(id),
+                lease_id INTEGER NOT NULL UNIQUE REFERENCES leases(id),
                 model TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL,
-                cached_tokens INTEGER NOT NULL,
+                reported INTEGER NOT NULL,
                 charged INTEGER NOT NULL,
                 http_status INTEGER NOT NULL,
                 aborted INTEGER NOT NULL,
-                estimated INTEGER NOT NULL
+                estimated INTEGER NOT NULL,
+                over_reservation INTEGER NOT NULL
             );
             SQL);
     }
 
-    /** Creates a key for an external reference (e.g. a billing service id). Returns the plaintext key, shown once. */
+    /**
+     * Creates a key for a ref: the billing system's stable id for the USER, so that all of a
+     * user's purchases add to one balance. Returns the plaintext key, shown once.
+     */
     public function createKey(string $ref): string
     {
         $key = 'vsk-' . bin2hex(random_bytes(24));
@@ -91,22 +109,35 @@ final class Ledger
 
     /**
      * Applies a billing grant once per grant id. Tokens may be negative (refund or chargeback).
+     * Retrying with the same grant id and the same ref and amount is a no-op; reusing a grant id
+     * for anything else is a conflict.
      * @return array{applied: bool, balance: int}
      */
     public function grant(string $ref, string $grantId, int $tokens): array
     {
-        if ($tokens === 0 || $grantId === '') {
-            throw new HttpError(400, 'grant needs a grant_id and nonzero tokens');
+        if ($tokens === 0 || abs($tokens) > self::MAX_GRANT || $grantId === '') {
+            throw new HttpError(400, 'grant needs a grant_id and nonzero tokens of at most ' . self::MAX_GRANT);
         }
         return $this->tx(function () use ($ref, $grantId, $tokens): array {
             $keyId = $this->keyIdByRef($ref);
-            $ins = $this->db->prepare('INSERT OR IGNORE INTO grants (grant_id, key_id, tokens, created_at) VALUES (?, ?, ?, ?)');
-            $ins->execute([$grantId, $keyId, $tokens, time()]);
-            $applied = $ins->rowCount() === 1;
-            if ($applied) {
-                $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$tokens, $keyId]);
+            $st = $this->db->prepare('SELECT key_id, tokens FROM grants WHERE grant_id = ?');
+            $st->execute([$grantId]);
+            $prior = $st->fetch(\PDO::FETCH_ASSOC);
+            $st->closeCursor();
+            if ($prior !== false) {
+                if ((int) $prior['key_id'] !== $keyId || (int) $prior['tokens'] !== $tokens) {
+                    throw new HttpError(409, 'grant_id was already used for a different ref or amount');
+                }
+                return ['applied' => false, 'balance' => $this->balanceOf($keyId)];
             }
-            return ['applied' => $applied, 'balance' => $this->balanceOf($keyId)];
+            $new = $this->balanceOf($keyId) + $tokens;
+            if (abs($new) > self::MAX_BALANCE) {
+                throw new HttpError(400, 'grant would take the balance out of range');
+            }
+            $this->db->prepare('INSERT INTO grants (grant_id, key_id, tokens, created_at) VALUES (?, ?, ?, ?)')
+                ->execute([$grantId, $keyId, $tokens, time()]);
+            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$tokens, $keyId]);
+            return ['applied' => true, 'balance' => $new];
         });
     }
 
@@ -126,8 +157,10 @@ final class Ledger
     /** @return array{ref: string, balance: int, active: bool, in_flight: int} */
     public function status(string $ref): array
     {
-        $st = $this->db->prepare('SELECT k.ref, k.balance, k.active, (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id) AS in_flight FROM keys k WHERE k.ref = ?');
-        $st->execute([$ref]);
+        $st = $this->db->prepare('SELECT k.ref, k.balance, k.active,
+                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight
+            FROM keys k WHERE k.ref = ?');
+        $st->execute([time(), $ref]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
         $st->closeCursor();
         if ($row === false) {
@@ -138,15 +171,12 @@ final class Ledger
 
     /**
      * Reserves tokens for one request. max_tokens is clamped so the reservation never exceeds the
-     * balance; the lease row also counts against the key's concurrency limit.
+     * balance; the lease also counts against the key's concurrency limit until settled or expired.
      * @return array{lease_id: int, max_tokens: int, reserved: int}
      */
-    public function reserve(int $keyId, int $promptEstimate, ?int $requestedMax, int $cap, int $maxConcurrent, int $leaseSeconds): array
+    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, int $maxConcurrent, int $leaseSeconds): array
     {
-        // Reap in its own transaction: a refusal below rolls back, and must not roll back the refund.
-        $this->tx(fn () => $this->reapExpired($keyId, time()));
-
-        return $this->tx(function () use ($keyId, $promptEstimate, $requestedMax, $cap, $maxConcurrent, $leaseSeconds): array {
+        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $maxConcurrent, $leaseSeconds): array {
             $now = time();
             $st = $this->db->prepare('SELECT balance, active FROM keys WHERE id = ?');
             $st->execute([$keyId]);
@@ -156,23 +186,23 @@ final class Ledger
                 throw new HttpError(403, 'key is disabled', 'permission_error');
             }
 
-            $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE key_id = ?');
-            $st->execute([$keyId]);
+            $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE key_id = ? AND settled = 0 AND expires_at > ?');
+            $st->execute([$keyId, $now]);
             if ((int) $st->fetchColumn() >= $maxConcurrent) {
                 throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error');
             }
 
-            $available = (int) $k['balance'] - $promptEstimate;
+            $available = (int) $k['balance'] - $promptBound;
             if ($available < 1) {
-                throw new HttpError(402, 'token balance exhausted', 'insufficient_quota');
+                throw new HttpError(402, 'token balance too low for this request', 'insufficient_quota');
             }
             $maxTokens = min($requestedMax ?? $cap, $cap, $available);
-            $reserved = $promptEstimate + $maxTokens;
+            $reserved = $promptBound + $maxTokens;
 
             $upd = $this->db->prepare('UPDATE keys SET balance = balance - ? WHERE id = ? AND balance >= ?');
             $upd->execute([$reserved, $keyId, $reserved]);
             if ($upd->rowCount() !== 1) {
-                throw new HttpError(402, 'token balance exhausted', 'insufficient_quota');
+                throw new HttpError(402, 'token balance too low for this request', 'insufficient_quota');
             }
             $this->db->prepare('INSERT INTO leases (key_id, reserved, expires_at) VALUES (?, ?, ?)')
                 ->execute([$keyId, $reserved, $now + $leaseSeconds]);
@@ -182,38 +212,30 @@ final class Ledger
     }
 
     /**
-     * Settles a request: returns the reservation and debits what was actually used, and writes the
-     * usage row in the same transaction. If the lease was already reaped (its reservation refunded),
-     * only the usage is debited.
-     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool} $meta
+     * Settles a request exactly once: charges what the upstream reported, never more than the
+     * reservation, returns the rest, and writes the usage row in the same transaction.
+     * Settling an already settled lease does nothing and returns false.
+     * @param array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool} $meta
      */
-    public function settle(int $leaseId, int $keyId, int $used, array $meta): void
+    public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
-        $this->tx(function () use ($leaseId, $keyId, $used, $meta): void {
-            $st = $this->db->prepare('SELECT reserved FROM leases WHERE id = ? AND key_id = ?');
+        return $this->tx(function () use ($leaseId, $keyId, $used, $meta): bool {
+            $st = $this->db->prepare('SELECT reserved FROM leases WHERE id = ? AND key_id = ? AND settled = 0');
             $st->execute([$leaseId, $keyId]);
             $reserved = $st->fetchColumn();
             $st->closeCursor();
-            if ($reserved !== false) {
-                $this->db->prepare('DELETE FROM leases WHERE id = ?')->execute([$leaseId]);
+            if ($reserved === false) {
+                return false;
             }
-            $delta = (int) ($reserved === false ? 0 : $reserved) - $used;
-            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$delta, $keyId]);
-            $this->db->prepare('INSERT INTO usage (ts, key_id, model, prompt_tokens, completion_tokens, cached_tokens, charged, http_status, aborted, estimated) VALUES (?,?,?,?,?,?,?,?,?,?)')
-                ->execute([time(), $keyId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated']]);
+            $reserved = (int) $reserved;
+            $used = max(0, $used);
+            $charged = min($used, $reserved);
+            $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
+            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
+            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved)]);
+            return true;
         });
-    }
-
-    /** Leases outlive their request only if the worker died; refund their reservation. */
-    private function reapExpired(int $keyId, int $now): void
-    {
-        $st = $this->db->prepare('SELECT COALESCE(SUM(reserved), 0) FROM leases WHERE key_id = ? AND expires_at <= ?');
-        $st->execute([$keyId, $now]);
-        $refund = (int) $st->fetchColumn();
-        if ($refund > 0) {
-            $this->db->prepare('DELETE FROM leases WHERE key_id = ? AND expires_at <= ?')->execute([$keyId, $now]);
-            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$refund, $keyId]);
-        }
     }
 
     private function keyIdByRef(string $ref): int

@@ -4,26 +4,31 @@ A small PHP proxy that gives every API key a prepaid token balance and meters ea
 
 - One key per user, one balance per key. The balance never expires and never resets.
 - Your billing system adds tokens through an admin endpoint ("grants"). Each grant applies once, however often it is retried.
-- Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`).
-- Requests are refused when the balance runs out. Parallel requests cannot overspend: each one reserves its tokens first, and the reservation never exceeds the balance. The settled charge is what the upstream reports, so a prompt larger than estimated can push a balance below zero; the key is then refused until the next grant.
-- Any OpenAI-compatible upstream works. You choose which models customers may use.
+- Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests.
+- A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
+- Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
 - No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions. Storage is one SQLite file.
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
 ## How metering works
 
-1. **Reserve.** Before forwarding, the proxy estimates the prompt size and reserves `prompt estimate + max_tokens` from the balance in one atomic transaction. `max_tokens` is clamped to what the balance can cover, so the reservation can never exceed it. Each reservation is a lease row; leases also count against the key's concurrency limit.
-2. **Forward.** The request goes upstream with the alias replaced by the real model id, `n` and other price-affecting parameters removed, and `stream_options` set by the proxy so the upstream always reports usage.
-3. **Settle.** When the response ends, the reservation is returned and the tokens the upstream reported are debited, in one transaction. A usage row (token counts only) is written in the same transaction.
+1. **Admit.** Only text requests are accepted: message content must be a string or text parts; images, audio and files are refused, because their cost cannot be bounded before sending. Only a fixed list of fields is forwarded (messages, tools, tool_choice, parallel_tool_calls, temperature, top_p, stop, seed, presence and frequency penalties, response_format, reasoning_effort). Everything else, including `n`, `store` and output-mode options, is dropped.
+2. **Reserve.** The prompt bound is the byte length of the forwarded fields (a token is at least one byte). The proxy reserves `prompt bound + max_tokens` in one atomic transaction, with `max_tokens` clamped to what the balance can cover. Each reservation is a lease row, which also counts against the key's concurrency limit.
+3. **Forward.** The request goes upstream with the alias replaced by the real model id and `stream_options` set by the proxy so the upstream reports usage.
+4. **Settle.** When the response ends, the tokens the upstream reported are charged (never more than the reservation) and the rest is returned, exactly once per request, together with a usage row (token counts only). Reported usage above the reservation is recorded as `over_reservation` so you can see an upstream that ignores `max_tokens`.
 
 Details that matter in production:
 
-- **Client hangs up mid-stream.** The proxy stops the upstream request and charges for what was generated up to that point. With an upstream that reports usage on every chunk (configure it in `stream_options`) this is exact to the upstream's own count; the client may be charged for a few chunks it never received, generated in the moment before the disconnect was noticed. Without per-chunk usage, the charge is the prompt estimate plus the number of streamed content chunks, and the usage row is flagged `estimated`.
-- **Usage in responses** carries the standard token counts only. Extra fields an upstream adds to `usage` (costs, account data) are removed before the client sees them.
-- **Upstream errors** never produce a 200. The client gets a generic error of the same class (429, 502, or the upstream's 4xx status). Upstream error bodies are not passed on, and nothing is charged.
-- **Crashed workers.** A lease outlives its request only if the worker died. Expired leases are refunded the next time the key makes a request. `lease_seconds` must be longer than `upstream_timeout`.
+- **Client hangs up mid-stream.** The proxy stops the upstream request and charges for what was generated up to that point. With an upstream that reports usage on every chunk (configure it in `stream_options`) the charge follows the upstream's own count; it can include a few chunks the client never received, generated before the disconnect was noticed. Without usage, the charge is an upper bound (the prompt bound plus the bytes delivered), capped at the reservation, and the usage row is flagged `estimated`.
+- **Responses** show the alias as the model, and only `prompt_tokens`, `completion_tokens` and `total_tokens` as usage. Anything else an upstream adds (costs, account data, its model ids) is removed.
+- **Upstream errors** never produce a 200. A non-streaming answer must arrive complete and be a valid completion; a stream must start with a valid event. Otherwise the client gets a generic error (429, the upstream's 4xx status, or 502), no upstream text, and no charge. A stream that ends without its final marker gets an error event at the end.
+- **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered; if the request is settled late, the difference is returned. `lease_seconds` must be longer than `upstream_timeout`.
 - **Concurrency.** `max_concurrent_per_key` stops one key from using up a shared upstream rate limit.
+
+### Before enabling a model
+
+Check, with that model at your upstream: it honours `max_tokens` (including reasoning tokens), it reports `usage` on streams (ideally on every chunk), and a client hang-up is detected under your real php-fpm and nginx (see below).
 
 ## Install
 
@@ -40,7 +45,7 @@ Point your web server at `public/index.php` for every path. The config path can 
 
 - **One worker per open stream.** A streaming request holds a php-fpm worker for its whole duration. Size `pm.max_children` for your peak number of concurrent streams, and set `request_terminate_timeout` above `upstream_timeout`.
 - **Turn buffering off**, or streams arrive all at once at the end. The proxy sends `X-Accel-Buffering: no`; also set `fastcgi_buffering off;` (or `proxy_buffering off;`) and a `fastcgi_read_timeout` above `upstream_timeout`. Keep `zlib.output_compression` off for this pool.
-- **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database).
+- **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database). The proxy creates its files private to its user and refuses to open a database other users can read.
 - **Before launch, test a client hang-up under your real php-fpm and nginx.** Abort detection depends on the server telling PHP that the connection closed; it is covered by the tests under the PHP built-in server, not under every stack.
 
 ### Access control
@@ -57,15 +62,15 @@ Customer side, authenticated with `Authorization: Bearer <key>`:
 | `GET /v1/models` | Lists the aliases. |
 | `GET /v1/balance` | `{"balance": N, "in_flight": N}` for the calling key. |
 
-Errors use OpenAI's shape: `{"error": {"message": "...", "type": "..."}}`. 401 bad key, 402 balance exhausted, 403 key disabled, 404 unknown model, 429 too many concurrent requests or upstream busy.
+Errors use OpenAI's shape: `{"error": {"message": "...", "type": "..."}}`. 400 invalid request or non-text content, 401 bad key, 402 balance too low for this request, 403 key disabled, 404 unknown model, 429 too many concurrent requests or upstream busy, 502 upstream failed.
 
 Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long random token (32 bytes or more); only its sha256 is stored in the config. The grant response returns the new balance; `bin/virsilipas status <ref>` shows it at any time.
 
 | Method and path | Body | What it does |
 |---|---|---|
-| `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for your reference id. Returns it once (201). |
+| `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for a user. `ref` must be your billing system's stable id for the user (not a per-service id), so all of the user's purchases add to one balance. Returns the key once (201). |
 | `POST /admin/keys/active` | `{"ref": "...", "active": false}` | Disables or re-enables a key (for suspend and unsuspend). |
-| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "tokens": 1000000}` | Adds tokens once per `grant_id`. Negative tokens remove them (refunds). |
+| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "tokens": 1000000}` | Adds tokens once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative tokens remove tokens (refunds). At most 10^15 per grant. |
 
 Use a `grant_id` that is unique per payment, for example the invoice number or the subscription id plus its billing period, so that a retried push never credits twice and a renewal is never dropped.
 
