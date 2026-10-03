@@ -1,0 +1,17 @@
+{
+  "name": "magnacapax/mcx-virsilipas",
+  "description": "Small PHP proxy that meters LLM tokens per API key against a prepaid, never-expiring balance",
+  "type": "project",
+  "license": "Apache-2.0",
+  "require": {
+    "php": ">=8.2",
+    "ext-curl": "*",
+    "ext-pdo_sqlite": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "MagnaCapax\\Virsilipas\\": "src/"
+    }
+  },
+  "bin": ["bin/virsilipas"]
+}

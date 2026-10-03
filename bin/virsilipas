@@ -1,0 +1,65 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use MagnaCapax\Virsilipas\Config;
+use MagnaCapax\Virsilipas\HttpError;
+use MagnaCapax\Virsilipas\Ledger;
+
+require dirname(__DIR__) . '/src/bootstrap.php';
+
+$usage = <<<'TXT'
+Usage: virsilipas <command> [args]
+  init                              create or upgrade the database
+  key-create <ref>                  create a key for <ref>; prints the key once
+  key-disable <ref>                 refuse all requests for <ref>
+  key-enable <ref>                  allow requests for <ref> again
+  grant <ref> <tokens> <grant_id>   add (or, if negative, remove) tokens, once per grant_id
+  status <ref>                      show balance, active flag and in-flight requests
+Config: $VIRSILIPAS_CONFIG or ./config.php
+
+TXT;
+
+$args = array_slice($argv, 1);
+$cmd = array_shift($args) ?? '';
+
+try {
+    $ledger = new Ledger(Config::load(virsilipas_config_path())->dbPath);
+    $out = match ($cmd) {
+        'init' => (function () use ($ledger) { $ledger->migrate(); return 'ok'; })(),
+        'key-create' => $ledger->createKey(arg($args, 0)),
+        'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
+        'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
+        'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
+        'status' => json_encode($ledger->status(arg($args, 0))),
+        default => null,
+    };
+    if ($out === null) {
+        fwrite(STDERR, $usage);
+        exit(2);
+    }
+    echo $out, "\n";
+} catch (HttpError | \InvalidArgumentException | \RuntimeException $e) {
+    fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+/** @param list<string> $a */
+function arg(array $a, int $i): string
+{
+    if (!isset($a[$i]) || $a[$i] === '') {
+        throw new \InvalidArgumentException('missing argument; run without arguments for usage');
+    }
+    return $a[$i];
+}
+
+/** @param list<string> $a */
+function intArg(array $a, int $i): int
+{
+    $v = arg($a, $i);
+    if (!preg_match('/^-?[0-9]+$/', $v)) {
+        throw new \InvalidArgumentException('tokens must be an integer');
+    }
+    return (int) $v;
+}

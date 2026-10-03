@@ -1,0 +1,223 @@
+<?php
+
+declare(strict_types=1);
+
+use MagnaCapax\Virsilipas\Config;
+use MagnaCapax\Virsilipas\Ledger;
+
+function check(bool $cond, string $msg): void
+{
+    if (!$cond) {
+        throw new \RuntimeException($msg);
+    }
+}
+
+function same(mixed $expected, mixed $actual, string $msg = ''): void
+{
+    if ($expected !== $actual) {
+        throw new \RuntimeException(trim("$msg expected " . var_export($expected, true) . ', got ' . var_export($actual, true)));
+    }
+}
+
+/** @return array{0: int, 1: string} [status, message] */
+function throwsHttp(callable $fn): array
+{
+    try {
+        $fn();
+    } catch (\MagnaCapax\Virsilipas\HttpError $e) {
+        return [$e->status, $e->getMessage()];
+    }
+    throw new \RuntimeException('expected an HttpError');
+}
+
+function tempDir(): string
+{
+    $d = sys_get_temp_dir() . '/virsilipas-test-' . bin2hex(random_bytes(4));
+    mkdir($d, 0700);
+    return $d;
+}
+
+/** @param array<string, mixed> $overrides */
+function configArrayFor(string $dir, array $overrides = []): array
+{
+    return $overrides + [
+        'db_path' => "$dir/ledger.sqlite",
+        'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
+        'upstream_key_file' => "$dir/upstream.key",
+        'upstream_timeout' => 30,
+        'models' => ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage', 'busy' => 'scenario-429', 'slow' => 'scenario-slow'],
+        'max_tokens_cap' => 1000,
+        'max_concurrent_per_key' => 5,
+        'lease_seconds' => 60,
+        'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true],
+        'admin_token_sha256' => hash('sha256', 'admin-secret'),
+    ];
+}
+
+function freshLedger(): Ledger
+{
+    $l = new Ledger(tempDir() . '/ledger.sqlite');
+    $l->migrate();
+    return $l;
+}
+
+/** Runs the fake upstream and the proxy under php -S with workers, shared by all integration tests. */
+final class Harness
+{
+    private static ?array $state = null;
+    /** @var list<resource> */
+    private static array $procs = [];
+
+    /** @return array{dir: string, proxy: string, proxies: list<string>, ledger: Ledger} */
+    public static function get(): array
+    {
+        if (self::$state !== null) {
+            return self::$state;
+        }
+        $dir = tempDir();
+        file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
+        $up = self::freePort();
+        $ports = array_map(static fn () => self::freePort(), range(1, 7));
+        $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions"]);
+        file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
+        $root = dirname(__DIR__);
+        $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+        self::spawn([PHP_BINARY, '-S', "127.0.0.1:$up", "$root/tests/fake-upstream.php"], $env, "$dir/upstream.log");
+        // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
+        foreach ($ports as $px) {
+            self::spawn([PHP_BINARY, '-S', "127.0.0.1:$px", "$root/public/index.php"], $env, "$dir/proxy-$px.log");
+        }
+        self::waitPort($up);
+        array_map([self::class, 'waitPort'], $ports);
+        $ledger = new Ledger(Config::load("$dir/config.php")->dbPath);
+        $ledger->migrate();
+        $urls = array_map(static fn (int $p): string => "http://127.0.0.1:$p", $ports);
+        return self::$state = ['dir' => $dir, 'proxy' => $urls[0], 'proxies' => $urls, 'ledger' => $ledger];
+    }
+
+    public static function stop(): void
+    {
+        foreach (self::$procs as $p) {
+            proc_terminate($p);
+        }
+        self::$procs = [];
+    }
+
+    private static function spawn(array $cmd, array $env, string $log): void
+    {
+        $p = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, null, $env);
+        check(is_resource($p), 'could not start ' . implode(' ', $cmd));
+        self::$procs[] = $p;
+    }
+
+    private static function freePort(): int
+    {
+        $s = stream_socket_server('tcp://127.0.0.1:0');
+        $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
+        fclose($s);
+        return $port;
+    }
+
+    private static function waitPort(int $port): void
+    {
+        for ($i = 0; $i < 100; $i++) {
+            $c = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1);
+            if ($c) {
+                fclose($c);
+                return;
+            }
+            usleep(50000);
+        }
+        throw new \RuntimeException("server on port $port did not start");
+    }
+}
+
+/**
+ * One HTTP request to the proxy. $stopAfterBytes > 0 makes the client hang up mid-response.
+ * @param array<string, mixed>|null $body
+ * @return array{status: int, body: string}
+ */
+function http(string $method, string $path, ?array $body = null, ?string $bearer = null, int $stopAfterBytes = 0): array
+{
+    $ch = curl_init(Harness::get()['proxy'] . $path);
+    $out = '';
+    $headers = ['Content-Type: application/json'];
+    if ($bearer !== null) {
+        $headers[] = "Authorization: Bearer $bearer";
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_TIMEOUT => 30,
+        CURLOPT_WRITEFUNCTION => static function ($ch, string $chunk) use (&$out, $stopAfterBytes): int {
+            $out .= $chunk;
+            return ($stopAfterBytes > 0 && strlen($out) >= $stopAfterBytes) ? 0 : strlen($chunk);
+        },
+    ]);
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body));
+    }
+    curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    return ['status' => $status, 'body' => $out];
+}
+
+/**
+ * Runs several chat requests at once, one per proxy process.
+ * @param list<array<string, mixed>> $bodies
+ * @return list<int> HTTP statuses in request order
+ */
+function parallelChat(array $bodies, string $key): array
+{
+    $mh = curl_multi_init();
+    $handles = [];
+    $proxies = Harness::get()['proxies'];
+    foreach ($bodies as $i => $b) {
+        $ch = curl_init($proxies[$i % count($proxies)] . '/v1/chat/completions');
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($b),
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', "Authorization: Bearer $key"],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 30,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[] = $ch;
+    }
+    do {
+        curl_multi_exec($mh, $running);
+        curl_multi_select($mh, 0.1);
+    } while ($running > 0);
+    $statuses = [];
+    foreach ($handles as $ch) {
+        $statuses[] = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_multi_remove_handle($mh, $ch);
+    }
+    curl_multi_close($mh);
+    return $statuses;
+}
+
+/** Waits until a key has no request in flight (settle runs after the response ends). */
+function settled(string $ref): array
+{
+    $ledger = Harness::get()['ledger'];
+    for ($i = 0; $i < 100; $i++) {
+        $s = $ledger->status($ref);
+        if ($s['in_flight'] === 0) {
+            return $s;
+        }
+        usleep(50000);
+    }
+    throw new \RuntimeException("requests for $ref never settled");
+}
+
+/** Creates a funded key in the shared harness and returns [ref, key]. */
+function fundedKey(int $tokens): array
+{
+    $ledger = Harness::get()['ledger'];
+    $ref = 'svc-' . bin2hex(random_bytes(4));
+    $key = $ledger->createKey($ref);
+    $ledger->grant($ref, "g-$ref", $tokens);
+    return [$ref, $key];
+}
