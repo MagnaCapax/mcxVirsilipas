@@ -86,6 +86,10 @@ switch ($model) {
         header('Content-Type: application/json');
         echo json_encode(['choices' => [new stdClass()], 'usage' => $usage(1)]);
         exit;
+    case 'scenario-list-message':
+        header('Content-Type: application/json');
+        echo '{"choices":[{"message":[]},{"index":1,"message":{}}],"usage":' . json_encode($usage(1)) . '}';
+        exit;
     case 'scenario-typed-private':
         header('Content-Type: application/json');
         echo json_encode(['id' => ['PRIVATE-DETAIL'], 'choices' => [['index' => 0, 'message' => ['role' => 'assistant',

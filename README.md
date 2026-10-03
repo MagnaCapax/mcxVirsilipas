@@ -29,7 +29,7 @@ Details that matter in production:
 
 ### Before enabling a model
 
-Check, with that model at your upstream: it honours `max_tokens` (including reasoning tokens), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), and a client hang-up is detected under your real php-fpm and nginx (see below).
+Check, with that model at your upstream, and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), and a client hang-up is detected under your real php-fpm and nginx (see below). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
 
 ## Install
 

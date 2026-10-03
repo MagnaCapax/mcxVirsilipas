@@ -230,6 +230,14 @@ final class Proxy
         $out['model'] = $alias;
         if (array_key_exists('choices', $j)) {
             $out['choices'] = self::choices($j['choices']);
+            foreach ($out['choices'] as &$c) {
+                foreach (['message', 'delta'] as $k) {
+                    if (($c[$k] ?? null) === []) {
+                        $c[$k] = new \stdClass(); // an empty object stays {} in JSON, not []
+                    }
+                }
+            }
+            unset($c);
         }
         if (array_key_exists('usage', $j)) {
             $u = self::validUsage($j['usage']);
@@ -246,14 +254,14 @@ final class Proxy
     private static function choices(mixed $choices): array
     {
         $out = [];
-        foreach (is_array($choices) ? $choices : [] as $c) {
-            if (!is_array($c)) {
+        foreach (is_array($choices) && array_is_list($choices) ? $choices : [] as $c) {
+            if (!self::isObject($c)) {
                 continue;
             }
-            $choice = self::typed($c, ['index' => 'int', 'finish_reason' => 'string']);
+            $choice = self::typed($c, ['index' => 'int', 'finish_reason' => '?string']);
             foreach (['message', 'delta'] as $k) {
-                if (is_array($c[$k] ?? null)) {
-                    $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => 'string', 'reasoning_content' => 'string', 'refusal' => 'string']);
+                if (self::isObject($c[$k] ?? null)) {
+                    $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => '?string', 'reasoning_content' => '?string', 'refusal' => '?string']);
                     if (array_key_exists('tool_calls', $c[$k])) {
                         $choice[$k]['tool_calls'] = self::toolCalls($c[$k]['tool_calls'], false);
                     }
@@ -291,9 +299,11 @@ final class Proxy
             $dropped = 0;
             $call = self::typed($t, ['index' => 'int', 'id' => 'string', 'type' => 'string'], $dropped);
             if (array_key_exists('function', $t)) {
-                $fn = $t['function'];
-                $dropped += is_array($fn) ? 0 : 1;
-                $call['function'] = is_array($fn) ? self::typed($fn, ['name' => 'string', 'arguments' => 'string'], $dropped) : [];
+                $fn = self::isObject($t['function']) ? self::typed($t['function'], ['name' => 'string', 'arguments' => 'string'], $dropped) : null;
+                $dropped += $fn === null ? 1 : 0;
+                if ($fn) {
+                    $call['function'] = $fn; // an empty or invalid function object is omitted, never relayed as []
+                }
             }
             if ($strict && $dropped > 0) {
                 throw new HttpError(400, 'tool call fields must be strings (arguments as a JSON string)');
@@ -304,9 +314,9 @@ final class Proxy
     }
 
     /**
-     * The listed fields of $a whose values have the listed type ('string' or 'int'); any other
-     * field or value is dropped, and each dropped listed field is counted in $dropped. Null is
-     * kept for string fields (e.g. the content of a message that only calls tools).
+     * The listed fields of $a whose values have the listed type ('string', 'int', or '?string'
+     * for the few fields the protocol allows to be null, such as content); any other field or
+     * value is dropped, and each dropped listed field is counted in $dropped.
      * @param array<mixed> $a
      * @param array<string, string> $types
      * @return array<string, mixed>
@@ -319,7 +329,7 @@ final class Proxy
                 continue;
             }
             $v = $a[$k];
-            if (($type === 'string' && (is_string($v) || $v === null)) || ($type === 'int' && is_int($v))) {
+            if ((is_string($v) && $type !== 'int') || ($v === null && $type === '?string') || (is_int($v) && $type === 'int')) {
                 $out[$k] = $v;
             } else {
                 $dropped++;
@@ -328,10 +338,27 @@ final class Proxy
         return $out;
     }
 
-    /** A completion with at least one usable choice (a message or delta object): what a 200 must carry. */
+    /**
+     * A completion with at least one usable choice: a message or delta object carrying at least
+     * one valid field (a role-only first stream delta counts). What a 200 must carry.
+     */
     private static function hasChoices(mixed $j): bool
     {
-        return is_array($j) && !isset($j['error']) && self::choices($j['choices'] ?? null) !== [];
+        if (!is_array($j) || isset($j['error'])) {
+            return false;
+        }
+        foreach (self::choices($j['choices'] ?? null) as $c) {
+            if (($c['message'] ?? []) !== [] || ($c['delta'] ?? []) !== []) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A decoded JSON object (json_decode turns both {} and [] into an empty array; a non-empty list is not an object). */
+    private static function isObject(mixed $v): bool
+    {
+        return is_array($v) && ($v === [] || !array_is_list($v));
     }
 
     /** Bytes of text a choice delivers: content, reasoning, refusal and tool-call names and arguments. */

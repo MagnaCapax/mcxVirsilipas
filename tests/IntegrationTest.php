@@ -61,7 +61,7 @@ function testIntegrationFinalOnlyUsageStreamDebitsExactly(): void
 function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
     foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
-        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502]] as [$model, $stream, $status]) {
+        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502], ['list-message', false, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));

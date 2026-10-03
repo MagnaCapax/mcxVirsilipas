@@ -34,6 +34,8 @@ function testOnlyTextContentIsAdmitted(): void
         [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => ['x'], 'type' => 'function']]]],
         [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'function' => 'f']]]],
         [['role' => 'tool', 'tool_call_id' => ['x'], 'content' => 'ok']],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => null, 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => null]]]]],
     ];
     foreach ($bad as $messages) {
         same(400, throwsHttp(fn () => Proxy::normalizeMessages($messages))[0], json_encode($messages));
@@ -94,6 +96,13 @@ function testPublicViewHidesUpstreamDetails(): void
     same(['id' => 'x', 'model' => 'alias', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]]], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
     $typed = ['id' => ['x'], 'created' => '1', 'choices' => [['index' => '0', 'message' => ['content' => ['private' => 'SECRET'], 'role' => 'assistant'], 'finish_reason' => 7], [], ['delta' => 'x']]];
     same(['model' => 'a', 'choices' => [['message' => ['role' => 'assistant']]]], Proxy::publicView($typed, 'a'), 'wrong-typed values dropped; a choice without a message or delta object dropped');
+    $nulls = ['id' => null, 'object' => null, 'choices' => [['index' => 0, 'finish_reason' => null, 'message' => ['role' => null, 'content' => null, 'refusal' => null,
+        'tool_calls' => [['index' => 0, 'id' => null, 'type' => null, 'function' => ['name' => null, 'arguments' => null]]]]]]];
+    same(['model' => 'a', 'choices' => [['index' => 0, 'finish_reason' => null, 'message' => ['content' => null, 'refusal' => null, 'tool_calls' => [['index' => 0]]]]]],
+        Proxy::publicView($nulls, 'a'), 'null kept only where the protocol allows it');
+    same('{"model":"a","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}', json_encode(Proxy::publicView(['choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'stop']]], 'a')),
+        'an empty closing delta is relayed as {}');
+    same([], Proxy::publicView(['choices' => [['message' => ['x']]]], 'a')['choices'], 'a list is not a message object');
     $tc = ['choices' => [['delta' => ['tool_calls' => [['index' => 0, 'id' => 'c', 'type' => 'function', 'secret' => 's', 'function' => ['name' => 'f', 'arguments' => '{}', 'secret' => 's']]]]]]];
     same([['index' => 0, 'id' => 'c', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]], Proxy::publicView($tc, 'a')['choices'][0]['delta']['tool_calls'], 'tool calls keep standard fields only');
 }
