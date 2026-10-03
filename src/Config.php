@@ -22,6 +22,10 @@ final class Config
     /** @var array<string, mixed> merged into every streaming request as stream_options */
     public readonly array $streamOptions;
     public readonly string $adminTokenSha256;
+    /** Directory for the daily JSONL log files; null logs to PHP's error_log. */
+    public readonly ?string $logDir;
+    /** error | warn | info | debug */
+    public readonly string $logLevel;
 
     /** @param array<string, mixed> $c */
     public function __construct(array $c)
@@ -34,6 +38,11 @@ final class Config
         $this->maxConcurrentPerKey = self::int($c, 'max_concurrent_per_key', 4);
         $this->leaseSeconds = self::int($c, 'lease_seconds', 900);
         $this->adminTokenSha256 = strtolower(self::str($c, 'admin_token_sha256'));
+        $this->logDir = isset($c['log_dir']) ? self::str($c, 'log_dir') : null;
+        $this->logLevel = $c['log_level'] ?? 'warn';
+        if (!is_string($this->logLevel) || !isset(Log::LEVELS[$this->logLevel])) {
+            throw new \InvalidArgumentException('config: log_level must be error, warn, info or debug');
+        }
 
         $models = $c['models'] ?? null;
         if (!is_array($models) || $models === []) {

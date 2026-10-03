@@ -90,7 +90,8 @@ final class Harness
         file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
         $up = self::freePort();
         $ports = array_map(static fn () => self::freePort(), range(1, 7));
-        $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions"]);
+        mkdir("$dir/logs", 0700);
+        $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
         file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
         $root = dirname(__DIR__);
         $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];

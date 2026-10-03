@@ -33,6 +33,13 @@ return [
     // client that hangs up is charged by the upstream's own running count, not an upper bound.
     'stream_options' => ['include_usage' => true],
 
+    // Operational log: one JSONL file per UTC day (YYYYMMDD.jsonl) in this directory, private to the PHP user.
+    // Leave unset to send log lines to PHP's error_log instead. Records hold counts, statuses and billing
+    // references only, never request or response bodies, keys or upstream error text.
+    // 'log_dir' => '/var/log/virsilipas',
+    // error | warn (upstream failures and billing anomalies) | info (+ every request and admin action) | debug
+    'log_level' => 'warn',
+
     // sha256 hex of the admin token used by billing: printf %s "$TOKEN" | sha256sum
     'admin_token_sha256' => '0000000000000000000000000000000000000000000000000000000000000000',
 ];

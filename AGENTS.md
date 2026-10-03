@@ -24,6 +24,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 7. Only allowlisted request fields and text content go upstream; the prompt bound counts every forwarded byte.
 8. Responses are rebuilt from allowlisted fields, each value of its expected type: the alias and the three standard usage counts. Upstream error text, costs, provider fields and model ids never reach the client.
 9. Lease ids are never reused (`AUTOINCREMENT`).
+10. Log records hold event names, counts, statuses and billing references only: never request or response bodies, prompts, keys, the admin token, upstream error text or client addresses. A failed log write never fails a request.
 
 ## Layout
 
@@ -35,6 +36,8 @@ src/Proxy.php      customer endpoints, request rewrite, streaming, charging
 src/Admin.php      billing/provisioning endpoints
 src/Http.php       request/response helpers; HttpError.php maps refusals to HTTP
 bin/virsilipas     CLI
+src/Log.php        leveled JSONL log, one file per UTC day
+tools/bench.php    load test (parallel, multi-process) with a ledger exactness check
 tests/             plain PHP runner (php tests/run.php), fake upstream, end-to-end harness
 ```
 

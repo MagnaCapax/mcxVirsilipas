@@ -19,7 +19,9 @@ final class Admin
     {
         $b = $this->body();
         $ref = self::ref($b);
-        Http::json(201, ['ref' => $ref, 'key' => $this->ledger->createKey($ref)]);
+        $key = $this->ledger->createKey($ref);
+        Log::write('info', 'key_create', ['ref' => $ref]);
+        Http::json(201, ['ref' => $ref, 'key' => $key]);
     }
 
     /** POST /admin/keys/active {"ref": "...", "active": true|false} — suspend or unsuspend. */
@@ -31,6 +33,7 @@ final class Admin
             throw new HttpError(400, 'active must be true or false');
         }
         $this->ledger->setActive($ref, $b['active']);
+        Log::write('info', 'key_active', ['ref' => $ref, 'active' => $b['active']]);
         Http::json(200, ['ref' => $ref, 'active' => $b['active']]);
     }
 
@@ -44,7 +47,9 @@ final class Admin
         if (!is_string($grantId) || $grantId === '' || strlen($grantId) > 200 || !is_int($tokens)) {
             throw new HttpError(400, 'grant needs a string grant_id and an integer tokens');
         }
-        Http::json(200, $this->ledger->grant($ref, $grantId, $tokens));
+        $r = $this->ledger->grant($ref, $grantId, $tokens);
+        Log::write('info', 'grant', ['ref' => $ref, 'grant_id' => $grantId, 'tokens' => $tokens, 'applied' => $r['applied'], 'balance' => $r['balance']]);
+        Http::json(200, $r);
     }
 
     /** @return array<string, mixed> */
@@ -57,6 +62,7 @@ final class Admin
     private function authorize(): void
     {
         if (!hash_equals($this->config->adminTokenSha256, hash('sha256', Http::bearer()))) {
+            Log::write('warn', 'admin_auth_failed');
             throw new HttpError(401, 'invalid admin token', 'authentication_error');
         }
     }

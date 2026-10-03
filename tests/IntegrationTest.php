@@ -331,3 +331,55 @@ function testIntegrationALowerUsageReportDoesNotEraseAHigherOne(): void
     settled($ref);
     same(61, lastUsage($ref)['charged'], 'the 11 + 50 report stands; the later 11 + 3 is ignored');
 }
+
+function testIntegrationLogsRecordEventsButNeverBodiesOrKeys(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $secret = 'SECRET-PROMPT-' . bin2hex(random_bytes(4));
+    $body = ['model' => 'ok', 'stream' => true, 'messages' => [['role' => 'user', 'content' => $secret]]];
+    same(200, http('POST', '/v1/chat/completions', $body, $key)['status']);
+    same(401, http('POST', '/admin/grants', ['ref' => $ref, 'grant_id' => 'g', 'tokens' => 1], 'wrong-admin-token')['status']);
+    settled($ref);
+    for ($i = 0; $i < 50; $i++) { // the record is written just after the settlement settled() waits for
+        $log = implode('', array_map('file_get_contents', glob(Harness::get()['dir'] . '/logs/*.jsonl')));
+        $records = array_map(static fn (string $l) => json_decode($l, true), array_filter(explode("\n", $log)));
+        $mine = array_values(array_filter($records, static fn ($r) => ($r['event'] ?? '') === 'request' && ($r['ref'] ?? '') === $ref));
+        if ($mine !== []) {
+            break;
+        }
+        usleep(20000);
+    }
+    same(1, count($mine), 'one request record for the request');
+    same(['info', 'ok', true, true, false], [$mine[0]['level'], $mine[0]['alias'], $mine[0]['stream'], $mine[0]['delivered'], $mine[0]['estimated']]);
+    check(in_array('admin_auth_failed', array_column($records, 'event'), true), 'a failed admin authentication is logged');
+    check(!str_contains($log, $secret), 'the prompt never reaches the log');
+    check(!str_contains($log, $key) && !str_contains($log, 'wrong-admin-token'), 'no key or token reaches the log');
+    check(!str_contains($log, 'hello world') && !str_contains($log, 'PRIVATE-DETAIL'), 'no response text reaches the log');
+}
+
+/** Load smoke: parallel streams across processes; no errors, and the ledger debits exactly what was reported. */
+function testIntegrationLoadSmokeUnderParallelStreams(): void
+{
+    [$ref, $key] = fundedKey(1000000);
+    $keyFile = tempDir() . '/key';
+    file_put_contents($keyFile, $key);
+    $cmd = [PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', '--url=' . Harness::get()['proxy'], "--key-file=$keyFile", '--model=ok',
+        '--requests=60', '--concurrency=2', '--processes=2', '--stream']; // 4 in flight: under the per-key cap of 5
+    $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    $out = stream_get_contents($pipes[1]);
+    $err = stream_get_contents($pipes[2]);
+    $code = proc_close($p);
+    check(preg_match('/^\[virsilipas-bench\] (\{.*\})$/m', $out, $m) === 1, "one result line expected, got: $out $err");
+    $r = json_decode($m[1], true);
+    same(['ok', 60, 0, true], [$r['status'], $r['ok'], $r['errors'], $r['ledger_exact']], trim($err) . ' ' . json_encode($r['status_counts']));
+    same(0, $code);
+    same(60 * 21, $r['tokens'], 'every stream reported its usage');
+
+    // Over the per-key cap (12 in flight against 5): the excess is refused with 429, uncharged, and the ledger stays exact.
+    $cmd[6] = '--concurrency=6';
+    $p = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    preg_match('/^\[virsilipas-bench\] (\{.*\})$/m', (string) stream_get_contents($pipes[1]), $m);
+    proc_close($p);
+    $r = json_decode($m[1] ?? 'null', true);
+    check(($r['status_counts']['429'] ?? 0) > 0 && $r['ledger_exact'] === true, 'cap refusals are 429 and the ledger stays exact: ' . json_encode($r));
+}

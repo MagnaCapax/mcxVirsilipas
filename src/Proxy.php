@@ -66,13 +66,34 @@ final class Proxy
             $this->config->leaseSeconds,
         );
 
+        Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
+            'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
         $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
         try {
             $body = self::rewrite($req, $this->config->models[$alias], $lease['max_tokens'], $stream, $this->config->streamOptions);
             $result = $this->forward($body, $stream, $alias, $lease['reserved']);
         } finally {
-            $this->ledger->settle($lease['lease_id'], $key['id'], ...self::charge($result, $promptBound, $alias));
+            [$used, $meta] = self::charge($result, $promptBound, $alias);
+            $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
+            self::logRequest($key['ref'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }
+    }
+
+    /**
+     * One record per request, after it settled: counts and statuses only. An upstream failure,
+     * an estimated charge or usage above the reservation is a warning (it points at the
+     * upstream or its configuration); everything else, client hang-ups included, is info.
+     * @param array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool} $meta
+     */
+    private static function logRequest(string $ref, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
+    {
+        $failed = !$delivered && !$meta['aborted'];
+        $over = $used > $reserved;
+        Log::write($failed || $meta['estimated'] || $over ? 'warn' : 'info', 'request', [
+            'ref' => $ref, 'alias' => $meta['model'], 'stream' => $stream, 'upstream_status' => $meta['status'],
+            'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
+            'reserved' => $reserved, 'reported' => $used, 'charged' => min($used, $reserved), 'over_reservation' => $over,
+        ]);
     }
 
     /**

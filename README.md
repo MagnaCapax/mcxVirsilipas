@@ -89,6 +89,32 @@ Use a `grant_id` that is unique per payment, for example the invoice number or t
 
 Request and response bodies are never stored or logged. The usage table holds token counts, the model alias, status and timestamps. Keys are stored only as sha256 hashes.
 
+## Logging
+
+Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMMDD.jsonl`, a new file each UTC day, appended under a lock so parallel workers never interleave. Without `log_dir`, the same lines go to PHP's `error_log`. Every record has `ts`, `level` and `event`, plus counts, statuses and billing references; never bodies, prompts, keys, the admin token, upstream error text or client addresses. A failed log write never affects a request.
+
+| `log_level` | Adds | Events |
+|---|---|---|
+| `error` | unexpected failures | `exception` |
+| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `admin_auth_failed` |
+| `info` | every request and admin action | `request`, `refused` (4xx with path and reason), `key_create`, `key_active`, `grant` |
+| `debug` | request admission | `admit` (alias, prompt bound, reservation) |
+
+The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
+
+## Parallelism
+
+Each request runs in its own php-fpm worker for its whole duration, so `pm.max_children` is the proxy's global concurrency limit; `max_concurrent_per_key` stops one key from taking more than its share, and an upstream that is busy returns 429 to the client without a charge. The ledger is one SQLite file in WAL mode: every write is a short transaction, nothing is held open while a request streams, and other writers wait up to 10 seconds. Measured with the load tool below on the PHP built-in server: 30 concurrent streams on 6 keys, 600 requests, no errors, no locked-database waits, and every key debited exactly what was reported to it.
+
+## Load testing
+
+```sh
+php tools/bench.php --url=https://proxy.example --key-file=/path/to/key --model=default \
+    --requests=500 --concurrency=20 --processes=4 --stream
+```
+
+Runs the requests with `--concurrency` in flight per process across `--processes` processes, then reports requests per second, latency and time to first byte (p50, p95, p99), errors by status, and whether the key's balance fell by exactly the usage the proxy reported (`ledger_exact`; the key must have no other traffic, or pass `--no-ledger-check`). The result is one line on stdout, `[virsilipas-bench] {...}` (schema `virsilipas.bench.v1`), and the exit code is non-zero on any error or ledger mismatch. Keep `--concurrency` × `--processes` within the key's `max_concurrent_per_key`, or the excess is refused with 429.
+
 ## CLI
 
 ```
@@ -102,7 +128,9 @@ php tests/run.php            # unit and end-to-end tests, no network access need
 php tests/run.php integration
 ```
 
-The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time.
+The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time. They include a load smoke test that runs `tools/bench.php` with parallel streams across two processes.
+
+CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on PHP 8.2, 8.3 and 8.4, keeps the test output when a run fails, and runs PHPStan as an advisory check that reports but does not fail the build.
 
 ## Attribution
 

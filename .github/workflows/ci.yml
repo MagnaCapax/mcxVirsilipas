@@ -9,6 +9,40 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: [ '8.2', '8.3', '8.4' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, pdo_sqlite
+          coverage: none
+
+      - name: PHP syntax lint
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l > /dev/null
+          php -l bin/virsilipas > /dev/null
+
+      - name: Test suite (unit, end-to-end and load smoke)
+        run: php tests/run.php 2>&1 | tee test-output.log
+
+      - name: Upload test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-php${{ matrix.php }}
+          path: test-output.log
+
+  phpstan:
+    # Advisory, as in PMSS: findings are shown but do not fail the build.
+    runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,5 +54,7 @@ jobs:
           extensions: curl, pdo_sqlite
           coverage: none
 
-      - name: Run test suite
-        run: php tests/run.php
+      - name: PHPStan (advisory, level 5)
+        run: |
+          curl -sSL -o phpstan.phar https://github.com/phpstan/phpstan/releases/download/1.12.7/phpstan.phar
+          php phpstan.phar analyse --no-progress --level=5 src public tools bin/virsilipas
