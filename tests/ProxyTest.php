@@ -21,8 +21,10 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
 
 function testOnlyTextContentIsAdmitted(): void
 {
-    Proxy::checkMessages([['role' => 'user', 'content' => 'hi'], ['role' => 'assistant', 'content' => null],
-        ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello']]]]);
+    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => 'hi', 'audio' => ['url' => 'x']], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1']]],
+        ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello', 'cache_control' => ['x' => 1]]]]]);
+    same([['role' => 'user', 'content' => 'hi'], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1']]],
+        ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello']]]], $norm, 'unknown message and part fields dropped');
     $bad = [
         null, [], ['x' => ['role' => 'user', 'content' => 'hi']], [['content' => 'no role']],
         [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => ['url' => 'https://example.com/a.png']]]]],
@@ -30,7 +32,7 @@ function testOnlyTextContentIsAdmitted(): void
         [['role' => 'user', 'content' => 42]],
     ];
     foreach ($bad as $messages) {
-        same(400, throwsHttp(fn () => Proxy::checkMessages($messages))[0], json_encode($messages));
+        same(400, throwsHttp(fn () => Proxy::normalizeMessages($messages))[0], json_encode($messages));
     }
 }
 
@@ -65,7 +67,7 @@ function testUsageValidation(): void
 
 function testChargeUsesReportedUsageThenAnUpperBound(): void
 {
-    $base = ['status' => 200, 'aborted' => false, 'delivered' => true, 'completion_bound' => 900];
+    $base = ['status' => 200, 'aborted' => false, 'delivered' => true, 'completion_bound' => 900, 'unmetered' => 0];
     [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 5, 'total' => 15]] + $base, 100, 'a');
     same(15, $used);
     same(false, $meta['estimated']);
@@ -74,13 +76,17 @@ function testChargeUsesReportedUsageThenAnUpperBound(): void
     same(true, $meta['estimated']);
     [$used] = Proxy::charge(['usage' => null, 'delivered' => false] + $base, 100, 'a');
     same(0, $used, 'nothing delivered: nothing charged');
+    [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 2, 'total' => 12], 'unmetered' => 5000] + $base, 100, 'a');
+    same([5012, true], [$used, $meta['estimated']], 'output after the last usage report is added as an upper bound');
 }
 
 function testPublicViewHidesUpstreamDetails(): void
 {
     $j = ['model' => 'vendor/secret-model', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3,
         'estimated_cost' => 0.1, 'prompt_tokens_details' => ['cached_tokens' => 0, 'account' => 'x']]];
-    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3]], Proxy::publicView($j, 'alias'));
+    same(['choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3], 'model' => 'alias'], Proxy::publicView($j, 'alias'));
+    $top = ['id' => 'x', 'provider' => 'p', 'choices' => [['index' => 0, 'message' => ['content' => 'hi', 'note' => 'n'], 'x' => 1]]];
+    same(['id' => 'x', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]], 'model' => 'alias'], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
 }
 
 function testSseEventParsing(): void

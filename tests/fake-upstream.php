@@ -42,6 +42,24 @@ switch ($model) {
         header('Content-Type: application/json');
         echo '{"error":{"message":"private upstream detail: refused"}}';
         exit;
+    case 'scenario-empty-choices':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [], 'usage' => $usage(0)]);
+        exit;
+    case 'scenario-top-private':
+        header('Content-Type: application/json');
+        echo json_encode(['id' => 'x', 'provider' => 'PRIVATE-DETAIL', 'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'hi', 'provider_note' => 'PRIVATE-DETAIL']]], 'usage' => $usage(1)]);
+        exit;
+    case 'scenario-done-only':
+        header('Content-Type: text/event-stream');
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-stale-usage':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'first']]], 'usage' => $usage(1)]);
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('more ', 1000)]]]]);
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-truncated':
         header('Content-Type: application/json');
         header('Content-Length: 100000');
@@ -61,6 +79,7 @@ if (empty($req['stream'])) {
 }
 
 header('Content-Type: text/event-stream');
+$runaway = $model === 'scenario-runaway';
 $continuous = ($req['stream_options']['continuous_usage_stats'] ?? false) === true
     && !in_array($model, ['scenario-final-usage', 'scenario-big-delta', 'scenario-empty-usage'], true);
 $delayUs = in_array($model, ['scenario-slow', 'scenario-big-delta'], true) ? 200000 : 20000;
@@ -68,7 +87,7 @@ for ($i = 1; $i <= $chunks; $i++) {
     $text = $model === 'scenario-big-delta' && $i === 1 ? str_repeat('word ', 2000) : "t$i ";
     $c = ['id' => 'x', 'object' => 'chat.completion.chunk', 'model' => $model, 'choices' => [['index' => 0, 'delta' => ['content' => $text]]]];
     if ($continuous) {
-        $c['usage'] = $usage($i);
+        $c['usage'] = $usage($runaway ? 50 * $i : $i);
     }
     $event($c);
     if ($model === 'scenario-no-done') {

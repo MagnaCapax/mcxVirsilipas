@@ -60,7 +60,8 @@ function testIntegrationFinalOnlyUsageStreamDebitsExactly(): void
 
 function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
-    foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502]] as [$model, $stream, $status]) {
+    foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
+        ['empty-choices', false, 502], ['done-only', true, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));
@@ -173,4 +174,37 @@ function testIntegrationAdminFlow(): void
     same(200, http('POST', '/admin/keys/active', ['ref' => $ref, 'active' => true], 'admin-secret')['status']);
     same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status']);
     same(5000 - 18, settled($ref)['balance']);
+}
+
+function testIntegrationUnknownResponseFieldsNeverReachTheClient(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('top-private', false), $key);
+    same(200, $r['status']);
+    checkNoUpstreamDetails($r['body']);
+    same('top-private', json_decode($r['body'], true)['model'], 'alias added even when the upstream sent no model');
+    settled($ref);
+}
+
+function testIntegrationOutputAfterTheLastUsageReportIsCharged(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    same(200, http('POST', '/v1/chat/completions', msg('stale-usage', true), $key)['status']);
+    settled($ref);
+    $u = lastUsage($ref);
+    same(1, $u['estimated'], 'flagged');
+    check($u['reported'] > 5000, "5 kB delivered after the last usage report must count, got {$u['reported']}");
+    same(1, $u['over_reservation'], 'and is charged up to the reservation');
+    check($u['charged'] > 1000, 'not the stale 12');
+}
+
+function testIntegrationRunawayStreamIsStoppedAtTheReservation(): void
+{
+    [$ref, $key] = fundedKey(300);
+    $r = http('POST', '/v1/chat/completions', msg('runaway', true), $key);
+    same(200, $r['status']);
+    check(!str_contains($r['body'], 't10 '), 'upstream stopped before the end');
+    check(str_contains($r['body'], 'upstream stream ended early'), 'client told');
+    same(0, settled($ref)['balance'], 'charged the whole reservation, never more');
+    same(1, lastUsage($ref)['over_reservation']);
 }

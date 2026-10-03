@@ -55,7 +55,7 @@ final class Config
         if (!preg_match('/^[0-9a-f]{64}$/', $this->adminTokenSha256)) {
             throw new \InvalidArgumentException('config: admin_token_sha256 must be a sha256 hex digest');
         }
-        // A lease shorter than the upstream timeout would refund a live request's reservation mid-stream.
+        // A lease shorter than the upstream timeout would stop counting a live request against the concurrency limit.
         if ($this->leaseSeconds <= $this->upstreamTimeout) {
             throw new \InvalidArgumentException('config: lease_seconds must be greater than upstream_timeout');
         }

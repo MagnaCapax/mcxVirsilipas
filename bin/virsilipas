@@ -11,7 +11,7 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 
 $usage = <<<'TXT'
 Usage: virsilipas <command> [args]
-  init                              create or upgrade the database
+  init                              create the database tables (safe to re-run)
   key-create <ref>                  create a key for <ref>; prints the key once
   key-disable <ref>                 refuse all requests for <ref>
   key-enable <ref>                  allow requests for <ref> again

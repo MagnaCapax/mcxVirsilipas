@@ -7,16 +7,23 @@ namespace MagnaCapax\Virsilipas;
 /**
  * The customer-facing side: OpenAI-compatible chat completions with per-key metering.
  *
- * Flow per request: authenticate the key, admit only text requests made of known fields,
+ * Flow per request: authenticate the key, admit only text requests built from known fields,
  * reserve an upper bound of tokens (clamping max_tokens to the balance), forward to the
- * configured upstream, relay the response, then settle against the usage the upstream
+ * configured upstream, relay a rebuilt response, then settle against the usage the upstream
  * reported. Request and response bodies are never logged.
  */
 final class Proxy
 {
-    /** The only request fields forwarded upstream. Anything else is dropped, so it can neither cost nor leak. */
-    private const FORWARD = ['messages', 'tools', 'tool_choice', 'parallel_tool_calls', 'temperature', 'top_p', 'stop',
+    /** Request fields forwarded upstream besides messages. Anything else is dropped. */
+    private const FORWARD = ['tools', 'tool_choice', 'parallel_tool_calls', 'temperature', 'top_p', 'stop',
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
+    /** Message fields forwarded upstream. */
+    private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
+    /** Response fields relayed to the client, per level. Everything an upstream adds beyond these is dropped. */
+    private const RESPONSE_FIELDS = ['id', 'object', 'created', 'choices', 'usage'];
+    private const CHOICE_FIELDS = ['index', 'message', 'delta', 'finish_reason'];
+    private const OUTPUT_FIELDS = ['role', 'content', 'reasoning_content', 'tool_calls', 'refusal'];
+    private const MAX_COUNT = 1_000_000_000_000;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
     private const MAX_EVENT_BYTES = 1024 * 1024;
@@ -50,7 +57,7 @@ final class Proxy
         if (!is_string($alias) || !isset($this->config->models[$alias])) {
             throw new HttpError(404, 'unknown model; see /v1/models');
         }
-        self::checkMessages($req['messages'] ?? null);
+        $req['messages'] = self::normalizeMessages($req['messages'] ?? null);
         $stream = ($req['stream'] ?? false) === true;
         $promptBound = self::promptBound($req);
 
@@ -63,54 +70,61 @@ final class Proxy
             $this->config->leaseSeconds,
         );
 
-        $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0];
+        $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
         try {
             $body = self::rewrite($req, $this->config->models[$alias], $lease['max_tokens'], $stream, $this->config->streamOptions);
-            $result = $this->forward($body, $stream, $alias);
+            $result = $this->forward($body, $stream, $alias, $lease['reserved']);
         } finally {
             $this->ledger->settle($lease['lease_id'], $key['id'], ...self::charge($result, $promptBound, $alias));
         }
     }
 
     /**
-     * Messages must be a non-empty list of objects whose content is text: a string, null, or a
-     * list of {"type": "text"} parts. Images, audio and files are refused: their cost cannot be
-     * bounded before the request is sent.
+     * Validates and rebuilds the messages: a non-empty list of objects with a role, whose content
+     * is text (a string, null, or a list of {"type": "text", "text": ...} parts), keeping only the
+     * known message fields. Images, audio and files are refused: their cost cannot be bounded.
+     * @return list<array<string, mixed>>
      */
-    public static function checkMessages(mixed $messages): void
+    public static function normalizeMessages(mixed $messages): array
     {
         if (!is_array($messages) || $messages === [] || !array_is_list($messages)) {
             throw new HttpError(400, 'messages must be a non-empty array');
         }
+        $out = [];
         foreach ($messages as $m) {
             if (!is_array($m) || !is_string($m['role'] ?? null)) {
                 throw new HttpError(400, 'each message needs a role');
             }
+            $m = array_intersect_key($m, array_flip(self::MESSAGE_FIELDS));
             $content = $m['content'] ?? null;
-            if ($content === null || is_string($content)) {
-                continue;
-            }
-            if (!is_array($content)) {
+            if (is_array($content)) {
+                $parts = [];
+                foreach ($content as $part) {
+                    if (!is_array($part) || ($part['type'] ?? null) !== 'text' || !is_string($part['text'] ?? null)) {
+                        throw new HttpError(400, 'only text content is supported');
+                    }
+                    $parts[] = ['type' => 'text', 'text' => $part['text']];
+                }
+                $m['content'] = $parts;
+            } elseif ($content !== null && !is_string($content)) {
                 throw new HttpError(400, 'message content must be text');
             }
-            foreach ($content as $part) {
-                if (!is_array($part) || ($part['type'] ?? null) !== 'text' || !is_string($part['text'] ?? null)) {
-                    throw new HttpError(400, 'only text content is supported');
-                }
-            }
+            $out[] = $m;
         }
+        return $out;
     }
 
     /**
-     * Builds the upstream request from the allowlisted fields: operator-chosen model, n=1 (by
-     * omission), clamped max_tokens, and server-side stream_options so usage is reported.
+     * Builds the upstream request from the normalized messages and allowlisted fields:
+     * operator-chosen model, n=1 (by omission), clamped max_tokens, and server-side
+     * stream_options so usage is reported.
      * @param array<string, mixed> $req
      * @param array<string, mixed> $streamOptions
      * @return array<string, mixed>
      */
     public static function rewrite(array $req, string $upstreamModel, int $maxTokens, bool $stream, array $streamOptions): array
     {
-        $out = ['model' => $upstreamModel] + array_intersect_key($req, array_flip(self::FORWARD));
+        $out = ['model' => $upstreamModel] + self::promptFields($req);
         $out['max_tokens'] = $maxTokens;
         $out['stream'] = $stream;
         if ($stream) {
@@ -126,8 +140,16 @@ final class Proxy
      */
     public static function promptBound(array $req): int
     {
-        $fields = array_intersect_key($req, array_flip(self::FORWARD));
-        return strlen(json_encode($fields, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '') + 16;
+        return strlen(json_encode(self::promptFields($req), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '') + 16;
+    }
+
+    /**
+     * @param array<string, mixed> $req
+     * @return array<string, mixed>
+     */
+    private static function promptFields(array $req): array
+    {
+        return array_intersect_key($req, array_flip(['messages', ...self::FORWARD]));
     }
 
     /** @param array<string, mixed> $req */
@@ -144,8 +166,8 @@ final class Proxy
     }
 
     /**
-     * Token counts from an upstream usage object, or null if they are missing or not
-     * non-negative integers (missing usage is never read as zero).
+     * Token counts from an upstream usage object, or null if they are missing, not integers,
+     * negative or absurdly large (missing usage is never read as zero).
      * @return array{prompt: int, completion: int, total: int}|null
      */
     public static function validUsage(mixed $u): ?array
@@ -155,26 +177,29 @@ final class Proxy
         }
         $p = $u['prompt_tokens'] ?? null;
         $c = $u['completion_tokens'] ?? null;
-        if (!is_int($p) || !is_int($c) || $p < 0 || $c < 0) {
+        if (!is_int($p) || !is_int($c) || $p < 0 || $c < 0 || $p > self::MAX_COUNT || $c > self::MAX_COUNT) {
             return null;
         }
         $t = $u['total_tokens'] ?? null;
-        return ['prompt' => $p, 'completion' => $c, 'total' => is_int($t) ? max($t, $p + $c) : $p + $c];
+        $total = is_int($t) && $t <= 2 * self::MAX_COUNT ? max($t, $p + $c) : $p + $c;
+        return ['prompt' => $p, 'completion' => $c, 'total' => $total];
     }
 
     /**
      * Turns a forward() result into the settle() arguments: (used tokens, usage-row metadata).
-     * Reported usage wins. Without it, a delivered response is charged an upper bound (the
-     * prompt bound plus the bytes of what was delivered) and flagged; the ledger caps any charge
-     * at the reservation.
-     * @param array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int} $r
+     * Reported usage wins, plus an upper bound for anything delivered after the last report.
+     * Without any usage, a delivered response is charged an upper bound (prompt bound plus the
+     * bytes delivered). Bounds are flagged as estimated; the ledger caps any charge at the
+     * reservation.
+     * @param array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int} $r
      * @return array{0: int, 1: array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool}}
      */
     public static function charge(array $r, int $promptBound, string $alias): array
     {
         $u = $r['usage'];
         if ($u !== null) {
-            [$prompt, $completion, $used, $estimated] = [$u['prompt'], $u['completion'], $u['total'], false];
+            [$prompt, $completion] = [$u['prompt'], $u['completion'] + $r['unmetered']];
+            [$used, $estimated] = [$u['total'] + $r['unmetered'], $r['unmetered'] > 0];
         } elseif ($r['delivered']) {
             [$prompt, $completion, $estimated] = [$promptBound, $r['completion_bound'], true];
             $used = $prompt + $completion;
@@ -186,22 +211,43 @@ final class Proxy
     }
 
     /**
-     * What the client sees of an upstream chunk or completion: the alias as the model and only
-     * the three standard token counts as usage. Upstreams add their own fields (costs, account
-     * data, model ids) that are the operator's business, not the customer's.
+     * The response the client sees, rebuilt from known fields only: the alias as the model,
+     * choices with their standard fields, and the three standard token counts as usage.
+     * Anything an upstream adds (costs, account data, provider names, model ids) is dropped.
      * @param array<string, mixed> $j
      * @return array<string, mixed>
      */
     public static function publicView(array $j, string $alias): array
     {
-        if (array_key_exists('model', $j)) {
-            $j['model'] = $alias;
+        $out = array_intersect_key($j, array_flip(self::RESPONSE_FIELDS));
+        $out['model'] = $alias;
+        if (isset($out['choices'])) {
+            $choices = [];
+            foreach (is_array($out['choices']) ? $out['choices'] : [] as $c) {
+                if (!is_array($c)) {
+                    continue;
+                }
+                $c = array_intersect_key($c, array_flip(self::CHOICE_FIELDS));
+                foreach (['message', 'delta'] as $k) {
+                    if (isset($c[$k]) && is_array($c[$k])) {
+                        $c[$k] = array_intersect_key($c[$k], array_flip(self::OUTPUT_FIELDS));
+                    }
+                }
+                $choices[] = $c;
+            }
+            $out['choices'] = $choices;
         }
-        if (isset($j['usage'])) {
-            $u = self::validUsage($j['usage']);
-            $j['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total']];
+        if (array_key_exists('usage', $out)) {
+            $u = self::validUsage($out['usage']);
+            $out['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total']];
         }
-        return $j;
+        return $out;
+    }
+
+    /** A completion with at least one choice: what a 200 must carry. */
+    private static function hasChoices(mixed $j): bool
+    {
+        return is_array($j) && !isset($j['error']) && is_array($j['choices'] ?? null) && $j['choices'] !== [];
     }
 
     /**
@@ -242,19 +288,20 @@ final class Proxy
 
     /**
      * Forwards to the upstream. The client gets a 200 only once the upstream has answered 2xx
-     * with a valid completion (non-stream) or a valid first event (stream); otherwise a generic
-     * error of the same class, with nothing charged (upstream bodies are not relayed).
-     * A client that hangs up stops the upstream request; what was delivered is still charged.
+     * with a completion that has choices (non-stream) or a first event with choices (stream);
+     * otherwise a generic error of the same class, with nothing charged (upstream bodies are not
+     * relayed). A client that hangs up stops the upstream request, and so does a stream whose
+     * reported usage passes the reservation; what was delivered is still charged.
      * @param array<string, mixed> $body
-     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int}
+     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int}
      */
-    private function forward(array $body, bool $stream, string $alias): array
+    private function forward(array $body, bool $stream, string $alias, int $reserved): array
     {
-        $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'done' => false,
-            'bad' => false, 'too_big' => false, 'bytes' => 0, 'buf' => '', 'full' => ''];
+        $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false,
+            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'pending' => '', 'full' => ''];
 
-        // One event: update usage and the delivered-bytes bound, return the text to relay ('' = drop).
-        $handle = static function (string $event) use (&$s, $alias): string {
+        // One event: update usage and the byte bounds, return the text to relay ('' = drop).
+        $handle = static function (string $event) use (&$s, $alias, $reserved): string {
             $e = self::parseEvent($event);
             if ($e === null) {
                 return '';
@@ -268,12 +315,19 @@ final class Proxy
                 $s['bad'] = !$s['started'];
                 return '';
             }
+            foreach ((is_array($j['choices'] ?? null) ? $j['choices'] : []) as $choice) {
+                $n = strlen(json_encode($choice['delta'] ?? [], JSON_UNESCAPED_UNICODE) ?: '');
+                $s['bytes'] += $n;
+                $s['unmetered'] += $n;
+            }
             $u = self::validUsage($j['usage'] ?? null);
             if ($u !== null) {
                 $s['usage'] = $u; // cumulative when the upstream reports continuously
+                $s['unmetered'] = 0;
+                $s['over'] = $u['total'] > $reserved;
             }
-            foreach (($j['choices'] ?? []) as $choice) {
-                $s['bytes'] += strlen(json_encode($choice['delta'] ?? [], JSON_UNESCAPED_UNICODE) ?: '');
+            if (self::hasChoices($j)) {
+                $s['start'] = true;
             }
             return 'data: ' . json_encode(self::publicView($j, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n";
         };
@@ -318,25 +372,30 @@ final class Proxy
                     $s['too_big'] = true;
                     return 0;
                 }
-                if ($out !== '') {
-                    if (!$s['started']) {
-                        $s['started'] = true;
-                        while (ob_get_level() > 0) {
-                            ob_end_flush();
-                        }
-                        http_response_code(200);
-                        header('Content-Type: text/event-stream');
-                        header('Cache-Control: no-cache');
-                        header('X-Accel-Buffering: no');
+                if (!$s['started']) {
+                    $s['pending'] .= $out; // nothing is sent until an event with choices arrives
+                    if (!$s['start']) {
+                        return $len;
                     }
+                    $s['started'] = true;
+                    $out = $s['pending'];
+                    while (ob_get_level() > 0) {
+                        ob_end_flush();
+                    }
+                    http_response_code(200);
+                    header('Content-Type: text/event-stream');
+                    header('Cache-Control: no-cache');
+                    header('X-Accel-Buffering: no');
+                }
+                if ($out !== '') {
                     echo $out;
                     flush();
                 }
-                if ($s['started'] && connection_aborted()) {
+                if (connection_aborted()) {
                     $s['aborted'] = true;
                     return 0; // a short write makes curl stop the upstream request
                 }
-                return $len;
+                return $s['over'] ? 0 : $len; // usage past the reservation: stop paying for more
             },
         ]);
         curl_exec($ch);
@@ -344,7 +403,7 @@ final class Proxy
         curl_close($ch);
 
         $status = $s['status'];
-        $result = ['status' => $status, 'usage' => null, 'aborted' => $s['aborted'], 'delivered' => false, 'completion_bound' => 0];
+        $result = ['status' => $status, 'usage' => null, 'aborted' => $s['aborted'], 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
 
         if ($stream && $s['started']) {
             if (!$s['aborted']) {
@@ -355,11 +414,11 @@ final class Proxy
                 echo $tail;
                 flush();
             }
-            return ['usage' => $s['usage'], 'delivered' => true, 'completion_bound' => $s['bytes']] + $result;
+            return ['usage' => $s['usage'], 'delivered' => true, 'completion_bound' => $s['bytes'], 'unmetered' => $s['unmetered']] + $result;
         }
 
         $json = (!$stream && $curlErr === 0 && $status >= 200 && $status <= 299) ? json_decode($s['full'], true) : null;
-        if (is_array($json) && is_array($json['choices'] ?? null) && !isset($json['error'])) {
+        if (self::hasChoices($json)) {
             http_response_code(200);
             header('Content-Type: application/json');
             echo json_encode(self::publicView($json, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

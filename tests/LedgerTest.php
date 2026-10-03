@@ -156,3 +156,26 @@ function testWorldReadableDatabaseIsRefused(): void
         check(str_contains($e->getMessage(), 'other users'), 'refusal names the problem');
     }
 }
+
+function testReadableWalOrWorldWritableDirectoryIsRefused(): void
+{
+    $dir = tempDir();
+    (new Ledger("$dir/ledger.sqlite"))->migrate();
+    touch("$dir/ledger.sqlite-wal");
+    chmod("$dir/ledger.sqlite-wal", 0644);
+    same(true, str_contains(throwsRuntime(fn () => new Ledger("$dir/ledger.sqlite")), 'accessible'), 'readable WAL');
+    chmod("$dir/ledger.sqlite-wal", 0600);
+    chmod($dir, 0777);
+    same(true, str_contains(throwsRuntime(fn () => new Ledger("$dir/ledger.sqlite")), 'writable'), 'world-writable directory');
+    chmod($dir, 0700);
+}
+
+function throwsRuntime(callable $fn): string
+{
+    try {
+        $fn();
+    } catch (\RuntimeException $e) {
+        return $e->getMessage();
+    }
+    throw new \RuntimeException('expected a refusal');
+}

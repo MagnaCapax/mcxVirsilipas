@@ -26,8 +26,14 @@ final class Ledger
 
     public function __construct(string $path)
     {
-        if (is_file($path) && (fileperms($path) & 0007) !== 0) {
-            throw new \RuntimeException('ledger database is accessible to other users; chmod 600 it');
+        $dir = dirname($path);
+        if (is_dir($dir) && (fileperms($dir) & 0002) !== 0) {
+            throw new \RuntimeException("ledger directory $dir is writable by other users");
+        }
+        foreach ([$path, "$path-wal", "$path-shm"] as $f) {
+            if (is_file($f) && (fileperms($f) & 0077) !== 0) {
+                throw new \RuntimeException("ledger file $f is accessible to other users; chmod 600 it");
+            }
         }
         $this->db = new \PDO('sqlite:' . $path, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
         $this->db->exec('PRAGMA busy_timeout = 10000');
