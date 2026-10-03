@@ -481,6 +481,8 @@ final class Proxy
      */
     private function forward(array $body, bool $stream, string $alias, int $reserved): array
     {
+        // Shared by reference with the curl callbacks below, which change it during the transfer.
+        /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string} $s */
         $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
             'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => ''];
 
