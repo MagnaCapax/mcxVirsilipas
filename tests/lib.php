@@ -56,7 +56,7 @@ function configArrayFor(string $dir, array $overrides = []): array
             'incomplete-message' => 'scenario-incomplete-message', 'done-first' => 'scenario-done-first', 'after-done' => 'scenario-after-done',
             'blank-tool' => 'scenario-blank-tool', 'stream-message' => 'scenario-stream-message', 'invalid-prelude' => 'scenario-invalid-prelude',
             'done-hang' => 'scenario-done-hang', 'stream-message-bytes' => 'scenario-stream-message-bytes', 'private-bytes' => 'scenario-private-bytes',
-            'over-batch' => 'scenario-over-batch'],
+            'over-batch' => 'scenario-over-batch', 'error-after-start' => 'scenario-error-after-start', 'error-batched' => 'scenario-error-batched'],
         'max_tokens_cap' => 1000,
         'max_concurrent_per_key' => 5,
         'lease_seconds' => 60,

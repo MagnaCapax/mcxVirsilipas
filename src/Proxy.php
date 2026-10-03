@@ -453,22 +453,29 @@ final class Proxy
      */
     private function forward(array $body, bool $stream, string $alias, int $reserved): array
     {
-        $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false,
+        $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
             'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => ''];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
         $handle = static function (string $event) use (&$s, $alias, $reserved): string {
             $e = self::parseEvent($event);
-            if ($e === null || $s['done']) {
-                return ''; // nothing after the terminal marker is relayed or counted
+            if ($e === null || $s['done'] || $s['failed']) {
+                return ''; // nothing after the terminal marker, or after an upstream error, is relayed or counted
             }
             if ($e['done']) {
                 $s['done'] = true; // a [DONE] before any choice leaves the stream unstarted: a 502, no charge
                 return "data: [DONE]\n\n";
             }
             $j = $e['json'];
-            if (isset($j['error']) || (!isset($j['choices']) && !isset($j['usage']))) {
-                $s['bad'] = !$s['started'];
+            $begun = $s['started'] || $s['start'];
+            if (isset($j['error'])) {
+                // Before the stream starts: a refusal (generic non-200). After: the stream ends here
+                // with the generic in-band error and no [DONE]; output already relayed is charged.
+                $s[$begun ? 'failed' : 'bad'] = true;
+                return '';
+            }
+            if (!isset($j['choices']) && !isset($j['usage'])) {
+                $s['bad'] = !$begun; // not a completion event; ignored once the stream has begun
                 return '';
             }
             if (self::hasChoices($j, false)) {
@@ -528,8 +535,8 @@ final class Proxy
                     if ($s['bad']) {
                         return 0; // a 2xx that is not a completion stream: nothing has been sent yet
                     }
-                    if ($s['over']) {
-                        $s['buf'] = ''; // the reservation is used up: nothing queued after this event is relayed
+                    if ($s['over'] || $s['failed']) {
+                        $s['buf'] = ''; // reservation used up, or upstream error: nothing queued behind it is relayed
                         break;
                     }
                 }
@@ -560,7 +567,7 @@ final class Proxy
                 }
                 // Usage past the reservation: stop paying for more. [DONE]: the answer is complete, so
                 // do not hold the worker and the key's concurrency slot while the upstream lingers.
-                return ($s['over'] || $s['done']) ? 0 : $len;
+                return ($s['over'] || $s['done'] || $s['failed']) ? 0 : $len;
             },
         ]);
         curl_exec($ch);

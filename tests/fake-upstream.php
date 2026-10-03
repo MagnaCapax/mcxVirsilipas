@@ -156,6 +156,18 @@ switch ($model) {
             . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('W', 4000)]]]]) . "\n\n"
             . "data: [DONE]\n\n";
         exit;
+    case 'scenario-error-after-start':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'partial']]], 'usage' => $usage(1)]);
+        usleep(300000);
+        $event(['error' => ['message' => 'PRIVATE-DETAIL: upstream failed mid-stream']]);
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-error-batched':
+        header('Content-Type: text/event-stream');
+        echo 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('V', 4000)]]]]) . "\n\n"
+            . 'data: ' . json_encode(['error' => ['message' => 'PRIVATE-DETAIL']]) . "\n\n" . "data: [DONE]\n\n";
+        exit;
     case 'scenario-done-first':
         header('Content-Type: text/event-stream');
         echo "data: [DONE]\n\n" . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => 'late']]], 'usage' => $usage(1)]) . "\n\n";

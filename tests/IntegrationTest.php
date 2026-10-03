@@ -193,6 +193,19 @@ function testIntegrationNothingIsRelayedAfterTheReservationIsUsedUp(): void
     same(0, settled($ref)['balance'], 'charged the reservation, never more');
 }
 
+function testIntegrationAnUpstreamErrorAfterTheStreamStartedEndsItWithoutDone(): void
+{
+    foreach (['error-after-start' => 'partial', 'error-batched' => 'VVVV'] as $model => $text) {
+        [$ref, $key] = fundedKey(10000);
+        $r = http('POST', '/v1/chat/completions', msg($model, true), $key);
+        same(200, $r['status'], "$model: the 200 was already sent");
+        check(str_contains($r['body'], $text), "$model: output relayed before the error is kept");
+        check(str_contains($r['body'], 'upstream stream ended early') && !str_contains($r['body'], '[DONE]'), "$model: generic in-band error, no [DONE]");
+        checkNoUpstreamDetails($r['body']);
+        check(settled($ref)['balance'] < 10000, "$model: the relayed output is charged");
+    }
+}
+
 function testIntegrationTheUpstreamIsLeftAtTheTerminalMarker(): void
 {
     [$ref, $key] = fundedKey(10000);
