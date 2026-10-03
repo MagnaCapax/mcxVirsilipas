@@ -165,6 +165,34 @@ function testIntegrationDroppedEventsAddNothingToTheCharge(): void
     check($u['charged'] < 1000, "the 1,000 dropped bytes are not charged: got {$u['charged']}");
 }
 
+function testIntegrationTheEstimateCoversExactlyWhatTheClientReceived(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('stream-message-bytes', true), $key);
+    same(200, $r['status']);
+    check(str_contains($r['body'], 'MMMM'), 'the message text was relayed');
+    settled($ref);
+    check(lastUsage($ref)['charged'] > 1000, 'so its 4 kB count toward the estimate (capped at the reservation)');
+
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('private-bytes', false), $key);
+    same(200, $r['status']);
+    check(!str_contains($r['body'], 'PPPP'), 'the private field was dropped');
+    settled($ref);
+    $u = lastUsage($ref);
+    same(1, $u['estimated']);
+    check($u['charged'] < 200, "so its 4 kB do not count: charged {$u['charged']}");
+}
+
+function testIntegrationNothingIsRelayedAfterTheReservationIsUsedUp(): void
+{
+    [$ref, $key] = fundedKey(300);
+    $r = http('POST', '/v1/chat/completions', msg('over-batch', true), $key);
+    same(200, $r['status']);
+    check(!str_contains($r['body'], 'WWWW'), 'the event queued after the over-limit report is not relayed');
+    same(0, settled($ref)['balance'], 'charged the reservation, never more');
+}
+
 function testIntegrationTheUpstreamIsLeftAtTheTerminalMarker(): void
 {
     [$ref, $key] = fundedKey(10000);

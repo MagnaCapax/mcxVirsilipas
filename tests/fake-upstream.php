@@ -139,6 +139,23 @@ switch ($model) {
         flush();
         sleep(3); // an upstream that keeps the connection open after its terminal marker
         exit;
+    case 'scenario-stream-message-bytes':
+        header('Content-Type: text/event-stream');
+        // A role delta plus 4 kB in a message object, and no usage: the relayed message text must count.
+        $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant'], 'message' => ['content' => str_repeat('M', 4000)]]]]);
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-private-bytes':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'ok', 'provider_trace' => str_repeat('P', 4000)]]]]);
+        exit;
+    case 'scenario-over-batch':
+        header('Content-Type: text/event-stream');
+        // One write: an event reporting usage past the reservation, then more output.
+        echo 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => 'a']]], 'usage' => $usage(400)]) . "\n\n"
+            . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('W', 4000)]]]]) . "\n\n"
+            . "data: [DONE]\n\n";
+        exit;
     case 'scenario-done-first':
         header('Content-Type: text/event-stream');
         echo "data: [DONE]\n\n" . 'data: ' . json_encode(['choices' => [['index' => 0, 'delta' => ['content' => 'late']]], 'usage' => $usage(1)]) . "\n\n";

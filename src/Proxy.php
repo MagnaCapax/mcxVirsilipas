@@ -374,7 +374,22 @@ final class Proxy
         return is_array($v) && ($v === [] || !array_is_list($v));
     }
 
-    /** Bytes of text a choice delivers: content, reasoning, refusal and tool-call names and arguments. */
+    /**
+     * Bytes of text a rebuilt response or event delivers to the client, over every choice's
+     * message and delta. The upper-bound charge is derived from this, so it covers exactly what
+     * was relayed: neither discarded upstream fields nor relayed text outside a delta escape it.
+     * @param array<string, mixed> $view
+     */
+    private static function viewBytes(array $view): int
+    {
+        $n = 0;
+        foreach ($view['choices'] ?? [] as $c) {
+            $n += self::textBytes($c['message'] ?? null) + self::textBytes($c['delta'] ?? null);
+        }
+        return $n;
+    }
+
+    /** Bytes of text a message or delta carries: content, reasoning, refusal and tool-call names and arguments. */
     private static function textBytes(mixed $part): int
     {
         if (!is_array($part)) {
@@ -464,11 +479,9 @@ final class Proxy
             // the rebuilt event the client receives, never from raw upstream text.
             $relay = $s['started'] || $s['start'];
             $view = self::publicView($j, $alias);
-            foreach ($relay ? ($view['choices'] ?? []) : [] as $choice) {
-                $n = self::textBytes($choice['delta'] ?? null);
-                $s['bytes'] += $n;
-                $s['unmetered'] += $n;
-            }
+            $n = $relay ? self::viewBytes($view) : 0;
+            $s['bytes'] += $n;
+            $s['unmetered'] += $n;
             $u = self::validUsage($j['usage'] ?? null);
             // Usage is cumulative. Only a report that advances covers the text delivered since the
             // last one; an equal or lower report changes nothing, so that text stays charged as bytes.
@@ -514,6 +527,10 @@ final class Proxy
                     $out .= $handle($event);
                     if ($s['bad']) {
                         return 0; // a 2xx that is not a completion stream: nothing has been sent yet
+                    }
+                    if ($s['over']) {
+                        $s['buf'] = ''; // the reservation is used up: nothing queued after this event is relayed
+                        break;
                     }
                 }
                 if (strlen($s['buf']) > self::MAX_EVENT_BYTES) {
@@ -569,8 +586,9 @@ final class Proxy
         if (self::hasChoices($json, true)) {
             http_response_code(200);
             header('Content-Type: application/json');
-            echo json_encode(self::publicView($json, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            $bound = strlen(json_encode($json['choices'], JSON_UNESCAPED_UNICODE) ?: '');
+            $view = self::publicView($json, $alias);
+            echo json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $bound = self::viewBytes($view); // what the client received, never discarded upstream fields
             return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
         }
 
