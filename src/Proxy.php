@@ -413,10 +413,17 @@ final class Proxy
     public static function parseEvent(string $event): ?array
     {
         $data = [];
+        $name = '';
         foreach (explode("\n", $event) as $line) {
             if (str_starts_with($line, 'data:')) {
                 $data[] = ltrim(substr($line, 5), ' ');
+            } elseif (str_starts_with($line, 'event:')) {
+                $name = trim(substr($line, 6));
             }
+        }
+        if ($name === 'error') {
+            // A named error frame is an error whatever its data says (the data is never relayed).
+            return ['json' => ['error' => ['message' => 'upstream error event']], 'done' => false];
         }
         if ($data === []) {
             return null;
