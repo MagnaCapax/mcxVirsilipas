@@ -97,7 +97,7 @@ final class Proxy
                     throw new HttpError(400, "message $k must be a string");
                 }
             }
-            if (isset($m['tool_calls'])) {
+            if (array_key_exists('tool_calls', $m)) {
                 $m['tool_calls'] = self::toolCalls($m['tool_calls'], true);
             }
             $content = $m['content'] ?? null;
@@ -262,8 +262,9 @@ final class Proxy
             foreach (['message', 'delta'] as $k) {
                 if (self::isObject($c[$k] ?? null)) {
                     $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => '?string', 'reasoning_content' => '?string', 'refusal' => '?string']);
-                    if (array_key_exists('tool_calls', $c[$k])) {
-                        $choice[$k]['tool_calls'] = self::toolCalls($c[$k]['tool_calls'], false);
+                    $calls = self::toolCalls($c[$k]['tool_calls'] ?? null, false);
+                    if ($calls !== []) {
+                        $choice[$k]['tool_calls'] = $calls; // no usable call: no tool_calls, so it cannot make a choice usable
                     }
                 }
             }
@@ -282,33 +283,27 @@ final class Proxy
      */
     private static function toolCalls(mixed $calls, bool $strict): array
     {
-        if (!is_array($calls) || !array_is_list($calls)) {
+        if (!is_array($calls) || !array_is_list($calls) || ($strict && $calls === [])) {
             if ($strict) {
-                throw new HttpError(400, 'tool_calls must be a list');
+                throw new HttpError(400, 'tool_calls must be a non-empty list');
             }
             return [];
         }
         $out = [];
         foreach ($calls as $t) {
-            if (!is_array($t)) {
-                if ($strict) {
-                    throw new HttpError(400, 'each tool call must be an object');
-                }
-                continue;
-            }
             $dropped = 0;
-            $call = self::typed($t, ['index' => 'int', 'id' => 'string', 'type' => 'string'], $dropped);
-            if (array_key_exists('function', $t)) {
-                $fn = self::isObject($t['function']) ? self::typed($t['function'], ['name' => 'string', 'arguments' => 'string'], $dropped) : null;
-                $dropped += $fn === null ? 1 : 0;
-                if ($fn) {
-                    $call['function'] = $fn; // an empty or invalid function object is omitted, never relayed as []
-                }
+            $call = self::isObject($t) ? self::typed($t, ['index' => 'int', 'id' => 'string', 'type' => 'string'], $dropped) : [];
+            $fn = self::isObject($t['function'] ?? null) ? self::typed($t['function'], ['name' => 'string', 'arguments' => 'string'], $dropped) : [];
+            if ($fn !== []) {
+                $call['function'] = $fn; // an empty or invalid function object is omitted, never relayed as []
             }
-            if ($strict && $dropped > 0) {
-                throw new HttpError(400, 'tool call fields must be strings (arguments as a JSON string)');
+            // A request replays a complete call; a response (or stream fragment) needs at least one valid field.
+            if ($strict && ($dropped > 0 || !isset($call['id'], $call['type'], $fn['name'], $fn['arguments']))) {
+                throw new HttpError(400, 'each tool call needs string id, type, function name and arguments (a JSON string)');
             }
-            $out[] = $call;
+            if ($call !== []) {
+                $out[] = $call;
+            }
         }
         return $out;
     }

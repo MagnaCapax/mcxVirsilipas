@@ -86,6 +86,16 @@ switch ($model) {
         header('Content-Type: application/json');
         echo json_encode(['choices' => [new stdClass()], 'usage' => $usage(1)]);
         exit;
+    case 'scenario-empty-tool-call':
+        if (empty($req['stream'])) {
+            header('Content-Type: application/json');
+            echo '{"choices":[{"message":{"tool_calls":[[]]}}],"usage":' . json_encode($usage(1)) . '}';
+            exit;
+        }
+        header('Content-Type: text/event-stream');
+        echo 'data: {"choices":[{"index":0,"delta":{"tool_calls":[[]]}}],"usage":' . json_encode($usage(1)) . "}\n\n";
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-list-message':
         header('Content-Type: application/json');
         echo '{"choices":[{"message":[]},{"index":1,"message":{}}],"usage":' . json_encode($usage(1)) . '}';

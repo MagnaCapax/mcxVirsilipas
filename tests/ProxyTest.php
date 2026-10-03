@@ -21,9 +21,11 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
 
 function testOnlyTextContentIsAdmitted(): void
 {
-    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => 'hi', 'audio' => ['url' => 'x']], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'audio' => ['url' => 'external']]]],
+    $call = ['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']];
+    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => 'hi', 'audio' => ['url' => 'x']],
+        ['role' => 'assistant', 'content' => null, 'tool_calls' => [$call + ['audio' => ['url' => 'external']]]],
         ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello', 'cache_control' => ['x' => 1]]]]]);
-    same([['role' => 'user', 'content' => 'hi'], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1']]],
+    same([['role' => 'user', 'content' => 'hi'], ['role' => 'assistant', 'content' => null, 'tool_calls' => [$call]],
         ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello']]]], $norm, 'unknown message and part fields dropped');
     $bad = [
         null, [], ['x' => ['role' => 'user', 'content' => 'hi']], [['content' => 'no role']],
@@ -36,6 +38,11 @@ function testOnlyTextContentIsAdmitted(): void
         [['role' => 'tool', 'tool_call_id' => ['x'], 'content' => 'ok']],
         [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => null, 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]]]],
         [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => null]]]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => null]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => []]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [[]]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'type' => 'function', 'function' => []]]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'function' => ['name' => 'f', 'arguments' => '{}']]]]],
     ];
     foreach ($bad as $messages) {
         same(400, throwsHttp(fn () => Proxy::normalizeMessages($messages))[0], json_encode($messages));
@@ -103,6 +110,10 @@ function testPublicViewHidesUpstreamDetails(): void
     same('{"model":"a","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}', json_encode(Proxy::publicView(['choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'stop']]], 'a')),
         'an empty closing delta is relayed as {}');
     same([], Proxy::publicView(['choices' => [['message' => ['x']]]], 'a')['choices'], 'a list is not a message object');
+    same('{"model":"a","choices":[{"message":{}}]}', json_encode(Proxy::publicView(['choices' => [['message' => ['tool_calls' => [[], 'x', ['id' => null]]]]]], 'a')),
+        'calls without a usable field are dropped, and an empty tool_calls is omitted');
+    $fragment = ['choices' => [['index' => 0, 'delta' => ['tool_calls' => [['index' => 0, 'function' => ['arguments' => '{"a']]]]]]];
+    same([['index' => 0, 'function' => ['arguments' => '{"a']]], Proxy::publicView($fragment, 'a')['choices'][0]['delta']['tool_calls'], 'a stream fragment of a call is kept');
     $tc = ['choices' => [['delta' => ['tool_calls' => [['index' => 0, 'id' => 'c', 'type' => 'function', 'secret' => 's', 'function' => ['name' => 'f', 'arguments' => '{}', 'secret' => 's']]]]]]];
     same([['index' => 0, 'id' => 'c', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]], Proxy::publicView($tc, 'a')['choices'][0]['delta']['tool_calls'], 'tool calls keep standard fields only');
 }
