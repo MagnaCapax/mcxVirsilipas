@@ -154,19 +154,25 @@ final class Ledger
         return ['id' => (int) $row['id'], 'ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active']];
     }
 
-    /** @return array{ref: string, balance: int, active: bool, in_flight: int} */
+    /**
+     * Balance and lease counts. `held` = expired leases never settled (their worker died); their
+     * reservations stay charged, so the operator can see and reconcile them.
+     * @return array{ref: string, balance: int, active: bool, in_flight: int, held: int}
+     */
     public function status(string $ref): array
     {
+        $now = time();
         $st = $this->db->prepare('SELECT k.ref, k.balance, k.active,
-                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight
+                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight,
+                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held
             FROM keys k WHERE k.ref = ?');
-        $st->execute([time(), $ref]);
+        $st->execute([$now, $now, $ref]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
         $st->closeCursor();
         if ($row === false) {
             throw new HttpError(404, 'unknown ref');
         }
-        return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'], 'in_flight' => (int) $row['in_flight']];
+        return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'], 'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held']];
     }
 
     /**

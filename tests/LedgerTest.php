@@ -79,7 +79,7 @@ function testReserveClampsMaxTokensToBalance(): void
     $r = $l->reserve($id, 50, 1000, 4000, 4, 60);
     same(100, $r['max_tokens'], 'clamped to balance minus prompt bound');
     same(150, $r['reserved']);
-    same(['ref' => 'a', 'balance' => 0, 'active' => true, 'in_flight' => 1], $l->status('a'));
+    same(['ref' => 'a', 'balance' => 0, 'active' => true, 'in_flight' => 1, 'held' => 0], $l->status('a'));
     [$l2, $id2] = fundedLedger(100000);
     same(4000, $l2->reserve($id2, 50, null, 4000, 4, 60)['max_tokens'], 'no max_tokens requested: the cap applies');
 }
@@ -123,11 +123,12 @@ function testExpiredLeaseStaysChargedAndALateSettleCorrectsItOnce(): void
     [$l, $id] = fundedLedger(100);
     $r = $l->reserve($id, 10, 50, 1000, 1, 1); // reserves 60, lease lives 1 s, limit 1 in flight
     sleep(2);
-    same(['ref' => 'a', 'balance' => 40, 'active' => true, 'in_flight' => 0], $l->status('a'), 'expired: not in flight, still charged');
+    same(['ref' => 'a', 'balance' => 40, 'active' => true, 'in_flight' => 0, 'held' => 1], $l->status('a'), 'expired: not in flight, still charged, counted as held');
     $r2 = $l->reserve($id, 10, 20, 1000, 1, 60); // the dead lease no longer blocks concurrency
     same(10, $l->status('a')['balance']);
     same(true, $l->settle($r['lease_id'], $id, 15, meta()), 'late settle of the dead lease');
     same(55, $l->status('a')['balance'], '60 reserved, 15 charged, 45 returned');
+    same(0, $l->status('a')['held'], 'no longer held once settled');
     same(false, $l->settle($r['lease_id'], $id, 15, meta()));
     same(55, $l->status('a')['balance']);
     unset($r2);
