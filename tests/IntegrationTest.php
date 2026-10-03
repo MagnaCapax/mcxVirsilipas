@@ -61,7 +61,7 @@ function testIntegrationFinalOnlyUsageStreamDebitsExactly(): void
 function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
     foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
-        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502]] as [$model, $stream, $status]) {
+        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502], ['empty-choice', false, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));
@@ -104,7 +104,42 @@ function testIntegrationClientHangUpIsChargedForWhatWasGenerated(): void
     $u = lastUsage($ref);
     same([1, 0, $charged], [$u['aborted'], $u['estimated'], $u['charged']], 'aborted, exact (continuous usage)');
     preg_match_all('/"total_tokens":(\d+)/', $r['body'], $m);
-    check($m[1] !== [] && $charged >= (int) end($m[1]), 'charged at least the last usage the client saw');
+    $seen = $m[1] === [] ? 0 : (int) end($m[1]);
+    $generated = (int) file_get_contents(Harness::get()['dir'] . '/generated-total.txt');
+    check($seen > 11 && $charged >= $seen && $charged <= $generated,
+        "charged $charged: at least the last usage the client saw ($seen), at most what the upstream generated ($generated)");
+}
+
+function testIntegrationAnEqualUsageReportDoesNotEraseLaterOutput(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    same(200, http('POST', '/v1/chat/completions', msg('equal-usage', true), $key)['status']);
+    settled($ref);
+    $u = lastUsage($ref);
+    same([1, 1], [$u['estimated'], $u['over_reservation']], 'the 5 kB after the last advancing report is an upper bound, capped');
+    check($u['reported'] > 5000 && $u['charged'] > 1000, "5 kB delivered after the report must count, not the stale 61: got {$u['charged']}");
+}
+
+function testIntegrationMalformedUsageIsChargedAnUpperBound(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    same(200, http('POST', '/v1/chat/completions', msg('negative-total', false), $key)['status']);
+    settled($ref);
+    $u = lastUsage($ref);
+    same([1, 1], [$u['estimated'], $u['over_reservation']], 'a negative total is not an exact report');
+    check($u['reported'] > 5000 && $u['charged'] > 1000, "the 5 kB answer is charged as bytes up to the reservation, not 1 token: got {$u['charged']}");
+}
+
+function testIntegrationWrongTypedResponseValuesNeverReachTheClient(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('typed-private', false), $key);
+    same(200, $r['status']);
+    checkNoUpstreamDetails($r['body']);
+    $msg = json_decode($r['body'], true)['choices'][0]['message'];
+    same(['index' => 0, 'id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f']], $msg['tool_calls'][0], 'object arguments dropped');
+    check(!isset($msg['content']), 'object content dropped');
+    settled($ref);
 }
 
 function testIntegrationHangUpWithoutUsageIsChargedAtMostTheReservation(): void

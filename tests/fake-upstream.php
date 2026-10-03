@@ -70,6 +70,29 @@ switch ($model) {
         $event(['choices' => [], 'usage' => $usage(3)]);
         echo "data: [DONE]\n\n";
         exit;
+    case 'scenario-equal-usage':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'a']]], 'usage' => $usage(50)]);
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('more ', 1000)]]]]);
+        $event(['choices' => [], 'usage' => $usage(50)]); // repeats the old count after 5 kB more output
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-negative-total':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => str_repeat('x', 5000)]]],
+            'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 0, 'total_tokens' => -1]]);
+        exit;
+    case 'scenario-empty-choice':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [new stdClass()], 'usage' => $usage(1)]);
+        exit;
+    case 'scenario-typed-private':
+        header('Content-Type: application/json');
+        echo json_encode(['id' => ['PRIVATE-DETAIL'], 'choices' => [['index' => 0, 'message' => ['role' => 'assistant',
+            'content' => ['private_account' => 'PRIVATE-DETAIL'],
+            'tool_calls' => [['index' => 0, 'id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => ['note' => 'PRIVATE-DETAIL']]]]],
+            'finish_reason' => 'tool_calls']], 'usage' => $usage(1)]);
+        exit;
     case 'scenario-truncated':
         header('Content-Type: application/json');
         header('Content-Length: 100000');
@@ -98,6 +121,8 @@ for ($i = 1; $i <= $chunks; $i++) {
     $c = ['id' => 'x', 'object' => 'chat.completion.chunk', 'model' => $model, 'choices' => [['index' => 0, 'delta' => ['content' => $text]]]];
     if ($continuous) {
         $c['usage'] = $usage($runaway ? 50 * $i : $i);
+        // Counts only: the total this upstream has generated so far, for the hang-up test.
+        file_put_contents($dir . '/generated-total.txt', (string) $c['usage']['total_tokens']);
     }
     $event($c);
     if ($model === 'scenario-no-done') {

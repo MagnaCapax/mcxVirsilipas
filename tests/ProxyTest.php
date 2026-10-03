@@ -30,6 +30,10 @@ function testOnlyTextContentIsAdmitted(): void
         [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => ['url' => 'https://example.com/a.png']]]]],
         [['role' => 'user', 'content' => [['type' => 'input_audio', 'input_audio' => ['data' => 'AAAA']]]]],
         [['role' => 'user', 'content' => 42]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => ['audio' => ['url' => 'external']]]]]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => ['x'], 'type' => 'function']]]],
+        [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'function' => 'f']]]],
+        [['role' => 'tool', 'tool_call_id' => ['x'], 'content' => 'ok']],
     ];
     foreach ($bad as $messages) {
         same(400, throwsHttp(fn () => Proxy::normalizeMessages($messages))[0], json_encode($messages));
@@ -58,9 +62,10 @@ function testRequestedMaxTokensValidation(): void
 function testUsageValidation(): void
 {
     same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
-    same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 3]), 'total below the parts');
-    same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5]), 'missing total');
-    foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x'], ['prompt_tokens' => 0, 'completion_tokens' => 0], ['prompt_tokens' => -1, 'completion_tokens' => 5], ['prompt_tokens' => '10', 'completion_tokens' => 5]] as $u) {
+    same(['prompt' => 10, 'completion' => 5, 'total' => 17], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 17]), 'a larger total is charged');
+    foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => 10, 'completion_tokens' => 5], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 3],
+        ['prompt_tokens' => 1, 'completion_tokens' => 0, 'total_tokens' => -1], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x'],
+        ['prompt_tokens' => 0, 'completion_tokens' => 0, 'total_tokens' => 0], ['prompt_tokens' => -1, 'completion_tokens' => 5, 'total_tokens' => 4], ['prompt_tokens' => '10', 'completion_tokens' => 5, 'total_tokens' => 15]] as $u) {
         same(null, Proxy::validUsage($u), json_encode($u));
     }
 }
@@ -84,9 +89,11 @@ function testPublicViewHidesUpstreamDetails(): void
 {
     $j = ['model' => 'vendor/secret-model', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3,
         'estimated_cost' => 0.1, 'prompt_tokens_details' => ['cached_tokens' => 0, 'account' => 'x']]];
-    same(['choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3], 'model' => 'alias'], Proxy::publicView($j, 'alias'));
+    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3]], Proxy::publicView($j, 'alias'));
     $top = ['id' => 'x', 'provider' => 'p', 'choices' => [['index' => 0, 'message' => ['content' => 'hi', 'note' => 'n'], 'x' => 1]]];
-    same(['id' => 'x', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]], 'model' => 'alias'], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
+    same(['id' => 'x', 'model' => 'alias', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]]], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
+    $typed = ['id' => ['x'], 'created' => '1', 'choices' => [['index' => '0', 'message' => ['content' => ['private' => 'SECRET'], 'role' => 'assistant'], 'finish_reason' => 7], [], ['delta' => 'x']]];
+    same(['model' => 'a', 'choices' => [['message' => ['role' => 'assistant']]]], Proxy::publicView($typed, 'a'), 'wrong-typed values dropped; a choice without a message or delta object dropped');
     $tc = ['choices' => [['delta' => ['tool_calls' => [['index' => 0, 'id' => 'c', 'type' => 'function', 'secret' => 's', 'function' => ['name' => 'f', 'arguments' => '{}', 'secret' => 's']]]]]]];
     same([['index' => 0, 'id' => 'c', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]], Proxy::publicView($tc, 'a')['choices'][0]['delta']['tool_calls'], 'tool calls keep standard fields only');
 }

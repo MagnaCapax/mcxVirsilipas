@@ -19,10 +19,6 @@ final class Proxy
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
     /** Message fields forwarded upstream. */
     private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
-    /** Response fields relayed to the client, per level. Everything an upstream adds beyond these is dropped. */
-    private const RESPONSE_FIELDS = ['id', 'object', 'created', 'choices', 'usage'];
-    private const CHOICE_FIELDS = ['index', 'message', 'delta', 'finish_reason'];
-    private const OUTPUT_FIELDS = ['role', 'content', 'reasoning_content', 'tool_calls', 'refusal'];
     private const MAX_COUNT = 1_000_000_000_000;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -96,8 +92,13 @@ final class Proxy
                 throw new HttpError(400, 'each message needs a role');
             }
             $m = array_intersect_key($m, array_flip(self::MESSAGE_FIELDS));
+            foreach (['name', 'tool_call_id'] as $k) {
+                if (array_key_exists($k, $m) && !is_string($m[$k])) {
+                    throw new HttpError(400, "message $k must be a string");
+                }
+            }
             if (isset($m['tool_calls'])) {
-                $m['tool_calls'] = self::toolCalls($m['tool_calls']);
+                $m['tool_calls'] = self::toolCalls($m['tool_calls'], true);
             }
             $content = $m['content'] ?? null;
             if (is_array($content)) {
@@ -169,8 +170,10 @@ final class Proxy
     }
 
     /**
-     * Token counts from an upstream usage object, or null if they are missing, not integers,
-     * negative or absurdly large (missing usage is never read as zero).
+     * Token counts from an upstream usage object, or null unless all three counts are integers,
+     * in range and consistent (the total is at least prompt plus completion). Anything else is
+     * not a report: missing usage is never read as zero, and a malformed report is charged as
+     * missing (an upper bound), never as exact.
      * @return array{prompt: int, completion: int, total: int}|null
      */
     public static function validUsage(mixed $u): ?array
@@ -180,15 +183,13 @@ final class Proxy
         }
         $p = $u['prompt_tokens'] ?? null;
         $c = $u['completion_tokens'] ?? null;
+        $t = $u['total_tokens'] ?? null;
         // Every completion has at least one prompt token; a zero prompt count is not a real report.
-        if (!is_int($p) || !is_int($c) || $p < 1 || $c < 0 || $p > self::MAX_COUNT || $c > self::MAX_COUNT) {
+        if (!is_int($p) || !is_int($c) || !is_int($t) || $p < 1 || $c < 0 || $p > self::MAX_COUNT || $c > self::MAX_COUNT
+            || $t < $p + $c || $t > 2 * self::MAX_COUNT) {
             return null;
         }
-        $t = $u['total_tokens'] ?? null;
-        if ($t !== null && (!is_int($t) || $t > 2 * self::MAX_COUNT)) {
-            return null; // a total that is present but malformed makes the whole report untrustworthy
-        }
-        return ['prompt' => $p, 'completion' => $c, 'total' => max($t ?? 0, $p + $c)];
+        return ['prompt' => $p, 'completion' => $c, 'total' => $t];
     }
 
     /**
@@ -225,59 +226,129 @@ final class Proxy
      */
     public static function publicView(array $j, string $alias): array
     {
-        $out = array_intersect_key($j, array_flip(self::RESPONSE_FIELDS));
+        $out = self::typed($j, ['id' => 'string', 'object' => 'string', 'created' => 'int']);
         $out['model'] = $alias;
-        if (isset($out['choices'])) {
-            $choices = [];
-            foreach (is_array($out['choices']) ? $out['choices'] : [] as $c) {
-                if (!is_array($c)) {
-                    continue;
-                }
-                $c = array_intersect_key($c, array_flip(self::CHOICE_FIELDS));
-                foreach (['message', 'delta'] as $k) {
-                    if (isset($c[$k]) && is_array($c[$k])) {
-                        $c[$k] = array_intersect_key($c[$k], array_flip(self::OUTPUT_FIELDS));
-                        if (isset($c[$k]['tool_calls'])) {
-                            $c[$k]['tool_calls'] = self::toolCalls($c[$k]['tool_calls']);
-                        }
-                    }
-                }
-                $choices[] = $c;
-            }
-            $out['choices'] = $choices;
+        if (array_key_exists('choices', $j)) {
+            $out['choices'] = self::choices($j['choices']);
         }
-        if (array_key_exists('usage', $out)) {
-            $u = self::validUsage($out['usage']);
+        if (array_key_exists('usage', $j)) {
+            $u = self::validUsage($j['usage']);
             $out['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total']];
         }
         return $out;
     }
 
     /**
-     * Tool calls with only their standard fields: index, id, type and function name and arguments.
+     * Choices rebuilt from their standard fields, each value of its expected type. A choice
+     * without a message or delta object is not a choice and is dropped.
      * @return list<array<string, mixed>>
      */
-    private static function toolCalls(mixed $calls): array
+    private static function choices(mixed $choices): array
     {
         $out = [];
-        foreach (is_array($calls) ? $calls : [] as $t) {
-            if (!is_array($t)) {
+        foreach (is_array($choices) ? $choices : [] as $c) {
+            if (!is_array($c)) {
                 continue;
             }
-            $call = array_intersect_key($t, array_flip(['index', 'id', 'type']));
-            if (is_array($t['function'] ?? null)) {
-                $call['function'] = array_intersect_key($t['function'], array_flip(['name', 'arguments']));
+            $choice = self::typed($c, ['index' => 'int', 'finish_reason' => 'string']);
+            foreach (['message', 'delta'] as $k) {
+                if (is_array($c[$k] ?? null)) {
+                    $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => 'string', 'reasoning_content' => 'string', 'refusal' => 'string']);
+                    if (array_key_exists('tool_calls', $c[$k])) {
+                        $choice[$k]['tool_calls'] = self::toolCalls($c[$k]['tool_calls'], false);
+                    }
+                }
+            }
+            if (isset($choice['message']) || isset($choice['delta'])) {
+                $out[] = $choice;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Tool calls with only their standard fields, each of its expected type: index, id, type and
+     * function name and arguments (a JSON string). Strict mode (requests) refuses anything else;
+     * otherwise (responses) wrong-typed values are dropped.
+     * @return list<array<string, mixed>>
+     */
+    private static function toolCalls(mixed $calls, bool $strict): array
+    {
+        if (!is_array($calls) || !array_is_list($calls)) {
+            if ($strict) {
+                throw new HttpError(400, 'tool_calls must be a list');
+            }
+            return [];
+        }
+        $out = [];
+        foreach ($calls as $t) {
+            if (!is_array($t)) {
+                if ($strict) {
+                    throw new HttpError(400, 'each tool call must be an object');
+                }
+                continue;
+            }
+            $dropped = 0;
+            $call = self::typed($t, ['index' => 'int', 'id' => 'string', 'type' => 'string'], $dropped);
+            if (array_key_exists('function', $t)) {
+                $fn = $t['function'];
+                $dropped += is_array($fn) ? 0 : 1;
+                $call['function'] = is_array($fn) ? self::typed($fn, ['name' => 'string', 'arguments' => 'string'], $dropped) : [];
+            }
+            if ($strict && $dropped > 0) {
+                throw new HttpError(400, 'tool call fields must be strings (arguments as a JSON string)');
             }
             $out[] = $call;
         }
         return $out;
     }
 
-    /** A completion with at least one choice: what a 200 must carry. */
+    /**
+     * The listed fields of $a whose values have the listed type ('string' or 'int'); any other
+     * field or value is dropped, and each dropped listed field is counted in $dropped. Null is
+     * kept for string fields (e.g. the content of a message that only calls tools).
+     * @param array<mixed> $a
+     * @param array<string, string> $types
+     * @return array<string, mixed>
+     */
+    private static function typed(array $a, array $types, int &$dropped = 0): array
+    {
+        $out = [];
+        foreach ($types as $k => $type) {
+            if (!array_key_exists($k, $a)) {
+                continue;
+            }
+            $v = $a[$k];
+            if (($type === 'string' && (is_string($v) || $v === null)) || ($type === 'int' && is_int($v))) {
+                $out[$k] = $v;
+            } else {
+                $dropped++;
+            }
+        }
+        return $out;
+    }
+
+    /** A completion with at least one usable choice (a message or delta object): what a 200 must carry. */
     private static function hasChoices(mixed $j): bool
     {
-        return is_array($j) && !isset($j['error']) && is_array($j['choices'] ?? null)
-            && array_filter($j['choices'], 'is_array') !== [];
+        return is_array($j) && !isset($j['error']) && self::choices($j['choices'] ?? null) !== [];
+    }
+
+    /** Bytes of text a choice delivers: content, reasoning, refusal and tool-call names and arguments. */
+    private static function textBytes(mixed $part): int
+    {
+        if (!is_array($part)) {
+            return 0;
+        }
+        $n = 0;
+        foreach (['content', 'reasoning_content', 'refusal'] as $k) {
+            $n += is_string($part[$k] ?? null) ? strlen($part[$k]) : 0;
+        }
+        foreach (is_array($part['tool_calls'] ?? null) ? $part['tool_calls'] : [] as $t) {
+            $fn = is_array($t) ? ($t['function'] ?? null) : null;
+            $n += is_array($fn) ? strlen(json_encode($fn, JSON_UNESCAPED_UNICODE) ?: '') : 0;
+        }
+        return $n;
     }
 
     /**
@@ -346,13 +417,15 @@ final class Proxy
                 return '';
             }
             foreach ((is_array($j['choices'] ?? null) ? $j['choices'] : []) as $choice) {
-                $n = strlen(json_encode($choice['delta'] ?? [], JSON_UNESCAPED_UNICODE) ?: '');
+                $n = self::textBytes(is_array($choice) ? ($choice['delta'] ?? null) : null);
                 $s['bytes'] += $n;
                 $s['unmetered'] += $n;
             }
             $u = self::validUsage($j['usage'] ?? null);
-            if ($u !== null && ($s['usage'] === null || $u['total'] >= $s['usage']['total'])) {
-                $s['usage'] = $u; // cumulative: a report lower than one already seen is ignored
+            // Usage is cumulative. Only a report that advances covers the text delivered since the
+            // last one; an equal or lower report changes nothing, so that text stays charged as bytes.
+            if ($u !== null && ($s['usage'] === null || $u['total'] > $s['usage']['total'])) {
+                $s['usage'] = $u;
                 $s['unmetered'] = 0;
                 $s['over'] = $u['total'] > $reserved;
             }
