@@ -61,7 +61,7 @@ function testIntegrationFinalOnlyUsageStreamDebitsExactly(): void
 function testIntegrationUpstreamErrorsAreGenericAndFree(): void
 {
     foreach ([['busy', true, 429], ['redirect', false, 502], ['json-error', false, 502], ['json-error', true, 502], ['truncated', false, 502],
-        ['empty-choices', false, 502], ['done-only', true, 502]] as [$model, $stream, $status]) {
+        ['empty-choices', false, 502], ['done-only', true, 502], ['null-choice', false, 502]] as [$model, $stream, $status]) {
         [$ref, $key] = fundedKey(10000);
         $r = http('POST', '/v1/chat/completions', msg($model, $stream), $key);
         same($status, $r['status'], "$model stream=" . var_export($stream, true));
@@ -103,6 +103,8 @@ function testIntegrationClientHangUpIsChargedForWhatWasGenerated(): void
     check($charged > 11 && $charged < 21, "charged $charged: more than the prompt, less than the full answer");
     $u = lastUsage($ref);
     same([1, 0, $charged], [$u['aborted'], $u['estimated'], $u['charged']], 'aborted, exact (continuous usage)');
+    preg_match_all('/"total_tokens":(\d+)/', $r['body'], $m);
+    check($m[1] !== [] && $charged >= (int) end($m[1]), 'charged at least the last usage the client saw');
 }
 
 function testIntegrationHangUpWithoutUsageIsChargedAtMostTheReservation(): void
@@ -207,4 +209,12 @@ function testIntegrationRunawayStreamIsStoppedAtTheReservation(): void
     check(str_contains($r['body'], 'upstream stream ended early'), 'client told');
     same(0, settled($ref)['balance'], 'charged the whole reservation, never more');
     same(1, lastUsage($ref)['over_reservation']);
+}
+
+function testIntegrationALowerUsageReportDoesNotEraseAHigherOne(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    same(200, http('POST', '/v1/chat/completions', msg('usage-drop', true), $key)['status']);
+    settled($ref);
+    same(61, lastUsage($ref)['charged'], 'the 11 + 50 report stands; the later 11 + 3 is ignored');
 }

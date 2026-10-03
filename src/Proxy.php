@@ -96,6 +96,9 @@ final class Proxy
                 throw new HttpError(400, 'each message needs a role');
             }
             $m = array_intersect_key($m, array_flip(self::MESSAGE_FIELDS));
+            if (isset($m['tool_calls'])) {
+                $m['tool_calls'] = self::toolCalls($m['tool_calls']);
+            }
             $content = $m['content'] ?? null;
             if (is_array($content)) {
                 $parts = [];
@@ -177,12 +180,15 @@ final class Proxy
         }
         $p = $u['prompt_tokens'] ?? null;
         $c = $u['completion_tokens'] ?? null;
-        if (!is_int($p) || !is_int($c) || $p < 0 || $c < 0 || $p > self::MAX_COUNT || $c > self::MAX_COUNT) {
+        // Every completion has at least one prompt token; a zero prompt count is not a real report.
+        if (!is_int($p) || !is_int($c) || $p < 1 || $c < 0 || $p > self::MAX_COUNT || $c > self::MAX_COUNT) {
             return null;
         }
         $t = $u['total_tokens'] ?? null;
-        $total = is_int($t) && $t <= 2 * self::MAX_COUNT ? max($t, $p + $c) : $p + $c;
-        return ['prompt' => $p, 'completion' => $c, 'total' => $total];
+        if ($t !== null && (!is_int($t) || $t > 2 * self::MAX_COUNT)) {
+            return null; // a total that is present but malformed makes the whole report untrustworthy
+        }
+        return ['prompt' => $p, 'completion' => $c, 'total' => max($t ?? 0, $p + $c)];
     }
 
     /**
@@ -231,6 +237,9 @@ final class Proxy
                 foreach (['message', 'delta'] as $k) {
                     if (isset($c[$k]) && is_array($c[$k])) {
                         $c[$k] = array_intersect_key($c[$k], array_flip(self::OUTPUT_FIELDS));
+                        if (isset($c[$k]['tool_calls'])) {
+                            $c[$k]['tool_calls'] = self::toolCalls($c[$k]['tool_calls']);
+                        }
                     }
                 }
                 $choices[] = $c;
@@ -244,10 +253,31 @@ final class Proxy
         return $out;
     }
 
+    /**
+     * Tool calls with only their standard fields: index, id, type and function name and arguments.
+     * @return list<array<string, mixed>>
+     */
+    private static function toolCalls(mixed $calls): array
+    {
+        $out = [];
+        foreach (is_array($calls) ? $calls : [] as $t) {
+            if (!is_array($t)) {
+                continue;
+            }
+            $call = array_intersect_key($t, array_flip(['index', 'id', 'type']));
+            if (is_array($t['function'] ?? null)) {
+                $call['function'] = array_intersect_key($t['function'], array_flip(['name', 'arguments']));
+            }
+            $out[] = $call;
+        }
+        return $out;
+    }
+
     /** A completion with at least one choice: what a 200 must carry. */
     private static function hasChoices(mixed $j): bool
     {
-        return is_array($j) && !isset($j['error']) && is_array($j['choices'] ?? null) && $j['choices'] !== [];
+        return is_array($j) && !isset($j['error']) && is_array($j['choices'] ?? null)
+            && array_filter($j['choices'], 'is_array') !== [];
     }
 
     /**
@@ -298,7 +328,7 @@ final class Proxy
     private function forward(array $body, bool $stream, string $alias, int $reserved): array
     {
         $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false,
-            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'pending' => '', 'full' => ''];
+            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => ''];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
         $handle = static function (string $event) use (&$s, $alias, $reserved): string {
@@ -321,13 +351,15 @@ final class Proxy
                 $s['unmetered'] += $n;
             }
             $u = self::validUsage($j['usage'] ?? null);
-            if ($u !== null) {
-                $s['usage'] = $u; // cumulative when the upstream reports continuously
+            if ($u !== null && ($s['usage'] === null || $u['total'] >= $s['usage']['total'])) {
+                $s['usage'] = $u; // cumulative: a report lower than one already seen is ignored
                 $s['unmetered'] = 0;
                 $s['over'] = $u['total'] > $reserved;
             }
             if (self::hasChoices($j)) {
                 $s['start'] = true;
+            } elseif (!$s['started']) {
+                return ''; // nothing is relayed before the first event with a choice; its usage is kept
             }
             return 'data: ' . json_encode(self::publicView($j, $alias), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n";
         };
@@ -373,12 +405,10 @@ final class Proxy
                     return 0;
                 }
                 if (!$s['started']) {
-                    $s['pending'] .= $out; // nothing is sent until an event with choices arrives
                     if (!$s['start']) {
-                        return $len;
+                        return $len; // nothing to relay yet
                     }
                     $s['started'] = true;
-                    $out = $s['pending'];
                     while (ob_get_level() > 0) {
                         ob_end_flush();
                     }

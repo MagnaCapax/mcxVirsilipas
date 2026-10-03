@@ -27,8 +27,8 @@ final class Ledger
     public function __construct(string $path)
     {
         $dir = dirname($path);
-        if (is_dir($dir) && (fileperms($dir) & 0002) !== 0) {
-            throw new \RuntimeException("ledger directory $dir is writable by other users");
+        if (is_dir($dir) && (fileperms($dir) & 0022) !== 0) {
+            throw new \RuntimeException("ledger directory $dir is writable by group or others");
         }
         foreach ([$path, "$path-wal", "$path-shm"] as $f) {
             if (is_file($f) && (fileperms($f) & 0077) !== 0) {

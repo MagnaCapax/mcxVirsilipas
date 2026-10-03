@@ -167,6 +167,8 @@ function testReadableWalOrWorldWritableDirectoryIsRefused(): void
     chmod("$dir/ledger.sqlite-wal", 0600);
     chmod($dir, 0777);
     same(true, str_contains(throwsRuntime(fn () => new Ledger("$dir/ledger.sqlite")), 'writable'), 'world-writable directory');
+    chmod($dir, 0770);
+    same(true, str_contains(throwsRuntime(fn () => new Ledger("$dir/ledger.sqlite")), 'writable'), 'group-writable directory');
     chmod($dir, 0700);
 }
 

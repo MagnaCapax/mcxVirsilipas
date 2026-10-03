@@ -21,7 +21,7 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
 
 function testOnlyTextContentIsAdmitted(): void
 {
-    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => 'hi', 'audio' => ['url' => 'x']], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1']]],
+    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => 'hi', 'audio' => ['url' => 'x']], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'audio' => ['url' => 'external']]]],
         ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello', 'cache_control' => ['x' => 1]]]]]);
     same([['role' => 'user', 'content' => 'hi'], ['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1']]],
         ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello']]]], $norm, 'unknown message and part fields dropped');
@@ -59,8 +59,8 @@ function testUsageValidation(): void
 {
     same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
     same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 3]), 'total below the parts');
-    same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x']));
-    foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => -1, 'completion_tokens' => 5], ['prompt_tokens' => '10', 'completion_tokens' => 5]] as $u) {
+    same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5]), 'missing total');
+    foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x'], ['prompt_tokens' => 0, 'completion_tokens' => 0], ['prompt_tokens' => -1, 'completion_tokens' => 5], ['prompt_tokens' => '10', 'completion_tokens' => 5]] as $u) {
         same(null, Proxy::validUsage($u), json_encode($u));
     }
 }
@@ -87,6 +87,8 @@ function testPublicViewHidesUpstreamDetails(): void
     same(['choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3], 'model' => 'alias'], Proxy::publicView($j, 'alias'));
     $top = ['id' => 'x', 'provider' => 'p', 'choices' => [['index' => 0, 'message' => ['content' => 'hi', 'note' => 'n'], 'x' => 1]]];
     same(['id' => 'x', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]], 'model' => 'alias'], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
+    $tc = ['choices' => [['delta' => ['tool_calls' => [['index' => 0, 'id' => 'c', 'type' => 'function', 'secret' => 's', 'function' => ['name' => 'f', 'arguments' => '{}', 'secret' => 's']]]]]]];
+    same([['index' => 0, 'id' => 'c', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']]], Proxy::publicView($tc, 'a')['choices'][0]['delta']['tool_calls'], 'tool calls keep standard fields only');
 }
 
 function testSseEventParsing(): void

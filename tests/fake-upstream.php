@@ -60,6 +60,16 @@ switch ($model) {
         $event(['choices' => [['index' => 0, 'delta' => ['content' => str_repeat('more ', 1000)]]]]);
         echo "data: [DONE]\n\n";
         exit;
+    case 'scenario-null-choice':
+        header('Content-Type: application/json');
+        echo json_encode(['choices' => [null], 'usage' => $usage(1)]);
+        exit;
+    case 'scenario-usage-drop':
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'a']]], 'usage' => $usage(50)]);
+        $event(['choices' => [], 'usage' => $usage(3)]);
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-truncated':
         header('Content-Type: application/json');
         header('Content-Length: 100000');
