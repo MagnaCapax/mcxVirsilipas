@@ -11,8 +11,9 @@ namespace MagnaCapax\Virsilipas;
  *
  * Records hold event names, counts, statuses and billing references only. They never hold
  * request or response bodies, prompts, keys, the admin token, upstream error text or client
- * addresses. Logging is best effort: a failed write never fails or delays a request. A daily
- * file that group or others can read is never appended to; its records go to error_log.
+ * addresses. Logging is best effort: a failed write never fails or delays a request. The log
+ * directory must be writable by its owner only, and a daily file that group or others can read,
+ * or a symlink in its place, is never written; such records go to error_log.
  */
 final class Log
 {
@@ -38,23 +39,33 @@ final class Log
         if (!self::enabled($level)) {
             return;
         }
-        $line = json_encode(['ts' => gmdate('Y-m-d\TH:i:s\Z'), 'level' => $level, 'event' => $event] + $fields,
+        $now = time(); // one clock read: the record's ts and its day file always agree
+        $line = json_encode(['ts' => gmdate('Y-m-d\TH:i:s\Z', $now), 'level' => $level, 'event' => $event] + $fields,
             JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         if ($line === false) {
             return;
         }
-        if (self::$dir !== null && self::append(self::$dir . '/' . gmdate('Ymd') . '.jsonl', $line . "\n")) {
+        if (self::$dir !== null && self::append(self::$dir, gmdate('Ymd', $now) . '.jsonl', $line . "\n")) {
             return;
         }
         error_log('virsilipas ' . $line);
     }
 
-    /** Appends to a new (created 0600) or private daily file; false if it cannot, never throws. */
-    private static function append(string $file, string $data): bool
+    /**
+     * Appends to a new (created 0600) or private daily file in a directory only its owner can
+     * write; false if it cannot, never throws. A symlink is never followed: in a directory others
+     * could write, it could point the write at any file this process can open.
+     */
+    private static function append(string $dir, string $name, string $data): bool
     {
+        $file = "$dir/$name";
         $umask = umask(0077);
         try {
-            clearstatcache(true, $file);
+            clearstatcache();
+            $dirPerms = @fileperms($dir);
+            if ($dirPerms === false || ($dirPerms & 0022) !== 0 || is_link($file)) {
+                return false; // missing or shared directory, or a planted link
+            }
             $perms = @fileperms($file);
             if ($perms !== false && ($perms & 0077) !== 0) {
                 return false; // readable by others: never append to it

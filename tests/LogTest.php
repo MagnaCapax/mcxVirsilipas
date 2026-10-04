@@ -71,3 +71,28 @@ function testLogNeverAppendsToADailyFileOthersCanRead(): void
         Log::init(null, 'error');
     }
 }
+function testLogNeverWritesThroughASymlinkOrIntoASharedDirectory(): void
+{
+    $old = ini_set('error_log', tempDir() . '/php-error.log');
+    try {
+        $sentinel = tempDir() . '/private.key';
+        file_put_contents($sentinel, 'secret');
+        chmod($sentinel, 0600);
+        $dir = tempDir(); // 0700: only the planted link is wrong
+        symlink($sentinel, "$dir/" . gmdate('Ymd') . '.jsonl');
+        Log::init($dir, 'info');
+        Log::write('info', 'via-link', []);
+        same('secret', file_get_contents($sentinel), 'a symlink in place of the daily file is not followed');
+
+        $shared = tempDir();
+        chmod($shared, 0777);
+        Log::init($shared, 'info');
+        Log::write('info', 'shared-dir', []);
+        same([], glob("$shared/*"), 'nothing is written into a directory others can write');
+        $err = (string) file_get_contents(ini_get('error_log'));
+        check(str_contains($err, '"event":"via-link"') && str_contains($err, '"event":"shared-dir"'), 'both fall back to error_log');
+    } finally {
+        ini_set('error_log', (string) $old);
+        Log::init(null, 'error');
+    }
+}

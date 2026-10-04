@@ -403,3 +403,13 @@ function testIntegrationBenchReportsTransportFailuresAsAStatusMap(): void
     same(['fail', 2], [json_decode($m[1], true)['status'], json_decode($m[1], true)['errors']]);
     same(1, $code);
 }
+function testIntegrationBenchRefusesMoreProcessesThanRequests(): void
+{
+    $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+    $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', '--url=http://127.0.0.1:1', '--requests=1', '--processes=2'],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    $out = stream_get_contents($pipes[1]);
+    stream_get_contents($pipes[2]);
+    same(2, proc_close($p), 'an option error');
+    same('', $out, 'no result line');
+}

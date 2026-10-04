@@ -37,6 +37,10 @@ function options(array $argv): array
         }
         $o[$k] = (int) $o[$k];
     }
+    if ($o['processes'] > $o['requests']) {
+        fwrite(STDERR, "--processes must not exceed --requests\n");
+        exit(2);
+    }
     $o['key'] = $o['key-file'] !== '' ? trim((string) file_get_contents($o['key-file'])) : (string) getenv('VIRSILIPAS_BENCH_KEY');
     if ($o['url'] === '' || $o['key'] === '') {
         fwrite(STDERR, "--url and a key (--key-file or VIRSILIPAS_BENCH_KEY) are required\n");

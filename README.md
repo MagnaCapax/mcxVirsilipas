@@ -91,7 +91,7 @@ Request and response bodies are never stored or logged. The usage table holds to
 
 ## Logging
 
-Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMMDD.jsonl`, a new file each UTC day, appended under a lock so parallel workers never interleave. Without `log_dir`, the same lines go to PHP's `error_log`. Every record has `ts`, `level` and `event`, plus counts, statuses and billing references; never bodies, prompts, keys, the admin token, upstream error text, request paths or client addresses. A failed log write never affects a request. New daily files are created with mode 600, and a daily file that group or others can read is never appended to (its records go to `error_log` instead).
+Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMMDD.jsonl`, a new file each UTC day, appended under a lock so parallel workers never interleave. Without `log_dir`, the same lines go to PHP's `error_log`. Every record has `ts`, `level` and `event`, plus counts, statuses and billing references; never bodies, prompts, keys, the admin token, upstream error text, request paths or client addresses. A failed log write never affects a request. Make `log_dir` writable by its owner only (for example mode 700, owned by the php-fpm user). New daily files are created with mode 600. If the directory is writable by group or others, or a daily file is readable by them or is a symlink, nothing is written there and the records go to `error_log` instead.
 
 | `log_level` | Adds | Events |
 |---|---|---|
