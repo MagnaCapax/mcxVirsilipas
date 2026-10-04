@@ -19,6 +19,8 @@ Usage: virsilipas <command> [args]
   limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
                                     credits_per_minute; 'default' follows the config again
   status <ref>                      show balance, holds, limits and the last minute's use
+  history <ref> [N]                 show the last N credit changes (default 100), newest first
+  verify                            check every balance against its credit log; exit 1 on a mismatch
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
 TXT;
@@ -37,6 +39,8 @@ try {
         'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
         'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
         'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
+        'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
+        'verify' => verifyOrExit($ledger),
         default => null,
     };
     if ($out === null) {
@@ -66,4 +70,16 @@ function intArg(array $a, int $i): int
         throw new \InvalidArgumentException('expected an integer of at most 16 digits');
     }
     return (int) $v;
+}
+
+/** Prints the verify summary; exits 1 when any balance disagrees with its credit log. */
+function verifyOrExit(Ledger $ledger): string
+{
+    $r = $ledger->verify();
+    if ($r['problems'] !== []) {
+        fwrite(STDERR, implode("\n", $r['problems']) . "\n");
+        echo json_encode($r), "\n";
+        exit(1);
+    }
+    return json_encode($r);
 }

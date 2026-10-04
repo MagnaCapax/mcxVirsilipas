@@ -34,6 +34,7 @@ Details that matter in production:
 - **Client hangs up mid-stream.** The proxy stops the upstream request and charges for what was generated up to that point. With an upstream that reports usage on every chunk (configure it in `stream_options`) the charge follows the upstream's own count; it can include a few chunks the client never received, generated before the disconnect was noticed. Without usage, the charge is an upper bound (the prompt bound at the input rate plus the bytes delivered at the output rate), capped at the reservation, and the usage row is flagged `estimated`.
 - **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and as usage `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` and `credits` (what the reported usage costs, at most the reservation). In a stream, each event that carries usage shows the report the request is charged by, so the last one matches the charge unless text arrived after the last report that advanced the counts; a later equal or lower report does not cover that text, and the charge adds an upper bound for it (flagged `estimated`). Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
 - **Upstream errors** never produce a 200 before a stream has started; once it has (the 200 is already sent), an upstream error ends the stream with a generic error event and no `[DONE]`, and the output relayed until then is charged. A non-streaming answer must arrive complete and carry a usable answer: non-empty text, reasoning or refusal, or a function tool call with a non-empty id, name and arguments. A stream starts only with an event that carries a completion choice (a delta with at least one valid field); events dropped before that add nothing to the charge, and at `[DONE]` the proxy stops reading the upstream, so nothing after it is relayed or charged. Otherwise the client gets a generic error (429, the upstream's 4xx status, or 502), no upstream text, and no charge. A stream that ends without its final marker gets an error event at the end.
+- **Credit log.** Every change to a balance writes one row to `credit_log` in the same transaction: a grant (its `grant_id`), a reservation taken when a request starts and the unused part returned when it settles (both `lease:<id>`), or the `opening` balance carried over by a schema upgrade. Each row holds the change and the balance after it; a change of zero (a request that used its whole reservation) writes no row. The table is append-only: the database refuses UPDATE and DELETE on it. `bin/virsilipas history <ref> [N]` shows a key's last N changes; `bin/virsilipas verify` checks that every key's changes sum to its balance and that each row's balance is the running sum, and exits 1 on any mismatch, which means something changed a balance outside the proxy.
 - **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered (a worker that dies just before forwarding also leaves its reservation charged); if the request is settled late, the difference is returned. `bin/virsilipas status <ref>` counts such leases as `held`. `lease_seconds` must be longer than `upstream_timeout`.
 - **Runaway output.** If the credits for a stream's reported usage pass the reservation, the proxy stops the upstream request there. Output delivered after the last usage report that advanced the count is charged as an upper bound (its bytes); a repeated or lower report does not cover it. Upstreams that report usage on every chunk often send the cached split only with the final report, whose counts repeat the last running report; such a repeat adds the cached split once and nothing else; a later repeat cannot change or remove it.
 - **Limits.** Each key has three: `max_concurrent` (requests in flight; stops one key from using up a shared upstream rate limit), `requests_per_minute` and `credits_per_minute` (over the last 60 seconds, counting each request's charge, or its reservation while it runs). The config sets the defaults (`max_concurrent_per_key`, `requests_per_minute`, `credits_per_minute`; the last two unset means no limit) and the admin endpoint sets a key's own values, higher or lower. A request is refused (429) when the key is at a limit; the credits limit is checked when a request starts and a request is admitted while the window is below it, so a window holds at most the limit plus one request; the request that crosses it is served in full, never shortened. Further requests are refused until the window falls below the limit again, either because requests age out of it or because a running request settles for less than it reserved. The refusal order is disabled key, concurrency, requests, credits, balance. Refusals carry `Retry-After`: for the per-minute limits, the seconds until the oldest request in the window turns a minute old (the latest the window can start to free; a settling request can free it sooner); for concurrency, 1.
@@ -73,6 +74,66 @@ sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).s
 ```
 
 To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
+
+## Releasing and upgrading
+
+Releases are git tags `vX.Y.Z`, listed in [CHANGELOG.md](CHANGELOG.md). CI runs on every push to `main` and on every tag.
+
+### Cutting a release
+
+Add the version to CHANGELOG.md, commit, push, and tag only after CI on that commit is green:
+
+```sh
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
+```
+
+A release that changes the schema raises `SCHEMA_VERSION` in `src/Ledger.php`, upgrades the previous schema in `migrate()` in one transaction, and is tested against a copy of the previous schema (`tests/fixtures/`).
+
+### One-time host setup
+
+The host pulls releases from a bare mirror over SSH with a read-only deploy key, so it holds no credential that can change the repository. As root:
+
+```sh
+apt install git sqlite3
+ssh-keygen -t ed25519 -N '' -C virsilipas-deploy -f /root/.ssh/virsilipas_deploy
+# Add /root/.ssh/virsilipas_deploy.pub to the repository as a deploy key, with write access off.
+cat >> /root/.ssh/config <<'EOF'
+Host virsilipas-git
+    HostName github.com
+    User git
+    IdentityFile /root/.ssh/virsilipas_deploy
+    IdentitiesOnly yes
+EOF
+git clone --mirror virsilipas-git:OWNER/REPOSITORY.git /opt/virsilipas.git
+```
+
+The web server serves `/opt/virsilipas/public/index.php`, and `/opt/virsilipas` becomes a symlink to the live release under `/opt/virsilipas-releases/`. `tools/deploy.php` ships inside each release, so the first time, unpack the release you are about to deploy and run its copy:
+
+```sh
+mkdir /root/virsilipas-boot
+git --git-dir=/opt/virsilipas.git fetch --tags origin
+git --git-dir=/opt/virsilipas.git archive v0.1.0 | tar -x -C /root/virsilipas-boot
+php /root/virsilipas-boot/tools/deploy.php --url https://proxy.example.com v0.1.0
+```
+
+If `/opt/virsilipas` is still a plain directory from a manual install, the first deploy moves it to `/opt/virsilipas-releases/legacy-<revision>`.
+
+### Upgrading
+
+```sh
+php /opt/virsilipas/tools/deploy.php --url https://proxy.example.com --log /var/log/virsilipas-deploy.log v0.2.0
+runuser -u www-data -- env VIRSILIPAS_CONFIG=/etc/virsilipas/config.php \
+    php /opt/virsilipas/tools/smoke.php --url https://proxy.example.com --model default
+```
+
+`deploy.php` fetches the mirror, unpacks the tag into its own directory (no `.git`, a `REVISION` file naming the tag and commit), lints it, waits up to `--drain` seconds for requests in flight to finish, and stops php-fpm. It then backs up the ledger to `/var/lib/virsilipas-snapshots/pre-<tag>-<time>.sqlite`, checks the backup's integrity, runs `init` as the PHP user, switches the symlink, runs `verify`, checks `REVISION` through the symlink, and starts php-fpm. Its last check is that `GET /v1/models` without a key answers 401. `deploy.php --help` lists the paths and the service name it assumes.
+
+If any step after php-fpm stopped fails, `deploy.php` points the symlink back at the previous release, puts the backup in place, starts php-fpm and exits 1. It restores the backup only if nothing but the migration has written to the ledger since the backup was taken. The CLI works while php-fpm is stopped, and a started release serves requests, so `deploy.php` compares every table except `credit_log` with the backup first. If they differ, or cannot be compared, it keeps the ledger as it is; once the new schema is in place it also keeps the new release live, and it says so. php-fpm is stopped before that comparison, so the only write that can slip in between the check and the restore is a CLI command run in that moment.
+
+`smoke.php` makes one small request with a new key (`smoke-<time>-<random>`; it costs a few dozen real tokens). It then checks the credit log rows, the balance and `verify`, and disables the key.
+
+**Never run an older release against a newer ledger.** An older release's `init` refuses a newer schema, so `deploy.php` rolls such a deploy back. To return to the state before an upgrade, stop php-fpm, restore that upgrade's `pre-<tag>` backup as described under [Backups](#backups), and deploy the older tag. Everything written to the ledger since the upgrade is lost, so decide that consciously.
 
 ## Endpoints
 
@@ -132,6 +193,7 @@ Runs the requests with `--concurrency` in flight per process across `--processes
 ```
 virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
            | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
+           | history <ref> [N] | verify
 ```
 
 ## Tests
@@ -141,7 +203,7 @@ php tests/run.php            # unit and end-to-end tests, no network access need
 php tests/run.php integration
 ```
 
-The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time. They include a load smoke test that runs `tools/bench.php` with parallel streams across two processes.
+The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time. They include a load smoke test that runs `tools/bench.php` with parallel streams across two processes, and runs of `tools/smoke.php` against the test proxy. Run the suite from a git checkout: `tests/SecretGuardTest.php` reads the tracked files and fails if a config file, key, certificate, database, log or credential value is committed, and it fails rather than passes when git cannot list the files. Words a deployment must never publish, such as its upstream provider, are not stored in the repository: list them in `.forbidden-words` (gitignored, one per line) or in `VIRSILIPAS_FORBIDDEN_WORDS` (comma-separated; CI reads a repository secret of that name), and the guard refuses them in any tracked file however they are spaced or cased.
 
 CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on PHP 8.2, 8.3 and 8.4, keeps the test output when a run fails, and runs PHPStan as an advisory check that reports but does not fail the build.
 

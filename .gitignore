@@ -1,5 +1,23 @@
+# Local configuration, credentials and keys: never commit these.
 config.php
+upstream.key
+credentials*
+.forbidden-words
+.env*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Ledger databases, their WAL files and backups.
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite-journal
+/backups/
+
+# Logs.
+/log/
+*.log
+
 /vendor/

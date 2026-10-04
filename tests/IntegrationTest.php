@@ -525,3 +525,41 @@ function testIntegrationARepeatedTotalAddsDetailButNeverASplit(): void
     // The first report stands: 10 prompt x 2 + 20 output x 8. The re-split repeat (29 x 2 + 1 x 8 = 66) is ignored.
     same(10000 - 180, settled($ref)['balance']);
 }
+function testIntegrationEveryBalanceChangeIsInTheCreditLog(): void
+{
+    // After all the traffic above (streams, hang-ups, refusals, grants), every balance must equal the
+    // sum of its logged changes. Each change and its log row commit together, so this holds even
+    // while a worker is still settling.
+    $r = Harness::get()['ledger']->verify();
+    same([], $r['problems']);
+    check($r['keys'] >= 10 && $r['rows'] > $r['keys'], "traffic was logged ({$r['keys']} keys, {$r['rows']} rows)");
+}
+
+/** @return array{0: int, 1: string} tools/smoke.php against the test proxy: exit code and output */
+function runSmoke(string $alias): array
+{
+    $h = Harness::get();
+    $env = ['VIRSILIPAS_CONFIG' => $h['dir'] . '/config.php', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+    $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/smoke.php', '--url', $h['proxy'], '--model', $alias, '--credits', '5000'],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+    $out = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
+    return [proc_close($p), $out];
+}
+
+function testIntegrationSmokeToolPassesAndDisablesItsKey(): void
+{
+    [$code, $out] = runSmoke('ok');
+    same(0, $code, $out);
+    check(str_contains($out, 'credit log: grant, reserve, refund'), $out);
+    check(!str_contains($out, 'vsk-'), 'the key is never printed');
+    check(preg_match('/key (smoke-\S+) disabled/', $out, $m) === 1, $out);
+    same(false, Harness::get()['ledger']->status($m[1], lim())['active'], 'smoke key disabled');
+}
+
+function testIntegrationSmokeToolFailsWhenTheUpstreamFails(): void
+{
+    [$code, $out] = runSmoke('busy');
+    same(1, $code, $out);
+    check(str_contains($out, 'FAIL ') && str_contains($out, 'credit log: grant, reserve, refund'), 'the failed request was refunded in full: ' . $out);
+    check(str_contains($out, 'disabled'), $out);
+}

@@ -318,3 +318,89 @@ function testMigrateRefusesALedgerFromAnotherVersion(): void
     $l->migrate(); // a current ledger: re-running init is safe
     $l->createKey('b');
 }
+
+/** @return list<array{0: string, 1: int, 2: int, 3: string}> history rows as [kind, delta, balance_after, cause] */
+function changes(Ledger $l, string $ref, int $limit = 100): array
+{
+    return array_map(fn (array $r) => [$r['kind'], $r['delta'], $r['balance_after'], $r['ref']], $l->history($ref, $limit));
+}
+
+function testCreditLogRecordsEveryChangeWithTheBalanceAfterIt(): void
+{
+    $l = freshLedger();
+    $id = $l->findKey($l->createKey('a'))['id'];
+    $l->grant('a', 'inv-1', 1000);                                    // +1000 -> 1000
+    $r1 = $l->reserve($id, 20, 200, 1000, unitRates(), lim(4), 60);   // -(20 + 200) -> 780
+    $l->settle($r1['lease_id'], $id, 57, meta());                     // +(220 - 57) -> 943
+    $l->grant('a', 'inv-1', 1000);                                    // retry: no change, no row
+    $l->grant('a', 'refund-1', -100);                                 // -100 -> 843
+    $r2 = $l->reserve($id, 10, 90, 1000, unitRates(), lim(4), 60);    // -(10 + 90) -> 743
+    $l->settle($r2['lease_id'], $id, 10000, meta());                  // all 100 used: nothing returned, no row
+    same([
+        ['reserve', -100, 743, 'lease:' . $r2['lease_id']],
+        ['grant', -100, 843, 'refund-1'],
+        ['refund', 163, 943, 'lease:' . $r1['lease_id']],
+        ['reserve', -220, 780, 'lease:' . $r1['lease_id']],
+        ['grant', 1000, 1000, 'inv-1'],
+    ], changes($l, 'a'), 'newest first');
+    same(743, $l->status('a', lim())['balance']);
+    same(2, count($l->history('a', 2)), 'limit');
+    same(['keys' => 1, 'rows' => 5, 'problems' => []], $l->verify());
+    same(400, throwsHttp(fn () => $l->history('a', 0))[0]);
+    same(404, throwsHttp(fn () => $l->history('nobody'))[0]);
+}
+
+function testVerifyCatchesABalanceChangedOutsideTheLedger(): void
+{
+    [$l, , $raw] = ledgerWithHandle(500);
+    $raw->exec('UPDATE keys SET balance = 999');
+    same(['key a: balance 999 but logged changes sum to 500'], $l->verify()['problems']);
+}
+
+function testVerifyCatchesABrokenRunningBalance(): void
+{
+    [$l, $id, $raw] = ledgerWithHandle(500);
+    // A forged row whose delta makes the sum right (500 + 10 = 510) but whose balance_after is wrong.
+    $raw->exec("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (0, $id, 'grant', 10, 5, 'forged')");
+    $raw->exec('UPDATE keys SET balance = 510');
+    same(['key a: credit_log row 2 says balance_after 5 but the changes up to it sum to 510'], $l->verify()['problems']);
+}
+
+function testCreditLogRefusesUpdateAndDelete(): void
+{
+    [, , $raw] = ledgerWithHandle(500);
+    foreach (['UPDATE credit_log SET delta = 1', 'DELETE FROM credit_log'] as $sql) {
+        try {
+            $raw->exec($sql);
+            check(false, "$sql was allowed");
+        } catch (\PDOException $e) {
+            check(str_contains($e->getMessage(), 'append-only'), "$sql refused");
+        }
+    }
+    same('1', (string) $raw->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'the row is still there');
+}
+
+function testMigrateUpgradesASchemaTwoLedgerWithOpeningBalances(): void
+{
+    $path = tempDir() . '/ledger.sqlite';
+    $old = new \PDO('sqlite:' . $path);
+    $old->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v2.sql'));
+    // a: 700 left with 100 of it held by an open lease; b: empty; c: overdrawn by a chargeback.
+    $old->exec("INSERT INTO keys (id, ref, key_hash, balance, created_at) VALUES (1, 'a', 'h1', 700, 0), (2, 'b', 'h2', 0, 0), (3, 'c', 'h3', -50, 0)");
+    $old->exec('INSERT INTO leases (id, key_id, reserved, created_at, expires_at) VALUES (1, 1, 100, 0, 0)');
+    $old = null;
+    chmod($path, 0600);
+
+    $l = new Ledger($path);
+    $l->migrate();
+    same([['opening', 700, 700, 'schema-3']], changes($l, 'a'));
+    same([], changes($l, 'b'), 'a zero balance gets no opening row');
+    same([['opening', -50, -50, 'schema-3']], changes($l, 'c'));
+    same(['keys' => 3, 'rows' => 2, 'problems' => []], $l->verify());
+
+    same(true, $l->settle(1, 1, 40, meta()), 'a lease opened before the upgrade settles after it');
+    same(['refund', 60, 760, 'lease:1'], changes($l, 'a')[0], '100 held, 40 used');
+    same([], $l->verify()['problems']);
+    $l->migrate(); // re-running init on the upgraded ledger adds nothing
+    same(3, $l->verify()['rows']);
+}

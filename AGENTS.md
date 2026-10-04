@@ -27,13 +27,14 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 10. Log records hold event names, counts, statuses and billing references only: never request or response bodies, prompts, keys, the admin token, upstream error text, request paths, exception messages or client addresses. A failed log write never fails a request.
 11. Every credit amount comes from `Credits` (one rounding, up, per request); counts and rates are clamped so no product overflows. `cached_input` never exceeds `input`, so pricing the whole prompt at the input rate bounds any charge.
 12. Limits are checked inside the reservation transaction; a refused request reserves nothing. Only the fixed limit names reach SQL.
+13. Every balance change writes one `credit_log` row in the same transaction (kind, delta, balance after, cause); zero changes write none. The log is append-only (triggers refuse UPDATE and DELETE). For every key the deltas sum to the balance and each `balance_after` is the running sum; `verify` checks both. A schema upgrade carries existing balances over as `opening` rows.
 
 ## Layout
 
 ```
 public/index.php   front controller and routes
 src/Config.php     config loading and validation
-src/Ledger.php     SQLite: keys, grants, leases, usage, per-key limits
+src/Ledger.php     SQLite: keys, grants, leases, usage, per-key limits, credit log
 src/Credits.php    credit arithmetic
 src/Proxy.php      customer endpoints, request rewrite, streaming, charging
 src/Admin.php      billing/provisioning endpoints
@@ -41,9 +42,13 @@ src/Http.php       request/response helpers; HttpError.php maps refusals to HTTP
 bin/virsilipas     CLI
 src/Log.php        leveled JSONL log, one file per UTC day
 tools/bench.php    load test (parallel, multi-process) with a ledger exactness check
-tests/             plain PHP runner (php tests/run.php), fake upstream, end-to-end harness
+tools/deploy.php   deploy a release tag from a git mirror: backup, migrate, symlink switch, rollback
+tools/smoke.php    live end-to-end check after a deploy (one request, credit log, verify)
+CHANGELOG.md       releases (git tags vX.Y.Z) and schema changes
+tests/             plain PHP runner (php tests/run.php), fake upstream, end-to-end harness,
+                   secret guard (fails if a credential or local file is tracked), schema fixtures
 ```
 
 ## Before you change behaviour
 
-Run `php tests/run.php` (CI runs the same suite on every push). Add a test for any change to metering, settling, grants or error handling. Never weaken the invariants above to make a test pass. When behaviour changes, update README.md in the same commit.
+Run `php tests/run.php` (CI runs the same suite on every push). Add a test for any change to metering, settling, grants or error handling. Never weaken the invariants above to make a test pass. When behaviour changes, update README.md in the same commit. A schema change raises `SCHEMA_VERSION`, upgrades the previous schema in place in `migrate()`, gets a fixture of the previous schema in `tests/fixtures/` and a CHANGELOG entry. Never commit config, keys, databases or logs; `.gitignore` covers them and `tests/SecretGuardTest.php` fails if one is tracked. Keep the provider-agnostic words list in your local `.forbidden-words`, never in the repo, not even hashed.

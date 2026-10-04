@@ -15,13 +15,21 @@ namespace MagnaCapax\Virsilipas;
  * taken until the request is settled. A lease that outlives its request (its worker
  * died) stops counting against concurrency when it expires, but its reservation stays
  * charged: the request may already have been answered. A late settle still corrects it.
+ *
+ * Every change to a balance writes one credit_log row in the same transaction: the change, the
+ * balance after it, its kind (grant, reserve, refund, or the opening balance carried over by a
+ * schema upgrade) and what caused it (the grant id or the lease). The table is append-only:
+ * triggers refuse UPDATE and DELETE. For every key, the deltas sum to the balance, and each row's
+ * balance_after is the running sum up to it; verify() checks both.
  */
 final class Ledger
 {
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 2;
+    private const SCHEMA_VERSION = 3;
+    /** The one older schema migrate() upgrades in place (it adds credit_log). */
+    private const UPGRADABLE_FROM = 2;
     /** Per-key limits: the name used by the admin API and CLI => its column. Only these names reach SQL. */
     private const LIMITS = ['max_concurrent' => 'max_concurrent', 'requests_per_minute' => 'requests_per_minute', 'credits_per_minute' => 'credits_per_minute'];
     private const WINDOW_SECONDS = 60;
@@ -52,13 +60,31 @@ final class Ledger
         }
     }
 
+    /**
+     * Creates the schema, or upgrades a schema-2 ledger in place in one transaction: credit_log is
+     * added and each key with a nonzero balance gets one 'opening' row carrying that balance, so the
+     * sum check holds from the first moment. Any other older or newer schema is refused.
+     */
     public function migrate(): void
     {
         $version = (int) $this->db->query('PRAGMA user_version')->fetchColumn();
         $tables = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'keys'")->fetchColumn();
-        if ($tables > 0 && $version !== self::SCHEMA_VERSION) {
+        if ($tables > 0 && $version !== self::SCHEMA_VERSION && $version !== self::UPGRADABLE_FROM) {
             throw new \RuntimeException('this ledger was created by another version of virsilipas (schema ' . $version . ', expected ' . self::SCHEMA_VERSION . '); start a new ledger');
         }
+        $upgrade = $tables > 0 && $version === self::UPGRADABLE_FROM;
+        $this->tx(function () use ($upgrade): void {
+            $this->createSchema();
+            if ($upgrade) {
+                $this->db->prepare("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) SELECT ?, id, 'opening', balance, balance, 'schema-" . self::SCHEMA_VERSION . "' FROM keys WHERE balance != 0 ORDER BY id")
+                    ->execute([time()]);
+            }
+            $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
+        });
+    }
+
+    private function createSchema(): void
+    {
         $this->db->exec(<<<'SQL'
             CREATE TABLE IF NOT EXISTS keys (
                 id INTEGER PRIMARY KEY,
@@ -106,8 +132,23 @@ final class Ledger
                 estimated INTEGER NOT NULL,
                 over_reservation INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS credit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                key_id INTEGER NOT NULL REFERENCES keys(id),
+                kind TEXT NOT NULL CHECK (kind IN ('opening', 'grant', 'reserve', 'refund')),
+                -- credits added (positive) or removed (negative), and the balance right after
+                delta INTEGER NOT NULL CHECK (delta != 0),
+                balance_after INTEGER NOT NULL,
+                -- the cause: the grant id, 'lease:<id>', or 'schema-<n>' for an opening balance
+                ref TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS credit_log_key ON credit_log(key_id, id);
+            CREATE TRIGGER IF NOT EXISTS credit_log_no_update BEFORE UPDATE ON credit_log
+                BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS credit_log_no_delete BEFORE DELETE ON credit_log
+                BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
             SQL);
-        $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
     }
 
     /**
@@ -168,6 +209,7 @@ final class Ledger
             $this->db->prepare('INSERT INTO grants (grant_id, key_id, credits, created_at) VALUES (?, ?, ?, ?)')
                 ->execute([$grantId, $keyId, $credits, time()]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$credits, $keyId]);
+            $this->logCredit($keyId, 'grant', $credits, $grantId);
             return ['applied' => true, 'balance' => $new];
         });
     }
@@ -316,8 +358,10 @@ final class Ledger
             }
             $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at) VALUES (?, ?, ?, ?)')
                 ->execute([$keyId, $reserved, $now, $now + $leaseSeconds]);
+            $leaseId = (int) $this->db->lastInsertId();
+            $this->logCredit($keyId, 'reserve', -$reserved, 'lease:' . $leaseId);
 
-            return ['lease_id' => (int) $this->db->lastInsertId(), 'max_tokens' => $maxTokens, 'reserved' => $reserved];
+            return ['lease_id' => $leaseId, 'max_tokens' => $maxTokens, 'reserved' => $reserved];
         });
     }
 
@@ -342,10 +386,69 @@ final class Ledger
             $charged = min($used, $reserved);
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
+            $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
             $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
                 ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved)]);
             return true;
         });
+    }
+
+    /**
+     * A ref's credit changes, newest first: each row's kind, delta, balance after it and its cause.
+     * @return list<array{id: int, ts: int, kind: string, delta: int, balance_after: int, ref: string}>
+     */
+    public function history(string $ref, int $limit = 100): array
+    {
+        if ($limit < 1 || $limit > 100_000) {
+            throw new HttpError(400, 'limit must be from 1 to 100000');
+        }
+        $st = $this->db->prepare('SELECT id, ts, kind, delta, balance_after, ref FROM credit_log WHERE key_id = ? ORDER BY id DESC LIMIT ?');
+        $st->bindValue(1, $this->keyIdByRef($ref), \PDO::PARAM_INT);
+        $st->bindValue(2, $limit, \PDO::PARAM_INT);
+        $st->execute();
+        $rows = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $rows[] = ['id' => (int) $r['id'], 'ts' => (int) $r['ts'], 'kind' => (string) $r['kind'], 'delta' => (int) $r['delta'],
+                'balance_after' => (int) $r['balance_after'], 'ref' => (string) $r['ref']];
+        }
+        return $rows;
+    }
+
+    /**
+     * Checks credit_log against the balances: for every key the deltas must sum to its balance, and
+     * every row's balance_after must equal the running sum of the key's deltas up to that row.
+     * Returns the number of keys and rows checked and one line per problem found (none = consistent).
+     * @return array{keys: int, rows: int, problems: list<string>}
+     */
+    public function verify(): array
+    {
+        $problems = [];
+        $sums = $this->db->query('SELECT k.ref, k.balance, COALESCE(SUM(c.delta), 0) AS logged, COUNT(c.id) AS n
+            FROM keys k LEFT JOIN credit_log c ON c.key_id = k.id GROUP BY k.id ORDER BY k.id')->fetchAll(\PDO::FETCH_ASSOC);
+        $rows = 0;
+        foreach ($sums as $s) {
+            $rows += (int) $s['n'];
+            if ((int) $s['logged'] !== (int) $s['balance']) {
+                $problems[] = "key {$s['ref']}: balance {$s['balance']} but logged changes sum to {$s['logged']}";
+            }
+        }
+        $chain = $this->db->query('SELECT c.id, k.ref, c.balance_after, c.running FROM
+                (SELECT id, key_id, balance_after, SUM(delta) OVER (PARTITION BY key_id ORDER BY id) AS running FROM credit_log) c
+            JOIN keys k ON k.id = c.key_id WHERE c.running != c.balance_after ORDER BY c.id LIMIT 100')->fetchAll(\PDO::FETCH_ASSOC);
+        foreach ($chain as $c) {
+            $problems[] = "key {$c['ref']}: credit_log row {$c['id']} says balance_after {$c['balance_after']} but the changes up to it sum to {$c['running']}";
+        }
+        return ['keys' => count($sums), 'rows' => $rows, 'problems' => $problems];
+    }
+
+    /** Writes the credit_log row for a balance change just made in the current transaction. */
+    private function logCredit(int $keyId, string $kind, int $delta, string $ref): void
+    {
+        if ($delta === 0) {
+            return; // nothing changed: a refund of a fully used reservation
+        }
+        $this->db->prepare('INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (?, ?, ?, ?, ?, ?)')
+            ->execute([time(), $keyId, $kind, $delta, $this->balanceOf($keyId), $ref]);
     }
 
     /**

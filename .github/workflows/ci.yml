@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
@@ -31,6 +32,10 @@ jobs:
           php -l bin/virsilipas > /dev/null
 
       - name: Test suite (unit, end-to-end and load smoke)
+        env:
+          # Deployment-specific words the secret guard refuses in the tree (kept out of the repo).
+          VIRSILIPAS_FORBIDDEN_WORDS: ${{ secrets.VIRSILIPAS_FORBIDDEN_WORDS }}
+          VIRSILIPAS_REQUIRE_FORBIDDEN_WORDS: '1'
         run: |
           set -o pipefail
           php tests/run.php 2>&1 | tee test-output.log
