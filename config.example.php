@@ -5,7 +5,7 @@ return [
     // SQLite database file. The directory must be writable by the PHP process (WAL needs it).
     'db_path' => '/var/lib/virsilipas/ledger.sqlite',
 
-    // Any OpenAI-compatible chat completions endpoint.
+    // Any OpenAI-compatible chat completions endpoint: https, or plain http only to 127.0.0.1, ::1 or localhost.
     'upstream_url' => 'https://llm.example.com/v1/chat/completions',
 
     // File holding only the upstream API key. Readable by the PHP process, by nobody else.
@@ -17,8 +17,13 @@ return [
     // The models customers may use: alias they send => the model id sent upstream and its rates in credits
     // per million tokens: fresh prompt tokens, prompt tokens served from the upstream's cache (at most the
     // input rate) and output tokens (reasoning included). Integers; the values below are only an example.
+    // A model may also name its own 'url', 'key_file' and 'stream_options' to be served by another upstream; anything it
+    // leaves out comes from the settings above. A model with its own 'url' must name its own 'key_file' too, so one
+    // upstream's key is never sent to another.
     'models' => [
         'default' => ['model' => 'example-org/example-model', 'input' => 1000000, 'cached_input' => 250000, 'output' => 4000000],
+        // 'other' => ['model' => 'other-org/other-model', 'input' => 1000000, 'cached_input' => 1000000, 'output' => 1000000,
+        //     'url' => 'https://other.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/other.key'],
     ],
 
     // Upper bound on max_tokens per request (at most 10^9). Requests are also clamped to the remaining balance.

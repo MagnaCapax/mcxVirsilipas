@@ -74,8 +74,9 @@ final class Proxy
         try {
             Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
                 'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
-            $body = self::rewrite($req, $rates['model'], $lease['max_tokens'], $stream, $this->config->streamOptions);
-            $result = $this->forward($body, $stream, $alias, $rates, $lease['reserved']);
+            $route = $this->config->route($alias);
+            $body = self::rewrite($req, $rates['model'], $lease['max_tokens'], $stream, $route['stream_options']);
+            $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved']);
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
@@ -516,11 +517,12 @@ final class Proxy
      * otherwise a generic error of the same class, with nothing charged (upstream bodies are not
      * relayed). A client that hangs up stops the upstream request, and so does a stream whose
      * reported usage passes the reservation; what was delivered is still charged.
+     * @param array{url: string, key: string, stream_options: array<string, mixed>} $route
      * @param array<string, mixed> $body
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
      * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int}
      */
-    private function forward(array $body, bool $stream, string $alias, array $rates, int $reserved): array
+    private function forward(array $route, array $body, bool $stream, string $alias, array $rates, int $reserved): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
         /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string} $s */
@@ -582,11 +584,11 @@ final class Proxy
             return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };
 
-        $ch = curl_init($this->config->upstreamUrl);
+        $ch = curl_init($route['url']);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $this->config->upstreamKey()],
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_TIMEOUT => $this->config->upstreamTimeout,
             CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$s): int {

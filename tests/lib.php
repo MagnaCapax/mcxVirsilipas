@@ -75,6 +75,9 @@ function configArrayFor(string $dir, array $overrides = []): array
     // Near-free input, expensive output: the credit count and the token count tell different stories.
     $models['weighted-shift'] = ['model' => 'scenario-split-shift', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
     $models['cheap-input'] = ['model' => 'scenario-ok', 'input' => 1, 'cached_input' => 1, 'output' => 8_000_000];
+    // A model served by a second upstream with its own key and stream_options (the harness points the url at the fake upstream).
+    $models['second-upstream'] = ['model' => 'scenario-ok'] + unitRates() + ['url' => 'http://127.0.0.1:1/second/v1/chat/completions',
+        'key_file' => "$dir/second.key", 'stream_options' => ['include_usage' => true]];
     return $overrides + [
         'db_path' => "$dir/ledger.sqlite",
         'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
@@ -111,10 +114,12 @@ final class Harness
         }
         $dir = tempDir();
         file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
+        file_put_contents("$dir/second.key", "second-upstream-key\n");
         $up = self::freePort();
         $ports = array_map(static fn () => self::freePort(), range(1, 7));
         mkdir("$dir/logs", 0700);
         $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
+        $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
         file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
         $root = dirname(__DIR__);
         $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];

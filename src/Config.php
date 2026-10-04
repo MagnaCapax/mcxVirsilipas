@@ -16,6 +16,8 @@ final class Config
     public readonly int $upstreamTimeout;
     /** @var array<string, array{model: string, input: int, cached_input: int, output: int}> alias => upstream model id and rates (credits per million tokens) */
     public readonly array $models;
+    /** @var array<string, array{url: string, key_file: string, stream_options: array<string, mixed>}> alias => where its requests go: its own url, key_file and stream_options, or the global ones */
+    public readonly array $routes;
     public readonly int $maxTokensCap;
     public readonly int $maxConcurrentPerKey;
     /** Default per-key limits over the last 60 seconds; null = no limit. A key's own setting overrides them. */
@@ -34,7 +36,7 @@ final class Config
     public function __construct(array $c)
     {
         $this->dbPath = self::str($c, 'db_path');
-        $this->upstreamUrl = self::str($c, 'upstream_url');
+        $this->upstreamUrl = self::url($c, 'upstream_url');
         $this->upstreamKeyFile = self::str($c, 'upstream_key_file');
         $this->upstreamTimeout = self::int($c, 'upstream_timeout', 600);
         $this->maxTokensCap = self::int($c, 'max_tokens_cap', 16384);
@@ -52,11 +54,13 @@ final class Config
             throw new \InvalidArgumentException('config: log_level must be error, warn, info or debug');
         }
 
+        $this->streamOptions = self::streamOptions($c, 'stream_options');
+
         $models = $c['models'] ?? null;
         if (!is_array($models) || $models === []) {
             throw new \InvalidArgumentException('config: models must be a non-empty map of alias => model and rates');
         }
-        $parsed = [];
+        $parsed = $routes = [];
         foreach ($models as $alias => $m) {
             if (!is_string($alias) || $alias === '' || !is_array($m) || !is_string($m['model'] ?? null) || $m['model'] === '') {
                 throw new \InvalidArgumentException('config: each models entry needs a non-empty alias and a model string');
@@ -69,14 +73,18 @@ final class Config
                 throw new \InvalidArgumentException("config: models.$alias.cached_input must not exceed input");
             }
             $parsed[$alias] = $p;
+            // A model with its own url must name its own key file too: the global key never goes to another upstream.
+            if (isset($m['url']) && !isset($m['key_file'])) {
+                throw new \InvalidArgumentException("config: models.$alias.url needs models.$alias.key_file as well");
+            }
+            $routes[$alias] = [
+                'url' => isset($m['url']) ? self::url($m, 'url', "models.$alias.") : $this->upstreamUrl,
+                'key_file' => isset($m['key_file']) ? self::str($m, 'key_file', "models.$alias.") : $this->upstreamKeyFile,
+                'stream_options' => isset($m['stream_options']) ? self::streamOptions($m, 'stream_options', "models.$alias.") : $this->streamOptions,
+            ];
         }
         $this->models = $parsed;
-
-        $opts = $c['stream_options'] ?? ['include_usage' => true];
-        if (!is_array($opts) || ($opts['include_usage'] ?? false) !== true) {
-            throw new \InvalidArgumentException('config: stream_options must include include_usage => true');
-        }
-        $this->streamOptions = $opts;
+        $this->routes = $routes;
 
         if (!preg_match('/^[0-9a-f]{64}$/', $this->adminTokenSha256)) {
             throw new \InvalidArgumentException('config: admin_token_sha256 must be a sha256 hex digest');
@@ -108,22 +116,56 @@ final class Config
         return ['max_concurrent' => $this->maxConcurrentPerKey, 'requests_per_minute' => $this->requestsPerMinute, 'credits_per_minute' => $this->creditsPerMinute];
     }
 
-    public function upstreamKey(): string
+    /**
+     * Where a model alias's requests go, with the key read from its key file at request time.
+     * @return array{url: string, key: string, stream_options: array<string, mixed>}
+     */
+    public function route(string $alias): array
     {
-        $key = is_readable($this->upstreamKeyFile) ? trim((string) file_get_contents($this->upstreamKeyFile)) : '';
+        $r = $this->routes[$alias] ?? throw new \InvalidArgumentException("unknown model alias $alias");
+        $key = is_readable($r['key_file']) ? trim((string) file_get_contents($r['key_file'])) : '';
         if ($key === '') {
             throw new \RuntimeException('upstream key file missing or empty');
         }
-        return $key;
+        return ['url' => $r['url'], 'key' => $key, 'stream_options' => $r['stream_options']];
     }
 
     /** @param array<string, mixed> $c */
-    private static function str(array $c, string $k): string
+    private static function str(array $c, string $k, string $prefix = ''): string
     {
         if (!isset($c[$k]) || !is_string($c[$k]) || $c[$k] === '') {
-            throw new \InvalidArgumentException("config: $k must be a non-empty string");
+            throw new \InvalidArgumentException("config: $prefix$k must be a non-empty string");
         }
         return $c[$k];
+    }
+
+    /**
+     * An upstream URL: https, or plain http only to this machine (a local gateway, or the tests),
+     * so the upstream key never crosses a network in the clear.
+     * @param array<string, mixed> $c
+     */
+    private static function url(array $c, string $k, string $prefix = ''): string
+    {
+        $u = self::str($c, $k, $prefix);
+        $scheme = strtolower((string) parse_url($u, PHP_URL_SCHEME));
+        $host = strtolower((string) parse_url($u, PHP_URL_HOST));
+        if ($host === '' || !($scheme === 'https' || ($scheme === 'http' && in_array($host, ['127.0.0.1', '[::1]', 'localhost'], true)))) {
+            throw new \InvalidArgumentException("config: $prefix$k must be an https URL (plain http only to 127.0.0.1, ::1 or localhost)");
+        }
+        return $u;
+    }
+
+    /**
+     * @param array<string, mixed> $c
+     * @return array<string, mixed>
+     */
+    private static function streamOptions(array $c, string $k, string $prefix = ''): array
+    {
+        $opts = $c[$k] ?? ['include_usage' => true];
+        if (!is_array($opts) || ($opts['include_usage'] ?? false) !== true) {
+            throw new \InvalidArgumentException("config: $prefix$k must include include_usage => true");
+        }
+        return $opts;
     }
 
     /** @param array<string, mixed> $c */

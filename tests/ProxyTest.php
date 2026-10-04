@@ -137,12 +137,38 @@ function testConfigValidation(): void
         ['stream_options' => ['include_usage' => false]],
         ['admin_token_sha256' => 'short'],
         ['max_tokens_cap' => 0],
+        ['upstream_url' => 'http://llm.example.com/v1/chat/completions'],   // plain http off this machine
+        ['upstream_url' => 'file:///etc/passwd'],
+        ['upstream_url' => 'https:///v1/chat/completions'],                  // no host
     ];
+    $model = ['model' => 'm', 'input' => 1, 'cached_input' => 1, 'output' => 1];
+    $bad[] = ['models' => ['a' => $model + ['url' => 'https://other.example.com/v1/chat/completions']]];   // url without its own key_file
+    $bad[] = ['models' => ['a' => $model + ['url' => 'http://other.example.com/v1/chat/completions', 'key_file' => '/k']]];
+    $bad[] = ['models' => ['a' => $model + ['key_file' => '']]];
+    $bad[] = ['models' => ['a' => $model + ['stream_options' => ['include_usage' => false]]]];
     foreach ($bad as $override) {
         try {
             new Config(configArrayFor($dir, $override));
             throw new \RuntimeException('accepted bad config: ' . json_encode($override));
         } catch (\InvalidArgumentException) {
         }
+    }
+}
+
+function testConfigRoutesPerModel(): void
+{
+    $dir = tempDir();
+    file_put_contents("$dir/upstream.key", "global-key\n");
+    file_put_contents("$dir/second.key", " second-key \n");
+    $c = new Config(configArrayFor($dir, ['upstream_url' => 'https://llm.example.com/v1/chat/completions']));
+    same(['url' => 'https://llm.example.com/v1/chat/completions', 'key' => 'global-key',
+        'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true]], $c->route('ok'), 'a plain model uses the global upstream');
+    same(['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'key' => 'second-key', 'stream_options' => ['include_usage' => true]],
+        $c->route('second-upstream'), 'a model with its own url, key_file and stream_options uses them');
+    unlink("$dir/second.key");
+    try {
+        $c->route('second-upstream');
+        throw new \LogicException('a missing per-model key file must not fall back to the global key');
+    } catch (\RuntimeException) {
     }
 }

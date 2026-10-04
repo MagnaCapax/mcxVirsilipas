@@ -14,6 +14,9 @@ $req = json_decode((string) file_get_contents('php://input'), true) ?: [];
 $dir = getenv('FAKE_UPSTREAM_DIR') ?: sys_get_temp_dir();
 // Only the fields the tests assert on; never the messages.
 $seen = array_intersect_key($req, array_flip(['model', 'n', 'best_of', 'store', 'modalities', 'stream', 'stream_options', 'max_tokens']));
+// Where the request arrived and with which key, for the per-model upstream test (fake keys only).
+$seen['path'] = (string) ($_SERVER['REQUEST_URI'] ?? '');
+$seen['auth'] = (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? '');
 file_put_contents($dir . '/last-request.json', json_encode($seen));
 
 $model = (string) ($req['model'] ?? '');

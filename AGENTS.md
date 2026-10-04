@@ -28,6 +28,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 11. Every credit amount comes from `Credits` (one rounding, up, per request); counts and rates are clamped so no product overflows. `cached_input` never exceeds `input`, so pricing the whole prompt at the input rate bounds any charge.
 12. Limits are checked inside the reservation transaction; a refused request reserves nothing. Only the fixed limit names reach SQL.
 13. Every balance change writes one `credit_log` row in the same transaction (kind, delta, balance after, cause); zero changes write none. The log is append-only (triggers refuse UPDATE and DELETE). For every key the deltas sum to the balance and each `balance_after` is the running sum; `verify` checks both. A schema upgrade carries existing balances over as `opening` rows.
+14. An upstream key goes only to its own upstream: a model with its own `url` must name its own `key_file`, a missing per-model key fails the request rather than falling back, and every upstream URL is https or plain http to the local machine.
 
 ## Layout
 

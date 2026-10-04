@@ -563,3 +563,18 @@ function testIntegrationSmokeToolFailsWhenTheUpstreamFails(): void
     check(str_contains($out, 'FAIL ') && str_contains($out, 'credit log: grant, reserve, refund'), 'the failed request was refunded in full: ' . $out);
     check(str_contains($out, 'disabled'), $out);
 }
+
+function testIntegrationModelWithItsOwnUpstreamUsesItsOwnUrlAndKey(): void
+{
+    [, $key] = fundedKey(10000);
+    $last = static fn (): array => json_decode((string) file_get_contents(Harness::get()['dir'] . '/last-request.json'), true);
+    same(200, http('POST', '/v1/chat/completions', msg('second-upstream', true), $key)['status']);
+    $up = $last();
+    same('/second/v1/chat/completions', $up['path']);
+    same('Bearer second-upstream-key', $up['auth']);
+    same(['include_usage' => true], $up['stream_options'], 'its own stream_options');
+    same(200, http('POST', '/v1/chat/completions', msg('ok', true), $key)['status']);
+    $up = $last();
+    same('/v1/chat/completions', $up['path']);
+    same('Bearer fake-upstream-key', $up['auth'], 'other models keep the global upstream and key');
+}
