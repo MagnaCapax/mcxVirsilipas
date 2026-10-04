@@ -285,13 +285,26 @@ final class Proxy
         }
         if (array_key_exists('usage', $j)) {
             $u = self::validUsage($j['usage']);
-            $out['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total'],
-                'prompt_tokens_details' => ['cached_tokens' => $u['cached']]];
-            if ($u !== null && $rates !== null) {
-                $out['usage']['credits'] = min(self::usageCredits($u, 0, $rates), $reserved);
-            }
+            $out['usage'] = $u === null ? null : self::usageView($u, $rates, $reserved);
         }
         return $out;
+    }
+
+    /**
+     * The usage object a client sees for a report: the standard counts, the cached count and, given
+     * rates, the credits the report costs (at most the reservation).
+     * @param array{prompt: int, completion: int, total: int, cached: int} $u
+     * @param ?array{input: int, cached_input: int, output: int} $rates
+     * @return array<string, mixed>
+     */
+    private static function usageView(array $u, ?array $rates, int $reserved): array
+    {
+        $view = ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total'],
+            'prompt_tokens_details' => ['cached_tokens' => $u['cached']]];
+        if ($rates !== null) {
+            $view['credits'] = min(self::usageCredits($u, 0, $rates), $reserved);
+        }
+        return $view;
     }
 
     /**
@@ -560,6 +573,11 @@ final class Proxy
                 // with the final report. It is added once and never changed or removed by a later repeat; it
                 // covers no text delivered since the last advance.
                 $s['usage']['cached'] = $u['cached'];
+            }
+            // A relayed usage object shows the report the request is charged by, not a repeat or a lower
+            // report the proxy did not adopt, so the client sees the same credits as the ledger.
+            if ($s['usage'] !== null && ($view['usage'] ?? null) !== null) {
+                $view['usage'] = self::usageView($s['usage'], $rates, $reserved);
             }
             return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };

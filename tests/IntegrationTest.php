@@ -467,6 +467,14 @@ function testIntegrationCachedInputIsChargedAtItsOwnRate(): void
         // 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
         check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"credits":1200'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
+        if ($stream) {
+            $last = null;
+            foreach (explode("\n", $r['body']) as $line) {
+                $e = str_starts_with($line, 'data: {') ? json_decode(substr($line, 6), true) : null;
+                $last = isset($e['usage']) ? $e['usage'] : $last;
+            }
+            same([800, 1200], [$last['prompt_tokens_details']['cached_tokens'] ?? null, $last['credits'] ?? null], 'the last usage the client sees is what it was charged, after repeats without or with other details');
+        }
         $u = lastUsage($ref);
         same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
     }
