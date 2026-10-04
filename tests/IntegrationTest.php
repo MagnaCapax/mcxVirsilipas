@@ -492,6 +492,9 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     check($refused['retry_after'] !== null && $refused['retry_after'] >= 1 && $refused['retry_after'] <= 60, 'Retry-After within the minute');
     $b = json_decode(http('GET', '/v1/balance', null, $key)['body'], true);
     same([1, ['requests' => 1, 'credits' => 18]], [$b['limits']['requests_per_minute'], $b['window']], 'the client sees its limit and its last minute');
+    [, $other] = fundedKey(10000);
+    $o = json_decode(http('GET', '/v1/balance?ref=' . urlencode($ref), null, $other)['body'], true);
+    same([10000, null, ['requests' => 0, 'credits' => 0]], [$o['balance'], $o['limits']['requests_per_minute'], $o['window']], 'another key sees only its own balance, limits and window');
 
     same(200, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_minute' => null], 'admin-secret')['status']);
     same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'back to the default: no limit');

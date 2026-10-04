@@ -198,9 +198,9 @@ final class Proxy
      * Token counts from an upstream usage object, or null unless all three counts are integers,
      * in range and consistent (the total is at least prompt plus completion). Anything else is
      * not a report: missing usage is never read as zero, and a malformed report is charged as
-     * missing (an upper bound), never as exact. Cached input (prompt_tokens_details.cached_tokens)
-     * counts only as an integer within the prompt side (total minus completion); otherwise it is 0,
-     * which prices the whole prompt as fresh input.
+     * missing (an upper bound), never as exact. Cached input (prompt_tokens_details.cached_tokens) is
+     * part of prompt_tokens, so it counts only as an integer from 0 to prompt_tokens; otherwise it is
+     * 0, which prices the whole prompt as fresh input.
      * @return array{prompt: int, completion: int, total: int, cached: int}|null
      */
     public static function validUsage(mixed $u): ?array
@@ -217,7 +217,7 @@ final class Proxy
             return null;
         }
         $d = $u['prompt_tokens_details'] ?? null;
-        $cached = is_array($d) && is_int($d['cached_tokens'] ?? null) && $d['cached_tokens'] >= 0 && $d['cached_tokens'] <= $t - $c ? $d['cached_tokens'] : 0;
+        $cached = is_array($d) && is_int($d['cached_tokens'] ?? null) && $d['cached_tokens'] >= 0 && $d['cached_tokens'] <= $p ? $d['cached_tokens'] : 0;
         return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached];
     }
 
@@ -554,10 +554,12 @@ final class Proxy
                 $s['usage'] = $u;
                 $s['unmetered'] = 0;
                 $s['over'] = self::usageCredits($u, 0, $rates) > $reserved;
-            } elseif ($u !== null && array_diff_key($u, ['cached' => 1]) === array_diff_key($s['usage'], ['cached' => 1])) {
-                // The same counts again: upstreams that report running usage send the cached split only with
-                // the final report. It adds that detail; it covers no text delivered since the last advance.
-                $s['usage'] = $u;
+            } elseif ($u !== null && $s['usage']['cached'] === 0
+                && array_diff_key($u, ['cached' => 1]) === array_diff_key($s['usage'], ['cached' => 1])) {
+                // The same counts again with a cached split: upstreams that report running usage send it only
+                // with the final report. It is added once and never changed or removed by a later repeat; it
+                // covers no text delivered since the last advance.
+                $s['usage']['cached'] = $u['cached'];
             }
             return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };

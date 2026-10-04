@@ -24,20 +24,22 @@ function testCreditsArithmetic(): void
     same(0, Credits::of(-5, -5, -5, weightedRates()), 'negative counts count as zero');
     $max = ['input' => Credits::MAX_RATE, 'cached_input' => Credits::MAX_RATE, 'output' => Credits::MAX_RATE];
     same(3_000_000_000_000, Credits::of(PHP_INT_MAX, PHP_INT_MAX, PHP_INT_MAX, $max), 'counts are clamped; nothing overflows');
-    same(1, Credits::at(1, 1));
-    same(0, Credits::at(0, 5));
-    same(16, Credits::at(2, 8_000_000));
 }
 
 function testAffordableTokens(): void
 {
-    same(10, Credits::affordable(10, 100, 1_000_000), 'one credit per token');
-    same(100, Credits::affordable(1000, 100, 1_000_000), 'never above the cap');
-    same(3, Credits::affordable(7, 100, 2_000_000), '7 credits at 2 per token buy 3 tokens');
-    same(0, Credits::affordable(0, 100, 1_000_000));
-    same(0, Credits::affordable(-50, 100, 1_000_000));
-    same(1_000_000, Credits::affordable(1, 1_000_000_000, 1), 'a cheap rate: one credit covers a million tokens');
-    same(Credits::MAX_COUNT, Credits::affordable(1_000_000_000_000_000_000, Credits::MAX_COUNT, Credits::MAX_RATE), 'large balance and rate: no overflow');
+    $unit = ['input' => 1_000_000, 'cached_input' => 1_000_000, 'output' => 1_000_000];
+    same(100, Credits::affordable(110, 10, 100, $unit), 'prompt 10 + cap 100 fit exactly');
+    same(50, Credits::affordable(60, 10, 100, $unit), '60 credits: 10 for the prompt, 50 for output');
+    same(100, Credits::affordable(1000, 100, 4000, weightedRates()), '100 x 2 + 100 x 8 = 1000');
+    same(0, Credits::affordable(207, 100, 4000, weightedRates()), '7 credits left: not one output token at 8');
+    same(0, Credits::affordable(0, 0, 100, $unit));
+    same(0, Credits::affordable(-50, 10, 100, $unit));
+    $tiny = ['input' => 1, 'cached_input' => 1, 'output' => 1];
+    same(1000, Credits::affordable(1, 50, 1000, $tiny), 'one credit covers the whole request at a tiny rate: rounded once, not per part');
+    $max = ['input' => Credits::MAX_RATE, 'cached_input' => Credits::MAX_RATE, 'output' => Credits::MAX_RATE];
+    same(Credits::MAX_COUNT, Credits::affordable(1_000_000_000_000_000_000, Credits::MAX_COUNT, Credits::MAX_COUNT, $max), 'large balance: no overflow');
+    same(999_999_999, Credits::affordable(1_999_999_999_999, Credits::MAX_COUNT, Credits::MAX_COUNT, $max), 'just below the cap at the largest values: no overflow');
 }
 
 function testCachedInputValidation(): void
@@ -47,7 +49,8 @@ function testCachedInputValidation(): void
     same(800, Proxy::validUsage($u(800))['cached']);
     same(1000, Proxy::validUsage($u(1000))['cached'], 'the whole prompt may be cached');
     same(0, Proxy::validUsage($u(1001))['cached'], 'more cached than the prompt side: counted as fresh');
-    same(1010, Proxy::validUsage($u(1010, 1060))['cached'], 'the prompt side is total minus completion');
+    same(0, Proxy::validUsage($u(1010, 1060))['cached'], 'cached is part of prompt_tokens, whatever the total');
+    same(0, Proxy::validUsage(['prompt_tokens' => 1, 'completion_tokens' => 0, 'total_tokens' => 100, 'prompt_tokens_details' => ['cached_tokens' => 100]])['cached'], 'more cached than prompt_tokens');
     same(0, Proxy::validUsage($u(-1))['cached']);
     same(0, Proxy::validUsage($u('800'))['cached']);
     same(0, Proxy::validUsage($u(null))['cached']);

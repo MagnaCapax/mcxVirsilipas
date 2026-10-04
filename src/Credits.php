@@ -27,23 +27,19 @@ final class Credits
         return intdiv($sum + self::PER - 1, self::PER);
     }
 
-    /** Credits for a token count at one rate, rounded up. */
-    public static function at(int $tokens, int $rate): int
+    /**
+     * The most output tokens, at most $cap, such that the prompt bound at the input rate plus those
+     * tokens at the output rate cost no more than $balance (0 if not even one fits).
+     * @param array{input: int, cached_input: int, output: int} $rates
+     */
+    public static function affordable(int $balance, int $promptBound, int $cap, array $rates): int
     {
-        return intdiv(self::count($tokens) * $rate + self::PER - 1, self::PER);
-    }
-
-    /** The most tokens, at most $cap, whose credits at $rate fit in $available (0 if none do). */
-    public static function affordable(int $available, int $cap, int $rate): int
-    {
-        if ($available < 1) {
-            return 0;
-        }
-        if ($available >= self::at($cap, $rate)) {
+        if ($balance >= self::of($promptBound, 0, $cap, $rates)) {
             return $cap;
         }
-        // Here $available < at($cap) <= MAX_COUNT * MAX_RATE / PER + 1, so the product stays in range.
-        return intdiv($available * self::PER, $rate);
+        // Here $balance < of($promptBound, 0, $cap) <= 2 * MAX_COUNT * MAX_RATE / PER + 1, so the product stays in range.
+        $room = $balance * self::PER - self::count($promptBound) * $rates['input'];
+        return $room < $rates['output'] ? 0 : intdiv($room, $rates['output']);
     }
 
     private static function count(int $n): int

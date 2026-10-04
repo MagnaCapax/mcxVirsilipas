@@ -234,6 +234,9 @@ function testReservePricesThePromptAtTheInputRateAndOutputAtTheOutputRate(): voi
     [$l, $id] = fundedLedger(207);
     same(402, refusal(fn () => $l->reserve($id, 100, null, 4000, $w, lim(), 60))[0], '7 credits left: not one output token');
     same('credit balance too low for this request', refusal(fn () => $l->reserve($id, 100, null, 4000, $w, lim(), 60))[1]);
+    [$l, $id] = fundedLedger(1);
+    $r = $l->reserve($id, 50, null, 1000, ['input' => 1, 'cached_input' => 1, 'output' => 1], lim(), 60);
+    same([1000, 1], [$r['max_tokens'], $r['reserved']], 'one credit: the whole request costs one credit, rounded once');
 }
 
 function testRequestsPerMinuteLimit(): void

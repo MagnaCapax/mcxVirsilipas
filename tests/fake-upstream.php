@@ -47,6 +47,10 @@ switch ($model) {
             $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'cached hello']]],
                 'usage' => array_diff_key($u, ['prompt_tokens_details' => 1])]);
             $event(['choices' => [], 'usage' => $u]);
+            // A further repeat without the detail must not take the cached split away again.
+            $event(['choices' => [], 'usage' => array_diff_key($u, ['prompt_tokens_details' => 1])]);
+            // Nor may a repeat with a different cached count change it.
+            $event(['choices' => [], 'usage' => ['prompt_tokens_details' => ['cached_tokens' => 1000]] + $u]);
             echo "data: [DONE]\n\n";
             exit;
         }

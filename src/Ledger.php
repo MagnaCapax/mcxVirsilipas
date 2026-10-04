@@ -302,13 +302,12 @@ final class Ledger
                 }
             }
 
-            $promptCredits = Credits::at($promptBound, $rates['input']);
-            $affordable = Credits::affordable((int) $k['balance'] - $promptCredits, $cap, $rates['output']);
-            $maxTokens = min($requestedMax ?? $cap, $affordable);
+            $maxTokens = min($requestedMax ?? $cap, Credits::affordable((int) $k['balance'], $promptBound, $cap, $rates));
             if ($maxTokens < 1) {
                 throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota');
             }
-            $reserved = $promptCredits + Credits::at($maxTokens, $rates['output']);
+            // Priced like a charge, rounded once: any reported usage within the prompt bound and max_tokens costs no more.
+            $reserved = Credits::of($promptBound, 0, $maxTokens, $rates);
 
             $upd = $this->db->prepare('UPDATE keys SET balance = balance - ? WHERE id = ? AND balance >= ?');
             $upd->execute([$reserved, $keyId, $reserved]);
