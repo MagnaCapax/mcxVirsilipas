@@ -403,6 +403,7 @@ function testIntegrationBenchReportsTransportFailuresAsAStatusMap(): void
     same(['fail', 2], [json_decode($m[1], true)['status'], json_decode($m[1], true)['errors']]);
     same(1, $code);
 }
+
 function testIntegrationBenchRefusesMoreProcessesThanRequests(): void
 {
     $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
@@ -412,4 +413,35 @@ function testIntegrationBenchRefusesMoreProcessesThanRequests(): void
     stream_get_contents($pipes[2]);
     same(2, proc_close($p), 'an option error');
     same('', $out, 'no result line');
+}
+
+/** The ledger check was requested but /v1/balance fails: the run must fail, not skip the check. */
+function testIntegrationBenchFailsWhenTheStartingBalanceIsUnreadable(): void
+{
+    $dir = tempDir();
+    file_put_contents("$dir/router.php", '<?php header("Content-Type: application/json");'
+        . 'if (parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH) === "/v1/balance") { http_response_code(503); echo "{}"; return; }'
+        . 'echo json_encode(["choices" => [["index" => 0, "message" => ["role" => "assistant", "content" => "ok"], "finish_reason" => "stop"]],'
+        . '"usage" => ["prompt_tokens" => 1, "completion_tokens" => 1, "total_tokens" => 2]]);');
+    $s = stream_socket_server('tcp://127.0.0.1:0');
+    $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
+    fclose($s);
+    $srv = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", "$dir/router.php"], [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']], $pipes);
+    try {
+        for ($i = 0; $i < 100 && !($c = @fsockopen('127.0.0.1', $port)); $i++) {
+            usleep(50000);
+        }
+        $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+        $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', "--url=http://127.0.0.1:$port", '--requests=3', '--concurrency=1'],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $bp, null, $env);
+        $out = stream_get_contents($bp[1]);
+        stream_get_contents($bp[2]);
+        $code = proc_close($p);
+        check(preg_match('/^\[virsilipas-bench\] (\{.*\})$/m', $out, $m) === 1, "one result line expected, got: $out");
+        $r = json_decode($m[1], true);
+        same(['fail', 3, 0, false], [$r['status'], $r['ok'], $r['errors'], $r['ledger_exact']]);
+        same(1, $code);
+    } finally {
+        proc_terminate($srv);
+    }
 }

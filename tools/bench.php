@@ -164,7 +164,10 @@ $ok = array_values(array_filter($results, static fn ($r) => $r['status'] === 200
 $statusCounts = (object) array_count_values(array_map(static fn ($r) => (string) $r['status'], $results));
 $tokens = array_sum(array_map(static fn ($r) => $r['tokens'] ?? 0, $ok));
 $ledgerExact = null;
-if ($before !== null) {
+if (!$o['no-ledger-check'] && $before === null) {
+    fwrite(STDERR, "could not read the starting balance from /v1/balance: ledger check failed\n");
+    $ledgerExact = false;
+} elseif ($before !== null) {
     for ($i = 0, $after = balance($o); $after !== null && $after['in_flight'] > 0 && $i < 100; $i++, $after = balance($o)) {
         usleep(100000); // wait for the last settlements
     }

@@ -63,8 +63,8 @@ final class Log
         try {
             clearstatcache();
             $dirPerms = @fileperms($dir);
-            if ($dirPerms === false || ($dirPerms & 0022) !== 0 || is_link($file)) {
-                return false; // missing or shared directory, or a planted link
+            if ($dirPerms === false || ($dirPerms & 0022) !== 0 || is_link($file) || (file_exists($file) && !is_file($file))) {
+                return false; // missing or shared directory, a planted link, or not a regular file (a FIFO would block)
             }
             $perms = @fileperms($file);
             if ($perms !== false && ($perms & 0077) !== 0) {

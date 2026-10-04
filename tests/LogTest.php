@@ -71,6 +71,7 @@ function testLogNeverAppendsToADailyFileOthersCanRead(): void
         Log::init(null, 'error');
     }
 }
+
 function testLogNeverWritesThroughASymlinkOrIntoASharedDirectory(): void
 {
     $old = ini_set('error_log', tempDir() . '/php-error.log');
@@ -92,6 +93,32 @@ function testLogNeverWritesThroughASymlinkOrIntoASharedDirectory(): void
         $err = (string) file_get_contents(ini_get('error_log'));
         check(str_contains($err, '"event":"via-link"') && str_contains($err, '"event":"shared-dir"'), 'both fall back to error_log');
     } finally {
+        ini_set('error_log', (string) $old);
+        Log::init(null, 'error');
+    }
+}
+
+function testLogSkipsADailyEntryThatIsNotARegularFile(): void
+{
+    if (!function_exists('posix_mkfifo')) {
+        return; // the FIFO case needs the posix extension
+    }
+    $dir = tempDir();
+    $fifo = "$dir/" . gmdate('Ymd') . '.jsonl';
+    check(posix_mkfifo($fifo, 0600), 'mkfifo');
+    // Hold the FIFO open so a regression writes into it (and fails below) instead of blocking the suite.
+    $reader = fopen($fifo, 'r+');
+    stream_set_blocking($reader, false);
+    Log::init($dir, 'info');
+    $old = ini_set('error_log', tempDir() . '/php-error.log');
+    try {
+        $t = microtime(true);
+        Log::write('info', 'fifo', []); // with no reader, a write to a FIFO blocks forever
+        check(microtime(true) - $t < 1, 'returns at once');
+        same('', (string) fread($reader, 8192), 'nothing written into the FIFO');
+        check(str_contains((string) file_get_contents(ini_get('error_log')), '"event":"fifo"'), 'fallback to error_log');
+    } finally {
+        fclose($reader);
         ini_set('error_log', (string) $old);
         Log::init(null, 'error');
     }

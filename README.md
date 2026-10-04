@@ -113,7 +113,7 @@ php tools/bench.php --url=https://proxy.example --key-file=/path/to/key --model=
     --requests=500 --concurrency=20 --processes=4 --stream
 ```
 
-Runs the requests with `--concurrency` in flight per process across `--processes` processes, then reports requests per second, latency and time to first byte (p50, p95, p99), errors by status, and whether the key's balance fell by exactly the usage the proxy reported (`ledger_exact`; the key must have no other traffic, or pass `--no-ledger-check`). The result is one line on stdout, `[virsilipas-bench] {...}` (schema `virsilipas.bench.v1`), and the exit code is non-zero on any error or ledger mismatch. Keep `--concurrency` × `--processes` within the key's `max_concurrent_per_key`, or the excess is refused with 429.
+Runs the requests with `--concurrency` in flight per process across `--processes` processes, then reports requests per second, latency and time to first byte (p50, p95, p99), errors by status, and whether the key's balance fell by exactly the usage the proxy reported (`ledger_exact`; the key must have no other traffic, or pass `--no-ledger-check`). The result is one line on stdout, `[virsilipas-bench] {...}` (schema `virsilipas.bench.v1`), and the exit code is non-zero on any error or ledger mismatch, or when the starting balance cannot be read. `ledger_exact` compares the balance with the usage reported to the client, so it also reads `false` when the proxy charged an estimate because the upstream did not report usage; the usage table's `estimated` flag tells the two apart. Keep `--concurrency` × `--processes` within the key's `max_concurrent_per_key`, or the excess is refused with 429.
 
 ## CLI
 
