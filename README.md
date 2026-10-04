@@ -1,9 +1,10 @@
 # mcxVirsilipas
 
-A small PHP proxy that gives every API key a prepaid token balance and meters each LLM request against it, streaming included.
+A small PHP proxy that gives every API key a prepaid credit balance and meters each LLM request against it, streaming included. Fresh input, cached input and output each cost their own number of credits per model, so the balance follows what requests cost you.
 
 - One key per user, one balance per key. The balance never expires and never resets.
-- Your billing system adds tokens through an admin endpoint ("grants"). Each grant applies once, however often it is retried.
+- Your billing system adds credits through an admin endpoint ("grants"). Each grant applies once, however often it is retried.
+- Clients can read their remaining credits, their limits and their last minute's use; you set per-key limits on concurrency, requests per minute and credits per minute.
 - Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
 - Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
@@ -11,25 +12,35 @@ A small PHP proxy that gives every API key a prepaid token balance and meters ea
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
+## Credits
+
+A credit is an abstract unit: you decide what it is worth and how many you grant for a payment. Each model alias has three rates, in credits per million tokens: `input` (fresh prompt tokens), `cached_input` (prompt tokens the upstream served from its prompt cache) and `output` (completion tokens, reasoning included). A request costs
+
+```
+ceil((fresh x input + cached x cached_input + output x output) / 1,000,000)
+```
+
+rounded up once per request. The counts come from the upstream's usage report: `cached` is `prompt_tokens_details.cached_tokens`, `fresh` is the rest of the prompt side (`total_tokens - completion_tokens`), and a missing or impossible cached count is read as 0, which prices the whole prompt as fresh input. Rates are integers from 0 to 10^9 (`input` and `output` at least 1); `cached_input` may not exceed `input`, because reservations price the whole prompt at the input rate. Rates are read when a request settles, so a rate change applies to requests that finish after it, never above their reservation. Example: with `input` 1,000,000, `cached_input` 250,000 and `output` 4,000,000 (illustrative values, not a recommendation), a credit is one fresh input token, a cached token costs a quarter and an output token four.
+
 ## How metering works
 
 1. **Admit.** Only text requests are accepted: message content must be a string or text parts; images, audio and files are refused, because their cost cannot be bounded before sending. Messages keep only role, content, name, tool_calls and tool_call_id, and text parts only their text; each tool call must carry a string id, type, function name and arguments (a JSON string), and a request with any other shape is refused. Only a fixed list of fields is forwarded (messages, tools, tool_choice, parallel_tool_calls, temperature, top_p, stop, seed, presence and frequency penalties, response_format, reasoning_effort). Everything else, including `n`, `store` and output-mode options, is dropped.
-2. **Reserve.** The prompt bound is the byte length of the forwarded fields (a token is at least one byte). The proxy reserves `prompt bound + max_tokens` in one atomic transaction, with `max_tokens` clamped to what the balance can cover. Each reservation is a lease row, which also counts against the key's concurrency limit. Because the bound counts bytes, a long prompt temporarily holds roughly four times its real token count (a 45 kB agent prompt holds about 46,000 tokens for about 11,500 used); a key needs that much free balance to start the request, and the unused part comes back when it settles.
+2. **Reserve.** The prompt bound is the byte length of the forwarded fields (a token is at least one byte). The proxy reserves the prompt bound at the input rate plus `max_tokens` at the output rate, in one atomic transaction, with `max_tokens` clamped to what the balance can cover; if the balance cannot cover the prompt and one output token, the request is refused with 402. Each reservation is a lease row, which also counts against the key's limits. Because the bound counts bytes, a long prompt temporarily holds roughly four times its real token count (a 45 kB agent prompt holds about 46,000 tokens' worth of input credits for about 11,500 tokens used); a key needs that much free balance to start the request, and the unused part comes back when it settles.
 3. **Forward.** The request goes upstream with the alias replaced by the real model id and `stream_options` set by the proxy so the upstream reports usage.
-4. **Settle.** When the response ends, the tokens the upstream reported are charged, never more than the reservation, and the rest is returned, exactly once per request, together with a usage row (token counts only). A report counts only with integer `prompt_tokens`, `completion_tokens` and `total_tokens`, the total at least the sum of the other two; anything else is charged as missing usage. Reported usage above the reservation is recorded as `over_reservation` so you can see an upstream that ignores `max_tokens`.
+4. **Settle.** When the response ends, the credits for the tokens the upstream reported are charged, never more than the reservation, and the rest is returned, exactly once per request, together with a usage row (token counts, cached count and credits only). A report counts only with integer `prompt_tokens`, `completion_tokens` and `total_tokens`, the total at least the sum of the other two; anything else is charged as missing usage. A charge above the reservation is recorded as `over_reservation` so you can see an upstream that ignores `max_tokens`.
 
 Details that matter in production:
 
-- **Client hangs up mid-stream.** The proxy stops the upstream request and charges for what was generated up to that point. With an upstream that reports usage on every chunk (configure it in `stream_options`) the charge follows the upstream's own count; it can include a few chunks the client never received, generated before the disconnect was noticed. Without usage, the charge is an upper bound (the prompt bound plus the bytes delivered), capped at the reservation, and the usage row is flagged `estimated`.
-- **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and `prompt_tokens`, `completion_tokens` and `total_tokens` as usage. Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
+- **Client hangs up mid-stream.** The proxy stops the upstream request and charges for what was generated up to that point. With an upstream that reports usage on every chunk (configure it in `stream_options`) the charge follows the upstream's own count; it can include a few chunks the client never received, generated before the disconnect was noticed. Without usage, the charge is an upper bound (the prompt bound at the input rate plus the bytes delivered at the output rate), capped at the reservation, and the usage row is flagged `estimated`.
+- **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and as usage `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` and `credits` (what the reported usage costs, at most the reservation; in a stream, on each event that carries usage). Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
 - **Upstream errors** never produce a 200 before a stream has started; once it has (the 200 is already sent), an upstream error ends the stream with a generic error event and no `[DONE]`, and the output relayed until then is charged. A non-streaming answer must arrive complete and carry a usable answer: non-empty text, reasoning or refusal, or a function tool call with a non-empty id, name and arguments. A stream starts only with an event that carries a completion choice (a delta with at least one valid field); events dropped before that add nothing to the charge, and at `[DONE]` the proxy stops reading the upstream, so nothing after it is relayed or charged. Otherwise the client gets a generic error (429, the upstream's 4xx status, or 502), no upstream text, and no charge. A stream that ends without its final marker gets an error event at the end.
 - **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered (a worker that dies just before forwarding also leaves its reservation charged); if the request is settled late, the difference is returned. `bin/virsilipas status <ref>` counts such leases as `held`. `lease_seconds` must be longer than `upstream_timeout`.
-- **Runaway output.** If a stream's reported usage passes the reservation, the proxy stops the upstream request there. Output delivered after the last usage report that advanced the count is charged as an upper bound (its bytes); a repeated or lower report does not cover it.
-- **Concurrency.** `max_concurrent_per_key` stops one key from using up a shared upstream rate limit.
+- **Runaway output.** If the credits for a stream's reported usage pass the reservation, the proxy stops the upstream request there. Output delivered after the last usage report that advanced the count is charged as an upper bound (its bytes); a repeated or lower report does not cover it. Upstreams that report usage on every chunk often send the cached split only with the final report, whose counts repeat the last running report; such a repeat adds the cached split and nothing else.
+- **Limits.** Each key has three: `max_concurrent` (requests in flight; stops one key from using up a shared upstream rate limit), `requests_per_minute` and `credits_per_minute` (over the last 60 seconds, counting each request's charge, or its reservation while it runs). The config sets the defaults (`max_concurrent_per_key`, `requests_per_minute`, `credits_per_minute`; the last two unset means no limit) and the admin endpoint sets a key's own values, higher or lower. A request is refused (429) when the key is at a limit; the credits limit is checked when a request starts, so one request may take the window past it. The refusal order is disabled key, concurrency, requests, credits, balance. Rate refusals carry `Retry-After`: the seconds until the oldest request in the window turns a minute old, the earliest moment the window can free.
 
 ### Before enabling a model
 
-Check, with that model at your upstream, and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), and a client hang-up is detected under your real php-fpm and nginx (see below). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
+Check, with that model at your upstream, and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), its `prompt_tokens` include the cached tokens it reports in `prompt_tokens_details.cached_tokens` (send the same long prompt twice; on a cache hit `prompt_tokens` must not drop by the cached count), its cache writes, if it reports `cache_write_tokens` at all, cost no more than your `input` rate covers, and a client hang-up is detected under your real php-fpm and nginx (see below). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
 
 ## Install
 
@@ -37,7 +48,7 @@ Check, with that model at your upstream, and again whenever the model or the ups
 cp config.example.php config.php      # edit: upstream, models, admin token hash, paths
 bin/virsilipas init                    # creates the SQLite database
 bin/virsilipas key-create customer-42  # prints the key once
-bin/virsilipas grant customer-42 1000000 invoice-1001
+bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
 ```
 
 Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`.
@@ -70,10 +81,10 @@ Customer side, authenticated with `Authorization: Bearer <key>`:
 | Method and path | What it does |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions, streaming or not. `model` must be one of your aliases. |
-| `GET /v1/models` | Lists the aliases. |
-| `GET /v1/balance` | `{"balance": N, "in_flight": N}` for the calling key. |
+| `GET /v1/models` | Lists the aliases, each with its `credits_per_million_tokens` (`input`, `cached_input`, `output`). |
+| `GET /v1/balance` | For the calling key: `balance` (credits left, already net of running requests), `reserved` (credits held by running or unsettled requests), `in_flight`, `limits` (`max_concurrent`, `requests_per_minute`, `credits_per_minute`; `null` = no limit) and `window` (`requests` and `credits` over the last 60 seconds). |
 
-Errors use OpenAI's shape: `{"error": {"message": "...", "type": "..."}}`. 400 invalid request or non-text content, 401 bad key, 402 balance too low for this request, 403 key disabled, 404 unknown model, 429 too many concurrent requests or upstream busy, 502 upstream failed.
+Errors use OpenAI's shape: `{"error": {"message": "...", "type": "..."}}`. 400 invalid request or non-text content, 401 bad key, 402 credit balance too low for this request, 403 key disabled, 404 unknown model, 429 a limit reached (concurrency, requests per minute or credits per minute; the message says which) or upstream busy, 502 upstream failed. 429s carry `Retry-After`.
 
 Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long random token (32 bytes or more); only its sha256 is stored in the config. The grant response returns the new balance; `bin/virsilipas status <ref>` shows it at any time.
 
@@ -81,13 +92,14 @@ Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long
 |---|---|---|
 | `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for a user. `ref` must be your billing system's stable id for the user (not a per-service id), so all of the user's purchases add to one balance. Returns the key once (201). |
 | `POST /admin/keys/active` | `{"ref": "...", "active": false}` | Disables or re-enables a key (for suspend and unsuspend). |
-| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "tokens": 1000000}` | Adds tokens once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative tokens remove tokens (refunds). At most 10^15 per grant. |
+| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "credits": 1000000}` | Adds credits once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative credits remove credits (refunds). At most 10^15 per grant. |
+| `POST /admin/keys/limits` | `{"ref": "...", "requests_per_minute": 60}` | Sets any of `max_concurrent`, `requests_per_minute` and `credits_per_minute` for a key: an integer from 1 to 10^15, or `null` to follow the config default again. Limits left out are unchanged; any other field is refused (400). Returns the key's own settings (`overrides`) and the limits in force (`limits`). |
 
 Use a `grant_id` that is unique per payment, for example the invoice number or the subscription id plus its billing period, so that a retried push never credits twice and a renewal is never dropped.
 
 ## Privacy
 
-Request and response bodies are never stored or logged. The usage table holds token counts, the model alias, status and timestamps. Keys are stored only as sha256 hashes.
+Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, status and timestamps. Keys are stored only as sha256 hashes.
 
 ## Logging
 
@@ -97,7 +109,7 @@ Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMM
 |---|---|---|
 | `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
 | `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `key_create`, `key_active`, `grant` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `key_create`, `key_active`, `key_limits`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
 The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
@@ -113,12 +125,13 @@ php tools/bench.php --url=https://proxy.example --key-file=/path/to/key --model=
     --requests=500 --concurrency=20 --processes=4 --stream
 ```
 
-Runs the requests with `--concurrency` in flight per process across `--processes` processes, then reports requests per second, latency and time to first byte (p50, p95, p99), errors by status, and whether the key's balance fell by exactly the usage the proxy reported (`ledger_exact`; the key must have no other traffic, or pass `--no-ledger-check`). The result is one line on stdout, `[virsilipas-bench] {...}` (schema `virsilipas.bench.v1`), and the exit code is non-zero on any error or ledger mismatch, or when the starting balance cannot be read. `ledger_exact` compares the balance with the usage reported to the client, so it also reads `false` when the proxy charged an estimate because the upstream did not report usage; the usage table's `estimated` flag tells the two apart. Keep `--concurrency` × `--processes` within the key's `max_concurrent_per_key`, or the excess is refused with 429.
+Runs the requests with `--concurrency` in flight per process across `--processes` processes, then reports requests per second, latency and time to first byte (p50, p95, p99), errors by status, and whether the key's balance fell by exactly the credits the proxy reported (`usage.credits`; `ledger_exact`; the key must have no other traffic, or pass `--no-ledger-check`). The result is one line on stdout, `[virsilipas-bench] {...}` (schema `virsilipas.bench.v2`), and the exit code is non-zero on any error or ledger mismatch, or when the starting balance cannot be read. `ledger_exact` compares the balance with the usage reported to the client, so it also reads `false` when the proxy charged an estimate because the upstream did not report usage; the usage table's `estimated` flag tells the two apart. Keep `--concurrency` × `--processes` within the key's concurrency limit and the request rate within its per-minute limits, or the excess is refused with 429.
 
 ## CLI
 
 ```
-virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <tokens> <grant_id> | status <ref>
+virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
+           | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
 ```
 
 ## Tests

@@ -5,12 +5,12 @@ declare(strict_types=1);
 namespace MagnaCapax\Virsilipas;
 
 /**
- * The customer-facing side: OpenAI-compatible chat completions with per-key metering.
+ * The customer-facing side: OpenAI-compatible chat completions with per-key metering in credits.
  *
  * Flow per request: authenticate the key, admit only text requests built from known fields,
- * reserve an upper bound of tokens (clamping max_tokens to the balance), forward to the
+ * reserve an upper bound of credits (clamping max_tokens to the balance), forward to the
  * configured upstream, relay a rebuilt response, then settle against the usage the upstream
- * reported. Request and response bodies are never logged.
+ * reported, priced at the alias's rates. Request and response bodies are never logged.
  */
 final class Proxy
 {
@@ -19,7 +19,7 @@ final class Proxy
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
     /** Message fields forwarded upstream. */
     private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
-    private const MAX_COUNT = 1_000_000_000_000;
+    private const MAX_COUNT = Credits::MAX_COUNT;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
     private const MAX_EVENT_BYTES = 1024 * 1024;
@@ -32,8 +32,9 @@ final class Proxy
     {
         $this->authenticate();
         $data = [];
-        foreach (array_keys($this->config->models) as $alias) {
-            $data[] = ['id' => $alias, 'object' => 'model', 'owned_by' => 'virsilipas'];
+        foreach ($this->config->models as $alias => $m) {
+            $data[] = ['id' => $alias, 'object' => 'model', 'owned_by' => 'virsilipas',
+                'credits_per_million_tokens' => ['input' => $m['input'], 'cached_input' => $m['cached_input'], 'output' => $m['output']]];
         }
         Http::json(200, ['object' => 'list', 'data' => $data]);
     }
@@ -41,8 +42,9 @@ final class Proxy
     public function balance(): void
     {
         $key = $this->authenticate();
-        $s = $this->ledger->status($key['ref']);
-        Http::json(200, ['balance' => $s['balance'], 'in_flight' => $s['in_flight']]);
+        $s = $this->ledger->status($key['ref'], $this->config->limitDefaults());
+        Http::json(200, ['balance' => $s['balance'], 'reserved' => $s['reserved'], 'in_flight' => $s['in_flight'],
+            'limits' => $s['limits'], 'window' => $s['window']]);
     }
 
     public function chat(): void
@@ -56,13 +58,15 @@ final class Proxy
         $req['messages'] = self::normalizeMessages($req['messages'] ?? null);
         $stream = ($req['stream'] ?? false) === true;
         $promptBound = self::promptBound($req);
+        $rates = $this->config->models[$alias];
 
         $lease = $this->ledger->reserve(
             $key['id'],
             $promptBound,
             self::requestedMaxTokens($req),
             $this->config->maxTokensCap,
-            $this->config->maxConcurrentPerKey,
+            $rates,
+            $this->config->limitDefaults(),
             $this->config->leaseSeconds,
         );
 
@@ -70,10 +74,10 @@ final class Proxy
         try {
             Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
                 'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
-            $body = self::rewrite($req, $this->config->models[$alias], $lease['max_tokens'], $stream, $this->config->streamOptions);
-            $result = $this->forward($body, $stream, $alias, $lease['reserved']);
+            $body = self::rewrite($req, $rates['model'], $lease['max_tokens'], $stream, $this->config->streamOptions);
+            $result = $this->forward($body, $stream, $alias, $rates, $lease['reserved']);
         } finally {
-            [$used, $meta] = self::charge($result, $promptBound, $alias);
+            [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
             self::logRequest($key['ref'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }
@@ -83,7 +87,7 @@ final class Proxy
      * One record per request, after it settled: counts and statuses only. An upstream failure,
      * an estimated charge or usage above the reservation is a warning (it points at the
      * upstream or its configuration); everything else, client hang-ups included, is info.
-     * @param array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool} $meta
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool} $meta
      */
     private static function logRequest(string $ref, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
     {
@@ -91,7 +95,7 @@ final class Proxy
         $over = $used > $reserved;
         Log::write($failed || $meta['estimated'] || $over ? 'warn' : 'info', 'request', [
             'ref' => $ref, 'alias' => $meta['model'], 'stream' => $stream, 'upstream_status' => $meta['status'],
-            'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
+            'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'], 'cached_tokens' => $meta['cached'],
             'reserved' => $reserved, 'reported' => $used, 'charged' => min($used, $reserved), 'over_reservation' => $over,
         ]);
     }
@@ -194,8 +198,10 @@ final class Proxy
      * Token counts from an upstream usage object, or null unless all three counts are integers,
      * in range and consistent (the total is at least prompt plus completion). Anything else is
      * not a report: missing usage is never read as zero, and a malformed report is charged as
-     * missing (an upper bound), never as exact.
-     * @return array{prompt: int, completion: int, total: int}|null
+     * missing (an upper bound), never as exact. Cached input (prompt_tokens_details.cached_tokens)
+     * counts only as an integer within the prompt side (total minus completion); otherwise it is 0,
+     * which prices the whole prompt as fresh input.
+     * @return array{prompt: int, completion: int, total: int, cached: int}|null
      */
     public static function validUsage(mixed $u): ?array
     {
@@ -210,42 +216,59 @@ final class Proxy
             || $t < $p + $c || $t > 2 * self::MAX_COUNT) {
             return null;
         }
-        return ['prompt' => $p, 'completion' => $c, 'total' => $t];
+        $d = $u['prompt_tokens_details'] ?? null;
+        $cached = is_array($d) && is_int($d['cached_tokens'] ?? null) && $d['cached_tokens'] >= 0 && $d['cached_tokens'] <= $t - $c ? $d['cached_tokens'] : 0;
+        return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached];
     }
 
     /**
-     * Turns a forward() result into the settle() arguments: (used tokens, usage-row metadata).
-     * Reported usage wins, plus an upper bound for anything delivered after the last report.
-     * Without any usage, a delivered response is charged an upper bound (prompt bound plus the
-     * bytes delivered). Bounds are flagged as estimated; the ledger caps any charge at the
-     * reservation.
-     * @param array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int} $r
-     * @return array{0: int, 1: array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool}}
+     * Credits for a usage report plus text delivered after it: the prompt side (total minus
+     * completion) split into cached and fresh input, and the completion plus unmetered bytes as output.
+     * @param array{prompt: int, completion: int, total: int, cached: int} $u
+     * @param array{input: int, cached_input: int, output: int} $rates
      */
-    public static function charge(array $r, int $promptBound, string $alias): array
+    public static function usageCredits(array $u, int $unmetered, array $rates): int
+    {
+        $promptSide = $u['total'] - $u['completion'];
+        return Credits::of($promptSide - $u['cached'], $u['cached'], $u['completion'] + $unmetered, $rates);
+    }
+
+    /**
+     * Turns a forward() result into the settle() arguments: (used credits, usage-row metadata).
+     * Reported usage wins, plus an upper bound for anything delivered after the last report.
+     * Without any usage, a delivered response is charged an upper bound (the prompt bound at the
+     * input rate plus the bytes delivered at the output rate). Bounds are flagged as estimated;
+     * the ledger caps any charge at the reservation.
+     * @param array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int} $r
+     * @param array{input: int, cached_input: int, output: int} $rates
+     * @return array{0: int, 1: array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool}}
+     */
+    public static function charge(array $r, int $promptBound, string $alias, array $rates): array
     {
         $u = $r['usage'];
         if ($u !== null) {
-            [$prompt, $completion] = [$u['prompt'], $u['completion'] + $r['unmetered']];
-            [$used, $estimated] = [$u['total'] + $r['unmetered'], $r['unmetered'] > 0];
+            [$prompt, $completion, $cached] = [$u['prompt'], $u['completion'] + $r['unmetered'], $u['cached']];
+            [$used, $estimated] = [self::usageCredits($u, $r['unmetered'], $rates), $r['unmetered'] > 0];
         } elseif ($r['delivered']) {
-            [$prompt, $completion, $estimated] = [$promptBound, $r['completion_bound'], true];
-            $used = $prompt + $completion;
+            [$prompt, $completion, $cached, $estimated] = [$promptBound, $r['completion_bound'], 0, true];
+            $used = Credits::of($promptBound, 0, $r['completion_bound'], $rates);
         } else {
-            [$prompt, $completion, $used, $estimated] = [0, 0, 0, false];
+            [$prompt, $completion, $cached, $used, $estimated] = [0, 0, 0, 0, false];
         }
-        return [$used, ['model' => $alias, 'prompt' => $prompt, 'completion' => $completion,
+        return [$used, ['model' => $alias, 'prompt' => $prompt, 'completion' => $completion, 'cached' => $cached,
             'status' => $r['status'], 'aborted' => $r['aborted'], 'estimated' => $estimated]];
     }
 
     /**
      * The response the client sees, rebuilt from known fields only: the alias as the model,
-     * choices with their standard fields, and the three standard token counts as usage.
-     * Anything an upstream adds (costs, account data, provider names, model ids) is dropped.
+     * choices with their standard fields, and as usage the three standard token counts, the cached
+     * input count and, given the alias's rates, the credits the reported usage costs (at most the
+     * reservation). Anything an upstream adds (costs, account data, provider names, model ids) is dropped.
      * @param array<string, mixed> $j
+     * @param ?array{input: int, cached_input: int, output: int} $rates
      * @return array<string, mixed>
      */
-    public static function publicView(array $j, string $alias): array
+    public static function publicView(array $j, string $alias, ?array $rates = null, int $reserved = 0): array
     {
         $out = self::typed($j, ['id' => 'string', 'object' => 'string', 'created' => 'int']);
         $out['model'] = $alias;
@@ -262,7 +285,11 @@ final class Proxy
         }
         if (array_key_exists('usage', $j)) {
             $u = self::validUsage($j['usage']);
-            $out['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total']];
+            $out['usage'] = $u === null ? null : ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total'],
+                'prompt_tokens_details' => ['cached_tokens' => $u['cached']]];
+            if ($u !== null && $rates !== null) {
+                $out['usage']['credits'] = min(self::usageCredits($u, 0, $rates), $reserved);
+            }
         }
         return $out;
     }
@@ -477,9 +504,10 @@ final class Proxy
      * relayed). A client that hangs up stops the upstream request, and so does a stream whose
      * reported usage passes the reservation; what was delivered is still charged.
      * @param array<string, mixed> $body
+     * @param array{model: string, input: int, cached_input: int, output: int} $rates
      * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int}
      */
-    private function forward(array $body, bool $stream, string $alias, int $reserved): array
+    private function forward(array $body, bool $stream, string $alias, array $rates, int $reserved): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
         /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string} $s */
@@ -487,7 +515,7 @@ final class Proxy
             'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => ''];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
-        $handle = static function (string $event) use (&$s, $alias, $reserved): string {
+        $handle = static function (string $event) use (&$s, $alias, $rates, $reserved): string {
             $e = self::parseEvent($event);
             if ($e === null || $s['done'] || $s['failed']) {
                 return ''; // nothing after the terminal marker, or after an upstream error, is relayed or counted
@@ -515,7 +543,7 @@ final class Proxy
             // bytes to the charge (their usage, if valid, is still kept). Bytes are counted from
             // the rebuilt event the client receives, never from raw upstream text.
             $relay = $s['started'] || $s['start'];
-            $view = self::publicView($j, $alias);
+            $view = self::publicView($j, $alias, $rates, $reserved);
             $n = $relay ? self::viewBytes($view) : 0;
             $s['bytes'] += $n;
             $s['unmetered'] += $n;
@@ -525,7 +553,11 @@ final class Proxy
             if ($u !== null && ($s['usage'] === null || $u['total'] > $s['usage']['total'])) {
                 $s['usage'] = $u;
                 $s['unmetered'] = 0;
-                $s['over'] = $u['total'] > $reserved;
+                $s['over'] = self::usageCredits($u, 0, $rates) > $reserved;
+            } elseif ($u !== null && array_diff_key($u, ['cached' => 1]) === array_diff_key($s['usage'], ['cached' => 1])) {
+                // The same counts again: upstreams that report running usage send the cached split only with
+                // the final report. It adds that detail; it covers no text delivered since the last advance.
+                $s['usage'] = $u;
             }
             return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };
@@ -623,7 +655,7 @@ final class Proxy
         if (self::hasChoices($json, true)) {
             http_response_code(200);
             header('Content-Type: application/json');
-            $view = self::publicView($json, $alias);
+            $view = self::publicView($json, $alias, $rates, $reserved);
             echo json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             $bound = self::viewBytes($view); // what the client received, never discarded upstream fields
             return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
@@ -632,7 +664,7 @@ final class Proxy
         if ($s['too_big']) {
             (new HttpError(502, 'upstream response too large', 'api_error'))->send();
         } elseif ($status === 429) {
-            (new HttpError(429, 'upstream is busy, retry shortly', 'rate_limit_error'))->send();
+            (new HttpError(429, 'upstream is busy, retry shortly', 'rate_limit_error', 1))->send();
         } elseif ($status >= 400 && $status <= 499) {
             (new HttpError($status, "upstream rejected the request (HTTP $status)"))->send();
         } else {

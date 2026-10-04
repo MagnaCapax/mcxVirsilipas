@@ -70,8 +70,8 @@ function testRequestedMaxTokensValidation(): void
 
 function testUsageValidation(): void
 {
-    same(['prompt' => 10, 'completion' => 5, 'total' => 15], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
-    same(['prompt' => 10, 'completion' => 5, 'total' => 17], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 17]), 'a larger total is charged');
+    same(['prompt' => 10, 'completion' => 5, 'total' => 15, 'cached' => 0], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
+    same(['prompt' => 10, 'completion' => 5, 'total' => 17, 'cached' => 0], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 17]), 'a larger total is charged');
     foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => 10, 'completion_tokens' => 5], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 3],
         ['prompt_tokens' => 1, 'completion_tokens' => 0, 'total_tokens' => -1], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x'],
         ['prompt_tokens' => 0, 'completion_tokens' => 0, 'total_tokens' => 0], ['prompt_tokens' => -1, 'completion_tokens' => 5, 'total_tokens' => 4], ['prompt_tokens' => '10', 'completion_tokens' => 5, 'total_tokens' => 15]] as $u) {
@@ -82,15 +82,15 @@ function testUsageValidation(): void
 function testChargeUsesReportedUsageThenAnUpperBound(): void
 {
     $base = ['status' => 200, 'aborted' => false, 'delivered' => true, 'completion_bound' => 900, 'unmetered' => 0];
-    [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 5, 'total' => 15]] + $base, 100, 'a');
+    [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 5, 'total' => 15, 'cached' => 0]] + $base, 100, 'a', unitRates());
     same(15, $used);
     same(false, $meta['estimated']);
-    [$used, $meta] = Proxy::charge(['usage' => null] + $base, 100, 'a');
+    [$used, $meta] = Proxy::charge(['usage' => null] + $base, 100, 'a', unitRates());
     same(1000, $used, 'no usage reported: prompt bound + delivered bytes');
     same(true, $meta['estimated']);
-    [$used] = Proxy::charge(['usage' => null, 'delivered' => false] + $base, 100, 'a');
+    [$used] = Proxy::charge(['usage' => null, 'delivered' => false] + $base, 100, 'a', unitRates());
     same(0, $used, 'nothing delivered: nothing charged');
-    [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 2, 'total' => 12], 'unmetered' => 5000] + $base, 100, 'a');
+    [$used, $meta] = Proxy::charge(['usage' => ['prompt' => 10, 'completion' => 2, 'total' => 12, 'cached' => 0], 'unmetered' => 5000] + $base, 100, 'a', unitRates());
     same([5012, true], [$used, $meta['estimated']], 'output after the last usage report is added as an upper bound');
 }
 
@@ -98,7 +98,7 @@ function testPublicViewHidesUpstreamDetails(): void
 {
     $j = ['model' => 'vendor/secret-model', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3,
         'estimated_cost' => 0.1, 'prompt_tokens_details' => ['cached_tokens' => 0, 'account' => 'x']]];
-    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3]], Proxy::publicView($j, 'alias'));
+    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3, 'prompt_tokens_details' => ['cached_tokens' => 0]]], Proxy::publicView($j, 'alias'), 'only cached_tokens survives from the details');
     $top = ['id' => 'x', 'provider' => 'p', 'choices' => [['index' => 0, 'message' => ['content' => 'hi', 'note' => 'n'], 'x' => 1]]];
     same(['id' => 'x', 'model' => 'alias', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]]], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
     $typed = ['id' => ['x'], 'created' => '1', 'choices' => [['index' => '0', 'message' => ['content' => ['private' => 'SECRET'], 'role' => 'assistant'], 'finish_reason' => 7], [], ['delta' => 'x']]];

@@ -37,15 +37,7 @@ function tempDir(): string
     return $d;
 }
 
-/** @param array<string, mixed> $overrides */
-function configArrayFor(string $dir, array $overrides = []): array
-{
-    return $overrides + [
-        'db_path' => "$dir/ledger.sqlite",
-        'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
-        'upstream_key_file' => "$dir/upstream.key",
-        'upstream_timeout' => 30,
-        'models' => ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage', 'busy' => 'scenario-429', 'slow' => 'scenario-slow',
+const SCENARIOS = ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage', 'busy' => 'scenario-429', 'slow' => 'scenario-slow',
             'empty-usage' => 'scenario-empty-usage', 'json-error' => 'scenario-json-error', 'truncated' => 'scenario-truncated',
             'redirect' => 'scenario-redirect', 'big-delta' => 'scenario-big-delta', 'no-done' => 'scenario-no-done',
             'empty-choices' => 'scenario-empty-choices', 'done-only' => 'scenario-done-only', 'stale-usage' => 'scenario-stale-usage',
@@ -57,7 +49,38 @@ function configArrayFor(string $dir, array $overrides = []): array
             'blank-tool' => 'scenario-blank-tool', 'stream-message' => 'scenario-stream-message', 'invalid-prelude' => 'scenario-invalid-prelude',
             'done-hang' => 'scenario-done-hang', 'stream-message-bytes' => 'scenario-stream-message-bytes', 'private-bytes' => 'scenario-private-bytes',
             'over-batch' => 'scenario-over-batch', 'error-after-start' => 'scenario-error-after-start', 'error-batched' => 'scenario-error-batched',
-            'named-error' => 'scenario-named-error'],
+            'named-error' => 'scenario-named-error'];
+
+/** One credit per token of every kind: the credit counts equal the token counts. */
+function unitRates(): array
+{
+    return ['input' => 1_000_000, 'cached_input' => 1_000_000, 'output' => 1_000_000];
+}
+
+/** Limit defaults as Config::limitDefaults() returns them. */
+function lim(int $concurrent = 4, ?int $rpm = null, ?int $cpm = null): array
+{
+    return ['max_concurrent' => $concurrent, 'requests_per_minute' => $rpm, 'credits_per_minute' => $cpm];
+}
+
+/** @param array<string, mixed> $overrides */
+function configArrayFor(string $dir, array $overrides = []): array
+{
+    $models = [];
+    foreach (SCENARIOS as $alias => $scenario) {
+        $models[$alias] = ['model' => $scenario] + unitRates();
+    }
+    // Round example weights for the credit tests: cached input a quarter of fresh, output four times fresh.
+    $models['weighted'] = ['model' => 'scenario-cached', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    // Near-free input, expensive output: the credit count and the token count tell different stories.
+    $models['weighted-shift'] = ['model' => 'scenario-split-shift', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    $models['cheap-input'] = ['model' => 'scenario-ok', 'input' => 1, 'cached_input' => 1, 'output' => 8_000_000];
+    return $overrides + [
+        'db_path' => "$dir/ledger.sqlite",
+        'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
+        'upstream_key_file' => "$dir/upstream.key",
+        'upstream_timeout' => 30,
+        'models' => $models,
         'max_tokens_cap' => 1000,
         'max_concurrent_per_key' => 5,
         'lease_seconds' => 60,
@@ -154,6 +177,7 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
 {
     $ch = curl_init(Harness::get()['proxy'] . $path);
     $out = '';
+    $retryAfter = null;
     $headers = ['Content-Type: application/json'];
     if ($bearer !== null) {
         $headers[] = "Authorization: Bearer $bearer";
@@ -162,6 +186,12 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_TIMEOUT => 30,
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$retryAfter): int {
+            if (preg_match('/^Retry-After:\s*(\d+)/i', $line, $m)) {
+                $retryAfter = (int) $m[1];
+            }
+            return strlen($line);
+        },
         CURLOPT_WRITEFUNCTION => static function ($ch, string $chunk) use (&$out, $stopAfterBytes): int {
             $out .= $chunk;
             return ($stopAfterBytes > 0 && strlen($out) >= $stopAfterBytes) ? 0 : strlen($chunk);
@@ -173,7 +203,7 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
     curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
-    return ['status' => $status, 'body' => $out];
+    return ['status' => $status, 'body' => $out, 'retry_after' => $retryAfter];
 }
 
 /**
@@ -216,7 +246,7 @@ function settled(string $ref): array
 {
     $ledger = Harness::get()['ledger'];
     for ($i = 0; $i < 100; $i++) {
-        $s = $ledger->status($ref);
+        $s = $ledger->status($ref, lim(5));
         if ($s['in_flight'] === 0) {
             return $s;
         }

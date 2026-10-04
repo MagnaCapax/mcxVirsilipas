@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace MagnaCapax\Virsilipas;
 
 /**
- * The token ledger: keys with one never-resetting balance each, idempotent grants,
- * per-request leases (reserve -> settle) and a metadata-only usage log.
+ * The credit ledger: keys with one never-resetting balance each, idempotent grants,
+ * per-request leases (reserve -> settle), per-key limits and a metadata-only usage log.
  *
  * Every write is a short BEGIN IMMEDIATE transaction. Nothing is held open while a
  * request streams, so a slow client never blocks other keys.
@@ -21,6 +21,10 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
+    private const SCHEMA_VERSION = 2;
+    /** Per-key limits: the name used by the admin API and CLI => its column. Only these names reach SQL. */
+    private const LIMITS = ['max_concurrent' => 'max_concurrent', 'requests_per_minute' => 'requests_per_minute', 'credits_per_minute' => 'credits_per_minute'];
+    private const WINDOW_SECONDS = 60;
 
     private \PDO $db;
 
@@ -50,6 +54,11 @@ final class Ledger
 
     public function migrate(): void
     {
+        $version = (int) $this->db->query('PRAGMA user_version')->fetchColumn();
+        $tables = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'keys'")->fetchColumn();
+        if ($tables > 0 && $version !== self::SCHEMA_VERSION) {
+            throw new \RuntimeException('this ledger was created by another version of virsilipas (schema ' . $version . ', expected ' . self::SCHEMA_VERSION . '); start a new ledger');
+        }
         $this->db->exec(<<<'SQL'
             CREATE TABLE IF NOT EXISTS keys (
                 id INTEGER PRIMARY KEY,
@@ -57,12 +66,16 @@ final class Ledger
                 key_hash TEXT NOT NULL UNIQUE,
                 balance INTEGER NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                -- per-key limits; NULL = the configured default
+                max_concurrent INTEGER CHECK (max_concurrent IS NULL OR max_concurrent BETWEEN 1 AND 1000000000000000),
+                requests_per_minute INTEGER CHECK (requests_per_minute IS NULL OR requests_per_minute BETWEEN 1 AND 1000000000000000),
+                credits_per_minute INTEGER CHECK (credits_per_minute IS NULL OR credits_per_minute BETWEEN 1 AND 1000000000000000)
             );
             CREATE TABLE IF NOT EXISTS grants (
                 grant_id TEXT PRIMARY KEY,
                 key_id INTEGER NOT NULL REFERENCES keys(id),
-                tokens INTEGER NOT NULL,
+                credits INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS leases (
@@ -70,10 +83,12 @@ final class Ledger
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 key_id INTEGER NOT NULL REFERENCES keys(id),
                 reserved INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 settled INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS leases_open ON leases(key_id, settled, expires_at);
+            CREATE INDEX IF NOT EXISTS leases_window ON leases(key_id, created_at);
             CREATE TABLE IF NOT EXISTS usage (
                 id INTEGER PRIMARY KEY,
                 ts INTEGER NOT NULL,
@@ -82,6 +97,8 @@ final class Ledger
                 model TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL,
+                cached_tokens INTEGER NOT NULL,
+                -- credits
                 reported INTEGER NOT NULL,
                 charged INTEGER NOT NULL,
                 http_status INTEGER NOT NULL,
@@ -90,6 +107,7 @@ final class Ledger
                 over_reservation INTEGER NOT NULL
             );
             SQL);
+        $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
     }
 
     /**
@@ -121,35 +139,35 @@ final class Ledger
     }
 
     /**
-     * Applies a billing grant once per grant id. Tokens may be negative (refund or chargeback).
+     * Applies a billing grant once per grant id. Credits may be negative (refund or chargeback).
      * Retrying with the same grant id and the same ref and amount is a no-op; reusing a grant id
      * for anything else is a conflict.
      * @return array{applied: bool, balance: int}
      */
-    public function grant(string $ref, string $grantId, int $tokens): array
+    public function grant(string $ref, string $grantId, int $credits): array
     {
-        if ($tokens === 0 || abs($tokens) > self::MAX_GRANT || $grantId === '') {
-            throw new HttpError(400, 'grant needs a grant_id and nonzero tokens of at most ' . self::MAX_GRANT);
+        if ($credits === 0 || abs($credits) > self::MAX_GRANT || $grantId === '') {
+            throw new HttpError(400, 'grant needs a grant_id and nonzero credits of at most ' . self::MAX_GRANT);
         }
-        return $this->tx(function () use ($ref, $grantId, $tokens): array {
+        return $this->tx(function () use ($ref, $grantId, $credits): array {
             $keyId = $this->keyIdByRef($ref);
-            $st = $this->db->prepare('SELECT key_id, tokens FROM grants WHERE grant_id = ?');
+            $st = $this->db->prepare('SELECT key_id, credits FROM grants WHERE grant_id = ?');
             $st->execute([$grantId]);
             $prior = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($prior !== false) {
-                if ((int) $prior['key_id'] !== $keyId || (int) $prior['tokens'] !== $tokens) {
+                if ((int) $prior['key_id'] !== $keyId || (int) $prior['credits'] !== $credits) {
                     throw new HttpError(409, 'grant_id was already used for a different ref or amount');
                 }
                 return ['applied' => false, 'balance' => $this->balanceOf($keyId)];
             }
-            $new = $this->balanceOf($keyId) + $tokens;
+            $new = $this->balanceOf($keyId) + $credits;
             if (abs($new) > self::MAX_BALANCE) {
                 throw new HttpError(400, 'grant would take the balance out of range');
             }
-            $this->db->prepare('INSERT INTO grants (grant_id, key_id, tokens, created_at) VALUES (?, ?, ?, ?)')
-                ->execute([$grantId, $keyId, $tokens, time()]);
-            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$tokens, $keyId]);
+            $this->db->prepare('INSERT INTO grants (grant_id, key_id, credits, created_at) VALUES (?, ?, ?, ?)')
+                ->execute([$grantId, $keyId, $credits, time()]);
+            $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$credits, $keyId]);
             return ['applied' => true, 'balance' => $new];
         });
     }
@@ -168,16 +186,22 @@ final class Ledger
     }
 
     /**
-     * Balance and lease counts. `held` = expired leases never settled (their worker died); their
-     * reservations stay charged, so the operator can see and reconcile them.
-     * @return array{ref: string, balance: int, active: bool, in_flight: int, held: int}
+     * Balance, holds, limits and recent use. `reserved` = credits held by unsettled leases (already
+     * taken from the balance); `held` = expired leases never settled (their worker died), whose
+     * reservations stay charged so the operator can see and reconcile them. `window` = requests and
+     * credits (charged, or still reserved) over the last 60 seconds.
+     * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
+     * @return array{ref: string, balance: int, active: bool, in_flight: int, held: int, reserved: int,
+     *     overrides: array<string, ?int>, limits: array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int},
+     *     window: array{requests: int, credits: int}}
      */
-    public function status(string $ref): array
+    public function status(string $ref, array $defaults): array
     {
         $now = time();
-        $st = $this->db->prepare('SELECT k.ref, k.balance, k.active,
+        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight,
-                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held
+                (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held,
+                (SELECT COALESCE(SUM(l.reserved), 0) FROM leases l WHERE l.key_id = k.id AND l.settled = 0) AS reserved
             FROM keys k WHERE k.ref = ?');
         $st->execute([$now, $now, $ref]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
@@ -185,56 +209,124 @@ final class Ledger
         if ($row === false) {
             throw new HttpError(404, 'unknown ref');
         }
-        return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'], 'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held']];
+        $w = $this->window((int) $row['id'], $now);
+        $overrides = self::overrides($row);
+        return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
+            'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held'], 'reserved' => (int) $row['reserved'],
+            'overrides' => $overrides, 'limits' => self::effectiveLimits($overrides, $defaults),
+            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']]];
     }
 
     /**
-     * Reserves tokens for one request. max_tokens is clamped so the reservation never exceeds the
-     * balance; the lease also counts against the key's concurrency limit until settled or expired.
+     * Sets a key's own limits. Each given name is set to a positive integer, or to null to follow the
+     * configured default again; names not given are left as they are.
+     * @param array<string, mixed> $changes
+     * @return array<string, ?int> the key's overrides after the change
+     */
+    public function setLimits(string $ref, array $changes): array
+    {
+        $sets = [];
+        $values = [];
+        foreach ($changes as $name => $value) {
+            if (!is_string($name) || !isset(self::LIMITS[$name])) {
+                throw new HttpError(400, 'unknown limit; use ' . implode(', ', array_keys(self::LIMITS)));
+            }
+            if ($value !== null && (!is_int($value) || $value < 1 || $value > self::MAX_GRANT)) {
+                throw new HttpError(400, "$name must be null (the default) or an integer from 1 to " . self::MAX_GRANT);
+            }
+            $sets[] = self::LIMITS[$name] . ' = ?';
+            $values[] = $value;
+        }
+        return $this->tx(function () use ($ref, $sets, $values): array {
+            $keyId = $this->keyIdByRef($ref);
+            if ($sets !== []) {
+                $this->db->prepare('UPDATE keys SET ' . implode(', ', $sets) . ' WHERE id = ?')->execute([...$values, $keyId]);
+            }
+            $st = $this->db->prepare('SELECT ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
+            $st->execute([$keyId]);
+            $row = $st->fetch(\PDO::FETCH_ASSOC);
+            $st->closeCursor();
+            return self::overrides(is_array($row) ? $row : []);
+        });
+    }
+
+    /**
+     * The limits in force: the key's own setting where it has one, else the configured default.
+     * @param array<string, ?int> $overrides
+     * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
+     * @return array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int}
+     */
+    public static function effectiveLimits(array $overrides, array $defaults): array
+    {
+        return ['max_concurrent' => $overrides['max_concurrent'] ?? $defaults['max_concurrent'],
+            'requests_per_minute' => $overrides['requests_per_minute'] ?? $defaults['requests_per_minute'],
+            'credits_per_minute' => $overrides['credits_per_minute'] ?? $defaults['credits_per_minute']];
+    }
+
+    /**
+     * Reserves credits for one request: the prompt bound at the input rate plus max_tokens at the
+     * output rate. max_tokens is clamped so the reservation never exceeds the balance. Refusals, in
+     * order: disabled key, concurrency, requests per minute, credits per minute, balance.
+     * @param array{input: int, cached_input: int, output: int} $rates
+     * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
      * @return array{lease_id: int, max_tokens: int, reserved: int}
      */
-    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, int $maxConcurrent, int $leaseSeconds): array
+    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, array $rates, array $defaults, int $leaseSeconds): array
     {
-        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $maxConcurrent, $leaseSeconds): array {
+        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds): array {
             $now = time();
-            $st = $this->db->prepare('SELECT balance, active FROM keys WHERE id = ?');
+            $st = $this->db->prepare('SELECT balance, active, ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
             $st->execute([$keyId]);
             $k = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($k === false || !(int) $k['active']) {
                 throw new HttpError(403, 'key is disabled', 'permission_error');
             }
+            $limits = self::effectiveLimits(self::overrides($k), $defaults);
 
             $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE key_id = ? AND settled = 0 AND expires_at > ?');
             $st->execute([$keyId, $now]);
-            if ((int) $st->fetchColumn() >= $maxConcurrent) {
-                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error');
+            if ((int) $st->fetchColumn() >= $limits['max_concurrent']) {
+                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error', 1);
             }
 
-            $available = (int) $k['balance'] - $promptBound;
-            if ($available < 1) {
-                throw new HttpError(402, 'token balance too low for this request', 'insufficient_quota');
+            if ($limits['requests_per_minute'] !== null || $limits['credits_per_minute'] !== null) {
+                $w = $this->window($keyId, $now);
+                // The earliest moment the window can free: when its oldest request turns 60 seconds old.
+                $retry = max(1, $w['oldest'] + self::WINDOW_SECONDS - $now);
+                if ($limits['requests_per_minute'] !== null && $w['requests'] >= $limits['requests_per_minute']) {
+                    throw new HttpError(429, 'requests per minute limit reached for this key', 'rate_limit_error', $retry);
+                }
+                if ($limits['credits_per_minute'] !== null && $w['credits'] >= $limits['credits_per_minute']) {
+                    throw new HttpError(429, 'credits per minute limit reached for this key', 'rate_limit_error', $retry);
+                }
             }
-            $maxTokens = min($requestedMax ?? $cap, $cap, $available);
-            $reserved = $promptBound + $maxTokens;
+
+            $promptCredits = Credits::at($promptBound, $rates['input']);
+            $affordable = Credits::affordable((int) $k['balance'] - $promptCredits, $cap, $rates['output']);
+            $maxTokens = min($requestedMax ?? $cap, $affordable);
+            if ($maxTokens < 1) {
+                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota');
+            }
+            $reserved = $promptCredits + Credits::at($maxTokens, $rates['output']);
 
             $upd = $this->db->prepare('UPDATE keys SET balance = balance - ? WHERE id = ? AND balance >= ?');
             $upd->execute([$reserved, $keyId, $reserved]);
             if ($upd->rowCount() !== 1) {
-                throw new HttpError(402, 'token balance too low for this request', 'insufficient_quota');
+                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota');
             }
-            $this->db->prepare('INSERT INTO leases (key_id, reserved, expires_at) VALUES (?, ?, ?)')
-                ->execute([$keyId, $reserved, $now + $leaseSeconds]);
+            $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at) VALUES (?, ?, ?, ?)')
+                ->execute([$keyId, $reserved, $now, $now + $leaseSeconds]);
 
             return ['lease_id' => (int) $this->db->lastInsertId(), 'max_tokens' => $maxTokens, 'reserved' => $reserved];
         });
     }
 
     /**
-     * Settles a request exactly once: charges what the upstream reported, never more than the
+     * Settles a request exactly once: charges the credits the request used, never more than the
      * reservation, returns the rest, and writes the usage row in the same transaction.
      * Settling an already settled lease does nothing and returns false.
-     * @param array{model: string, prompt: int, completion: int, status: int, aborted: bool, estimated: bool} $meta
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool} $meta
      */
     public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
@@ -251,10 +343,38 @@ final class Ledger
             $charged = min($used, $reserved);
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
-            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved)]);
+            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved)]);
             return true;
         });
+    }
+
+    /**
+     * Requests started in the last 60 seconds, the credits they cost (charged if settled, else still
+     * reserved) and when the oldest of them started.
+     * @return array{requests: int, credits: int, oldest: int}
+     */
+    private function window(int $keyId, int $now): array
+    {
+        $st = $this->db->prepare('SELECT COUNT(*), COALESCE(SUM(COALESCE(u.charged, l.reserved)), 0), COALESCE(MIN(l.created_at), ?)
+            FROM leases l LEFT JOIN usage u ON u.lease_id = l.id WHERE l.key_id = ? AND l.created_at > ?');
+        $st->execute([$now, $keyId, $now - self::WINDOW_SECONDS]);
+        $r = $st->fetch(\PDO::FETCH_NUM);
+        $st->closeCursor();
+        return ['requests' => (int) $r[0], 'credits' => (int) $r[1], 'oldest' => (int) $r[2]];
+    }
+
+    /**
+     * @param array<string, mixed> $row
+     * @return array<string, ?int>
+     */
+    private static function overrides(array $row): array
+    {
+        $out = [];
+        foreach (self::LIMITS as $name => $column) {
+            $out[$name] = isset($row[$column]) ? (int) $row[$column] : null;
+        }
+        return $out;
     }
 
     private function keyIdByRef(string $ref): int

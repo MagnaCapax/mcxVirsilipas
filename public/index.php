@@ -30,6 +30,7 @@ try {
         'GET /v1/balance' => $proxy->balance(),
         'POST /admin/keys' => $admin->createKey(),
         'POST /admin/keys/active' => $admin->setActive(),
+        'POST /admin/keys/limits' => $admin->setLimits(),
         'POST /admin/grants' => $admin->grant(),
         default => throw new HttpError(404, 'not found'),
     };

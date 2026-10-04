@@ -29,6 +29,30 @@ $event = static function (array $data): void {
 };
 
 switch ($model) {
+    case 'scenario-split-shift':
+        // A repeat of the same total that moves output tokens over to the prompt side: not a detail, a different split.
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [['index' => 0, 'delta' => ['content' => 'twenty tokens']]], 'usage' => ['prompt_tokens' => 10, 'completion_tokens' => 20, 'total_tokens' => 30]]);
+        $event(['choices' => [], 'usage' => ['prompt_tokens' => 29, 'completion_tokens' => 1, 'total_tokens' => 30]]);
+        echo "data: [DONE]\n\n";
+        exit;
+    case 'scenario-cached':
+        // 1000 prompt tokens of which 800 were read from the provider's cache, 50 output tokens.
+        $u = ['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050, 'estimated_cost' => 0.0001,
+            'prompt_tokens_details' => ['cached_tokens' => 800, 'private_account' => 'PRIVATE-DETAIL']];
+        if (!empty($req['stream'])) {
+            header('Content-Type: text/event-stream');
+            // Like real upstreams with running usage: the running reports carry the counts only, and the
+            // cached split arrives with the final report, whose counts are the same.
+            $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'cached hello']]],
+                'usage' => array_diff_key($u, ['prompt_tokens_details' => 1])]);
+            $event(['choices' => [], 'usage' => $u]);
+            echo "data: [DONE]\n\n";
+            exit;
+        }
+        header('Content-Type: application/json');
+        echo json_encode(['id' => 'c', 'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'cached hello']]], 'usage' => $u]);
+        exit;
     case 'scenario-429':
         http_response_code(429);
         header('Content-Type: application/json');

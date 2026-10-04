@@ -15,8 +15,10 @@ Usage: virsilipas <command> [args]
   key-create <ref>                  create a key for <ref>; prints the key once
   key-disable <ref>                 refuse all requests for <ref>
   key-enable <ref>                  allow requests for <ref> again
-  grant <ref> <tokens> <grant_id>   add (or, if negative, remove) tokens, once per grant_id
-  status <ref>                      show balance, active flag and in-flight requests
+  grant <ref> <credits> <grant_id>  add (or, if negative, remove) credits, once per grant_id
+  limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
+                                    credits_per_minute; 'default' follows the config again
+  status <ref>                      show balance, holds, limits and the last minute's use
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
 TXT;
@@ -25,14 +27,16 @@ $args = array_slice($argv, 1);
 $cmd = array_shift($args) ?? '';
 
 try {
-    $ledger = new Ledger(Config::load(virsilipas_config_path())->dbPath);
+    $config = Config::load(virsilipas_config_path());
+    $ledger = new Ledger($config->dbPath);
     $out = match ($cmd) {
         'init' => (function () use ($ledger) { $ledger->migrate(); return 'ok'; })(),
         'key-create' => $ledger->createKey(arg($args, 0)),
         'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
         'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
-        'status' => json_encode($ledger->status(arg($args, 0))),
+        'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
+        'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
         default => null,
     };
     if ($out === null) {
@@ -59,7 +63,7 @@ function intArg(array $a, int $i): int
 {
     $v = arg($a, $i);
     if (!preg_match('/^-?[0-9]{1,16}$/', $v)) {
-        throw new \InvalidArgumentException('tokens must be an integer of at most 16 digits');
+        throw new \InvalidArgumentException('expected an integer of at most 16 digits');
     }
     return (int) $v;
 }

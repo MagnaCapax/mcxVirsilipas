@@ -25,7 +25,7 @@ function testIntegrationNonStreamDebitsReportedUsage(): void
     $j = json_decode($r['body'], true);
     same('hello world', $j['choices'][0]['message']['content'] ?? null);
     same('ok', $j['model'], 'the alias, not the upstream model id');
-    same(['prompt_tokens' => 11, 'completion_tokens' => 7, 'total_tokens' => 18], $j['usage']);
+    same(['prompt_tokens' => 11, 'completion_tokens' => 7, 'total_tokens' => 18, 'prompt_tokens_details' => ['cached_tokens' => 0], 'credits' => 18], $j['usage']);
     checkNoUpstreamDetails($r['body']);
     same(10000 - 18, settled($ref)['balance']);
     $u = lastUsage($ref);
@@ -267,7 +267,11 @@ function testIntegrationModelsAndBalance(): void
     [, $key] = fundedKey(777);
     $m = json_decode(http('GET', '/v1/models', null, $key)['body'], true);
     same(array_keys(configArrayFor('x')['models']), array_column($m['data'], 'id'));
-    same(['balance' => 777, 'in_flight' => 0], json_decode(http('GET', '/v1/balance', null, $key)['body'], true));
+    $w = array_values(array_filter($m['data'], static fn ($d) => $d['id'] === 'weighted'))[0];
+    same(['input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000], $w['credits_per_million_tokens'], 'rates are listed per alias');
+    check(!str_contains(json_encode($m), 'scenario-'), 'upstream model ids stay hidden');
+    same(['balance' => 777, 'reserved' => 0, 'in_flight' => 0, 'limits' => ['max_concurrent' => 5, 'requests_per_minute' => null, 'credits_per_minute' => null],
+        'window' => ['requests' => 0, 'credits' => 0]], json_decode(http('GET', '/v1/balance', null, $key)['body'], true));
 }
 
 function testIntegrationAdminFlow(): void
@@ -279,10 +283,11 @@ function testIntegrationAdminFlow(): void
     $key = json_decode($r['body'], true)['key'];
     same(409, http('POST', '/admin/keys', ['ref' => $ref], 'admin-secret')['status']);
 
-    $g = ['ref' => $ref, 'grant_id' => "inv-$ref", 'tokens' => 5000];
+    $g = ['ref' => $ref, 'grant_id' => "inv-$ref", 'credits' => 5000];
     same(['applied' => true, 'balance' => 5000], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true));
     same(['applied' => false, 'balance' => 5000], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true), 'retried push');
-    same(409, http('POST', '/admin/grants', ['tokens' => 6000] + $g, 'admin-secret')['status'], 'same grant_id, different amount');
+    same(409, http('POST', '/admin/grants', ['credits' => 6000] + $g, 'admin-secret')['status'], 'same grant_id, different amount');
+    same(400, http('POST', '/admin/grants', ['ref' => $ref, 'grant_id' => 'old-field', 'tokens' => 10], 'admin-secret')['status'], 'the field is credits');
 
     same(200, http('POST', '/admin/keys/active', ['ref' => $ref, 'active' => false], 'admin-secret')['status']);
     same(403, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status']);
@@ -375,7 +380,8 @@ function testIntegrationLoadSmokeUnderParallelStreams(): void
     $r = json_decode($m[1], true);
     same(['ok', 60, 0, true], [$r['status'], $r['ok'], $r['errors'], $r['ledger_exact']], trim($err) . ' ' . json_encode($r['status_counts']));
     same(0, $code);
-    same(60 * 21, $r['tokens'], 'every stream reported its usage');
+    same(60 * 21, $r['credits'], 'every stream reported its credits');
+    same('virsilipas.bench.v2', $r['schema']);
 
     // Over the per-key cap (12 in flight against 5): the excess is refused with 429, uncharged, and the ledger stays exact.
     $cmd[6] = '--concurrency=6';
@@ -444,4 +450,67 @@ function testIntegrationBenchFailsWhenTheStartingBalanceIsUnreadable(): void
     } finally {
         proc_terminate($srv);
     }
+}
+/** A prompt long enough that its bound covers the 1000 prompt tokens the cached scenario reports. */
+function cachedMsg(bool $stream): array
+{
+    return ['model' => 'weighted', 'stream' => $stream, 'max_tokens' => 100, 'messages' => [['role' => 'user', 'content' => str_repeat('a', 1100)]]];
+}
+
+function testIntegrationCachedInputIsChargedAtItsOwnRate(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(100000);
+        $r = http('POST', '/v1/chat/completions', cachedMsg($stream), $key);
+        same(200, $r['status']);
+        checkNoUpstreamDetails($r['body']);
+        // 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
+        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"credits":1200'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
+        $u = lastUsage($ref);
+        same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
+    }
+}
+
+function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $set = ['ref' => $ref, 'requests_per_minute' => 1];
+    same(401, http('POST', '/admin/keys/limits', $set)['status'], 'no token');
+    same(401, http('POST', '/admin/keys/limits', $set, $key)['status'], 'a client key is not the admin token');
+    $r = json_decode(http('POST', '/admin/keys/limits', $set, 'admin-secret')['body'], true);
+    same(['ref' => $ref, 'overrides' => ['max_concurrent' => null, 'requests_per_minute' => 1, 'credits_per_minute' => null],
+        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null]], $r);
+    same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'burst' => 3], 'admin-secret')['status'], 'unknown limit');
+    same(404, http('POST', '/admin/keys/limits', ['ref' => 'nobody-' . $ref, 'max_concurrent' => 2], 'admin-secret')['status']);
+
+    same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status']);
+    settled($ref);
+    $refused = http('POST', '/v1/chat/completions', msg('ok', false), $key);
+    same(429, $refused['status']);
+    check(str_contains($refused['body'], 'requests per minute limit reached'), 'the reason is named');
+    check($refused['retry_after'] !== null && $refused['retry_after'] >= 1 && $refused['retry_after'] <= 60, 'Retry-After within the minute');
+    $b = json_decode(http('GET', '/v1/balance', null, $key)['body'], true);
+    same([1, ['requests' => 1, 'credits' => 18]], [$b['limits']['requests_per_minute'], $b['window']], 'the client sees its limit and its last minute');
+
+    same(200, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_minute' => null], 'admin-secret')['status']);
+    same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'back to the default: no limit');
+}
+function testIntegrationStreamStopsWhenTheCreditsPassTheReservation(): void
+{
+    // Reservation: 1 credit for the prompt + 2 tokens x 8 = 17 credits. Event i reports 11 + i tokens,
+    // which cost 8i + 1 credits: past 17 at the third event, while the token count passes 17 only at the seventh.
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('cheap-input', true, ['max_tokens' => 2]), $key);
+    same(200, $r['status']);
+    check(str_contains($r['body'], 't3 ') && !str_contains($r['body'], 't4 '), 'stopped right after the event that passed the reservation');
+    same(10000 - 17, settled($ref)['balance'], 'charged the reservation, never more');
+    same(1, lastUsage($ref)['over_reservation']);
+}
+function testIntegrationARepeatedTotalAddsDetailButNeverASplit(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    same(200, http('POST', '/v1/chat/completions', msg('weighted-shift', true), $key)['status']);
+    // The first report stands: 10 prompt x 2 + 20 output x 8. The re-split repeat (29 x 2 + 1 x 8 = 66) is ignored.
+    same(10000 - 180, settled($ref)['balance']);
 }

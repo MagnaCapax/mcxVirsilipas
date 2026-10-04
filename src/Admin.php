@@ -37,19 +37,34 @@ final class Admin
         Http::json(200, ['ref' => $ref, 'active' => $b['active']]);
     }
 
-    /** POST /admin/grants {"ref", "grant_id", "tokens"} — applied once per grant_id; tokens may be negative. */
+    /** POST /admin/grants {"ref", "grant_id", "credits"} — applied once per grant_id; credits may be negative. */
     public function grant(): void
     {
         $b = $this->body();
         $ref = self::ref($b);
         $grantId = $b['grant_id'] ?? null;
-        $tokens = $b['tokens'] ?? null;
-        if (!is_string($grantId) || $grantId === '' || strlen($grantId) > 200 || !is_int($tokens)) {
-            throw new HttpError(400, 'grant needs a string grant_id and an integer tokens');
+        $credits = $b['credits'] ?? null;
+        if (!is_string($grantId) || $grantId === '' || strlen($grantId) > 200 || !is_int($credits)) {
+            throw new HttpError(400, 'grant needs a string grant_id and an integer credits');
         }
-        $r = $this->ledger->grant($ref, $grantId, $tokens);
-        Log::write('info', 'grant', ['ref' => $ref, 'grant_id' => $grantId, 'tokens' => $tokens, 'applied' => $r['applied'], 'balance' => $r['balance']]);
+        $r = $this->ledger->grant($ref, $grantId, $credits);
+        Log::write('info', 'grant', ['ref' => $ref, 'grant_id' => $grantId, 'credits' => $credits, 'applied' => $r['applied'], 'balance' => $r['balance']]);
         Http::json(200, $r);
+    }
+
+    /**
+     * POST /admin/keys/limits {"ref", "max_concurrent"?, "requests_per_minute"?, "credits_per_minute"?}:
+     * a given limit is set to a positive integer, or to null to follow the configured default again;
+     * limits not given are left as they are. Returns the key's own settings and the limits in force.
+     */
+    public function setLimits(): void
+    {
+        $b = $this->body();
+        $ref = self::ref($b);
+        unset($b['ref']);
+        $overrides = $this->ledger->setLimits($ref, $b);
+        Log::write('info', 'key_limits', ['ref' => $ref] + $overrides);
+        Http::json(200, ['ref' => $ref, 'overrides' => $overrides, 'limits' => Ledger::effectiveLimits($overrides, $this->config->limitDefaults())]);
     }
 
     /** @return array<string, mixed> */

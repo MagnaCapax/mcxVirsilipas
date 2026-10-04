@@ -2,7 +2,7 @@
 
 ## What this is
 
-A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per API key against one prepaid, never-expiring balance. Billing pushes grants; the proxy never refills a balance by itself.
+A small PHP application: an OpenAI-compatible proxy that meters LLM usage per API key, in credits priced per model (fresh input, cached input, output), against one prepaid, never-expiring balance. Billing pushes grants; the proxy never refills a balance by itself.
 
 ## Rules
 
@@ -20,18 +20,21 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM tokens per A
 3. A grant is applied once per `grant_id`; reusing a `grant_id` for anything else is a conflict. Balances stay far inside the 64-bit range.
 4. No transaction or statement is open while a request streams.
 5. The client never gets a 200 unless the upstream answered 2xx with a usable answer (non-empty text, reasoning or refusal, or a function tool call with non-empty id, name and arguments), or a stream whose first relayed event has a delta with a valid field. Nothing after a stream's [DONE] is relayed or charged, and streamed bytes are counted only from the rebuilt events the client receives.
-6. Missing or malformed usage is never read as zero; it is charged an upper bound, capped and flagged. Usage is exact only with all three integer counts and a total at least prompt plus completion. In a stream, only a report that advances the total covers the text delivered before it.
+6. Missing or malformed usage is never read as zero; it is charged an upper bound, capped and flagged. Usage is exact only with all three integer counts and a total at least prompt plus completion. In a stream, only a report that advances the total covers the text delivered before it. A repeat with the same counts may add the cached split (sent with the final report); nothing else.
 7. Only allowlisted request fields and text content go upstream; the prompt bound counts every forwarded byte.
-8. Responses are rebuilt from allowlisted fields, each value of its expected type: the alias and the three standard usage counts. Upstream error text, costs, provider fields and model ids never reach the client.
+8. Responses are rebuilt from allowlisted fields, each value of its expected type: the alias, the three standard usage counts, the cached count and the credits. Upstream error text, costs, provider fields and model ids never reach the client.
 9. Lease ids are never reused (`AUTOINCREMENT`).
 10. Log records hold event names, counts, statuses and billing references only: never request or response bodies, prompts, keys, the admin token, upstream error text, request paths, exception messages or client addresses. A failed log write never fails a request.
+11. Every credit amount comes from `Credits` (one rounding, up, per request); counts and rates are clamped so no product overflows. `cached_input` never exceeds `input`, so pricing the whole prompt at the input rate bounds any charge.
+12. Limits are checked inside the reservation transaction; a refused request reserves nothing. Only the fixed limit names reach SQL.
 
 ## Layout
 
 ```
 public/index.php   front controller and routes
 src/Config.php     config loading and validation
-src/Ledger.php     SQLite: keys, grants, leases, usage
+src/Ledger.php     SQLite: keys, grants, leases, usage, per-key limits
+src/Credits.php    credit arithmetic
 src/Proxy.php      customer endpoints, request rewrite, streaming, charging
 src/Admin.php      billing/provisioning endpoints
 src/Http.php       request/response helpers; HttpError.php maps refusals to HTTP

@@ -14,16 +14,22 @@ return [
     // Seconds before an upstream request is cut off.
     'upstream_timeout' => 600,
 
-    // The models customers may use: alias they send => model id sent upstream.
+    // The models customers may use: alias they send => the model id sent upstream and its rates in credits
+    // per million tokens: fresh prompt tokens, prompt tokens served from the upstream's cache (at most the
+    // input rate) and output tokens (reasoning included). Integers; the values below are only an example.
     'models' => [
-        'default' => 'example-org/example-model',
+        'default' => ['model' => 'example-org/example-model', 'input' => 1000000, 'cached_input' => 250000, 'output' => 4000000],
     ],
 
-    // Upper bound on max_tokens per request. Requests are also clamped to the remaining balance.
+    // Upper bound on max_tokens per request (at most 10^9). Requests are also clamped to the remaining balance.
     'max_tokens_cap' => 16384,
 
+    // Default per-key limits; POST /admin/keys/limits (or bin/virsilipas limit) sets a key's own values.
     // In-flight requests allowed per key. Keeps one key from using up a shared upstream limit.
     'max_concurrent_per_key' => 4,
+    // Requests and credits per key over the last 60 seconds. Unset means no limit.
+    // 'requests_per_minute' => 60,
+    // 'credits_per_minute' => 2000000,
 
     // How long a reservation survives if its worker dies. Must exceed upstream_timeout.
     'lease_seconds' => 900,
