@@ -23,6 +23,14 @@ final class Proxy
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
     private const MAX_EVENT_BYTES = 1024 * 1024;
+    /** Upstream error bodies are read this far, for their machine code only. */
+    private const MAX_ERROR_BYTES = 64 * 1024;
+    /** Upstream statuses that mean nothing was generated and the same upstream may take the request again. */
+    private const RETRY_STATUSES = [408, 409, 429, 502, 503, 504];
+    /** Upstream statuses that are this upstream's problem (its key, its account's credit, its model id): the next one may answer. */
+    private const NEXT_STATUSES = [401, 402, 403, 404];
+    /** Upstream error codes passed on to the client, because the client can act on them. */
+    private const PASSED_CODES = ['context_length_exceeded'];
 
     public function __construct(private readonly Config $config, private readonly Ledger $ledger)
     {
@@ -33,8 +41,13 @@ final class Proxy
         $this->authenticate();
         $data = [];
         foreach ($this->config->models as $alias => $m) {
-            $data[] = ['id' => $alias, 'object' => 'model', 'owned_by' => 'virsilipas',
-                'credits_per_million_tokens' => ['input' => $m['input'], 'cached_input' => $m['cached_input'], 'output' => $m['output']]];
+            // The standard model fields, the alias's prices in credits, and what agent clients read to size requests.
+            $info = $this->config->info[$alias];
+            $data[] = ['id' => $alias, 'object' => 'model', 'created' => 0, 'owned_by' => 'virsilipas']
+                + ($info['description'] !== '' ? ['description' => $info['description']] : [])
+                + ($info['context_length'] !== null ? ['context_length' => $info['context_length']] : [])
+                + ['max_completion_tokens' => $this->config->maxTokensCap,
+                    'credits_per_million_tokens' => ['input' => $m['input'], 'cached_input' => $m['cached_input'], 'output' => $m['output']]];
         }
         Http::json(200, ['object' => 'list', 'data' => $data]);
     }
@@ -53,11 +66,12 @@ final class Proxy
         $req = Http::jsonBody(self::MAX_BODY_BYTES);
         $alias = $req['model'] ?? null;
         if (!is_string($alias) || !isset($this->config->models[$alias])) {
-            throw new HttpError(404, 'unknown model; see /v1/models');
+            throw new HttpError(404, 'unknown model; see /v1/models', code: 'model_not_found', param: 'model');
         }
         $req['messages'] = self::normalizeMessages($req['messages'] ?? null);
         $stream = ($req['stream'] ?? false) === true;
-        $promptBound = self::promptBound($req);
+        // Every forwarded byte counts, the operator's params included; one bound must cover whichever upstream answers.
+        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params']), $this->config->routes[$alias]));
         $rates = $this->config->models[$alias];
 
         $lease = $this->ledger->reserve(
@@ -70,21 +84,128 @@ final class Proxy
             $this->config->leaseSeconds,
         );
 
-        $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
+        $result = self::attemptResult(0);
         [$upstream, $started] = ['', hrtime(true)];
+        $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
-            Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
+            if (!headers_sent()) {
+                header('X-Request-Id: ' . $lease['lease_id']); // the client can quote it; it is the lease id in the usage rows and the log
+            }
+            Log::write('debug', 'admit', ['ref' => $key['ref'], 'lease' => $lease['lease_id'], 'alias' => $alias, 'stream' => $stream,
                 'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
-            $route = $this->config->route($alias);
-            $upstream = (string) parse_url($route['url'], PHP_URL_HOST); // which upstream served it, for tracking per upstream
-            $body = self::rewrite($req, $rates['model'], $lease['max_tokens'], $stream, $route['stream_options']);
-            $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved']);
+            // The alias's upstreams in order. Each gets the first try plus `retries` more when a failure cost nothing
+            // upstream; anything that may have generated output, or that the client caused, ends the request.
+            foreach (array_keys($this->config->routes[$alias]) as $hop) {
+                try {
+                    $route = $this->config->route($alias, $hop);
+                } catch (\RuntimeException) {
+                    Log::write('warn', 'upstream_skipped', ['ref' => $key['ref'], 'lease' => $lease['lease_id'], 'alias' => $alias, 'hop' => $hop, 'reason' => 'key file missing or empty']);
+                    $result = self::attemptResult(0, 'next');
+                    continue;
+                }
+                $upstream = (string) parse_url($route['url'], PHP_URL_HOST); // which upstream served it, for tracking per upstream
+                $body = self::rewrite($req, $route['model'], $lease['max_tokens'], $stream, $route['stream_options'], $route['params']);
+                for ($try = 0; $try <= $this->config->retries; $try++) {
+                    if (connection_aborted()) {
+                        break 2; // the client is gone: no further attempt is made for it
+                    }
+                    $left = intdiv($deadline - hrtime(true), 1_000_000_000);
+                    if ($left < 1) {
+                        $result = array_replace(self::attemptResult(0), ['timed_out' => true]);
+                        break 2;
+                    }
+                    $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved'], $left);
+                    if ($result['delivered'] || $result['kind'] === 'final') {
+                        break 2;
+                    }
+                    Log::write('warn', 'upstream_attempt', ['ref' => $key['ref'], 'lease' => $lease['lease_id'], 'alias' => $alias, 'hop' => $hop,
+                        'try' => $try, 'upstream' => $upstream, 'upstream_status' => $result['status'], 'outcome' => $result['kind']]);
+                    if ($result['kind'] !== 'retry' || $try === $this->config->retries) {
+                        break; // on to the next upstream
+                    }
+                    // The upstream's own wait when it gives one (up to a minute), else 0.5 s doubling. A wait that
+                    // would run past the deadline is not taken: the next upstream gets the remaining time instead.
+                    $waitNs = (int) (($result['retry_after'] !== null && $result['retry_after'] <= 60 ? $result['retry_after'] : min(0.5 * 2 ** $try, 8)) * 1e9);
+                    if (hrtime(true) + $waitNs >= $deadline) {
+                        break;
+                    }
+                    usleep(intdiv($waitNs, 1000));
+                }
+            }
+            if (!$result['delivered']) {
+                self::failure($result)->send();
+            }
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000)];
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
-            self::logRequest($key['ref'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
+            self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }
+    }
+
+    /**
+     * A forward() result before (or without) a usable answer. $kind says what the failure allows:
+     * retry (the same upstream again: nothing was generated), next (the next upstream), final (stop).
+     * @return array{status: int, usage: null, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool}
+     */
+    private static function attemptResult(int $status, string $kind = 'final'): array
+    {
+        return ['status' => $status, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0,
+            'kind' => $kind, 'retry_after' => null, 'code' => null, 'timed_out' => false, 'too_big' => false];
+    }
+
+    /**
+     * What a failed attempt allows. Retry or move on only when the upstream cannot have generated (and billed)
+     * an answer: the request never left, or the upstream refused it before working on it. Once a 2xx status has
+     * arrived, or a sent request timed out or broke, output may exist, so the request ends: a second try could
+     * pay for the same answer twice. A request the upstream rejected as invalid ends too; another upstream would
+     * reject it as well.
+     */
+    public static function outcome(int $status, int $curlErr, bool $sent, bool $tooBig): string
+    {
+        return match (true) {
+            $tooBig, $status >= 200 && $status <= 299 => 'final',
+            $curlErr !== 0 && !$sent => 'retry',
+            $curlErr !== 0 && $status === 0 => 'final',
+            in_array($status, self::RETRY_STATUSES, true) => 'retry',
+            $status >= 500 || in_array($status, self::NEXT_STATUSES, true) => 'next',
+            default => 'final',
+        };
+    }
+
+    /** A recognised machine code in an upstream error body (error.code, error.type or error.metadata.error_type), or null. */
+    public static function errorCode(string $body): ?string
+    {
+        $e = $body === '' ? null : (json_decode($body, true)['error'] ?? null);
+        if (!is_array($e)) {
+            return null;
+        }
+        foreach ([$e['code'] ?? null, $e['type'] ?? null, is_array($e['metadata'] ?? null) ? ($e['metadata']['error_type'] ?? null) : null] as $c) {
+            if (is_string($c) && in_array($c, self::PASSED_CODES, true)) {
+                return $c;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * What the client is told when no upstream gave a usable answer: one of the proxy's fixed errors,
+     * chosen from the last attempt's status class. Nothing the upstream said is passed on except a
+     * recognised machine code for an over-long request, which the client can act on.
+     * @param array{status: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool} $r
+     */
+    public static function failure(array $r): HttpError
+    {
+        $s = $r['status'];
+        return match (true) {
+            $r['code'] === 'context_length_exceeded' => new HttpError(400, 'the request is longer than the model accepts', 'invalid_request_error', null, 'context_length_exceeded', 'messages'),
+            $r['timed_out'] => new HttpError(504, 'upstream timed out', 'api_error', null, 'upstream_timeout'),
+            $r['too_big'] => new HttpError(502, 'upstream response too large', 'api_error', null, 'upstream_error'),
+            $s === 429 => new HttpError(429, 'upstream is busy, retry shortly', 'rate_limit_error', max(1, min($r['retry_after'] ?? 1, 60)), 'upstream_busy'),
+            in_array($s, [400, 413, 422], true) => new HttpError(400, "upstream rejected the request (HTTP $s)", 'invalid_request_error', null, 'upstream_rejected'),
+            $r['kind'] === 'retry' || $s === 0 || $s === 503 => new HttpError(503, 'upstream unavailable, retry shortly', 'api_error', 1, 'upstream_unavailable'),
+            default => new HttpError(502, 'upstream unavailable or returned an invalid response', 'api_error', null, 'upstream_error'),
+        };
     }
 
     /**
@@ -93,12 +214,12 @@ final class Proxy
      * upstream or its configuration); everything else, client hang-ups included, is info.
      * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, reasoning: int, cost: ?int, upstream: string, duration_ms: int} $meta
      */
-    private static function logRequest(string $ref, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
+    private static function logRequest(string $ref, int $lease, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
     {
         $failed = !$delivered && !$meta['aborted'];
         $over = $used > $reserved;
         Log::write($failed || $meta['estimated'] || $over ? 'warn' : 'info', 'request', [
-            'ref' => $ref, 'alias' => $meta['model'], 'upstream' => $meta['upstream'], 'stream' => $stream, 'upstream_status' => $meta['status'],
+            'ref' => $ref, 'lease' => $lease, 'alias' => $meta['model'], 'upstream' => $meta['upstream'], 'stream' => $stream, 'upstream_status' => $meta['status'],
             'duration_ms' => $meta['duration_ms'], 'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
             'prompt_tokens' => $meta['prompt'], 'cached_tokens' => $meta['cached'], 'completion_tokens' => $meta['completion'],
             'reasoning_tokens' => $meta['reasoning'], 'upstream_cost' => $meta['cost'],
@@ -115,17 +236,17 @@ final class Proxy
     public static function normalizeMessages(mixed $messages): array
     {
         if (!is_array($messages) || $messages === [] || !array_is_list($messages)) {
-            throw new HttpError(400, 'messages must be a non-empty array');
+            throw new HttpError(400, 'messages must be a non-empty array', code: 'invalid_messages', param: 'messages');
         }
         $out = [];
         foreach ($messages as $m) {
             if (!is_array($m) || !is_string($m['role'] ?? null)) {
-                throw new HttpError(400, 'each message needs a role');
+                throw new HttpError(400, 'each message needs a role', code: 'invalid_messages', param: 'messages');
             }
             $m = array_intersect_key($m, array_flip(self::MESSAGE_FIELDS));
             foreach (['name', 'tool_call_id'] as $k) {
                 if (array_key_exists($k, $m) && !is_string($m[$k])) {
-                    throw new HttpError(400, "message $k must be a string");
+                    throw new HttpError(400, "message $k must be a string", code: 'invalid_messages', param: 'messages');
                 }
             }
             if (array_key_exists('tool_calls', $m)) {
@@ -136,13 +257,13 @@ final class Proxy
                 $parts = [];
                 foreach ($content as $part) {
                     if (!is_array($part) || ($part['type'] ?? null) !== 'text' || !is_string($part['text'] ?? null)) {
-                        throw new HttpError(400, 'only text content is supported');
+                        throw new HttpError(400, 'only text content is supported', code: 'unsupported_content', param: 'messages');
                     }
                     $parts[] = ['type' => 'text', 'text' => $part['text']];
                 }
                 $m['content'] = $parts;
             } elseif ($content !== null && !is_string($content)) {
-                throw new HttpError(400, 'message content must be text');
+                throw new HttpError(400, 'message content must be text', code: 'unsupported_content', param: 'messages');
             }
             $out[] = $m;
         }
@@ -151,15 +272,17 @@ final class Proxy
 
     /**
      * Builds the upstream request from the normalized messages and allowlisted fields:
-     * operator-chosen model, n=1 (by omission), clamped max_tokens, and server-side
-     * stream_options so usage is reported.
+     * operator-chosen model, the operator's params for this model and upstream (they win over what the
+     * client sent; Config refuses params naming the fields set below), n=1 (by omission), clamped
+     * max_tokens, and server-side stream_options so usage is reported.
      * @param array<string, mixed> $req
      * @param array<string, mixed> $streamOptions
+     * @param array<string, mixed> $params
      * @return array<string, mixed>
      */
-    public static function rewrite(array $req, string $upstreamModel, int $maxTokens, bool $stream, array $streamOptions): array
+    public static function rewrite(array $req, string $upstreamModel, int $maxTokens, bool $stream, array $streamOptions, array $params = []): array
     {
-        $out = ['model' => $upstreamModel] + self::promptFields($req);
+        $out = ['model' => $upstreamModel] + array_replace(self::promptFields($req), $params);
         $out['max_tokens'] = $maxTokens;
         $out['stream'] = $stream;
         if ($stream) {
@@ -173,9 +296,9 @@ final class Proxy
      * A token is at least one byte, and the JSON quoting outweighs chat-template tokens.
      * @param array<string, mixed> $req
      */
-    public static function promptBound(array $req): int
+    public static function promptBound(array $req, array $params = []): int
     {
-        return strlen(json_encode(self::promptFields($req), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '') + 16;
+        return strlen(json_encode(array_replace(self::promptFields($req), $params), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '') + 16;
     }
 
     /**
@@ -195,7 +318,7 @@ final class Proxy
             return null;
         }
         if (!is_int($v) || $v < 1) {
-            throw new HttpError(400, 'max_tokens must be a positive integer');
+            throw new HttpError(400, 'max_tokens must be a positive integer', code: 'invalid_value', param: 'max_tokens');
         }
         return $v;
     }
@@ -364,7 +487,7 @@ final class Proxy
     {
         if (!is_array($calls) || !array_is_list($calls) || ($strict && $calls === [])) {
             if ($strict) {
-                throw new HttpError(400, 'tool_calls must be a non-empty list');
+                throw new HttpError(400, 'tool_calls must be a non-empty list', code: 'invalid_messages', param: 'messages');
             }
             return [];
         }
@@ -378,7 +501,7 @@ final class Proxy
             }
             // A request replays a complete call; a response (or stream fragment) needs at least one valid field.
             if ($strict && ($dropped > 0 || !isset($call['id'], $call['type'], $fn['name'], $fn['arguments']))) {
-                throw new HttpError(400, 'each tool call needs string id, type, function name and arguments (a JSON string)');
+                throw new HttpError(400, 'each tool call needs string id, type, function name and arguments (a JSON string)', code: 'invalid_messages', param: 'messages');
             }
             if ($call !== []) {
                 $out[] = $call;
@@ -520,31 +643,33 @@ final class Proxy
     {
         $key = $this->ledger->findKey(Http::bearer());
         if ($key === null) {
-            throw new HttpError(401, 'invalid key', 'authentication_error');
+            throw new HttpError(401, 'invalid key', 'authentication_error', code: 'invalid_api_key');
         }
         if (!$key['active']) {
-            throw new HttpError(403, 'key is disabled', 'permission_error');
+            throw new HttpError(403, 'key is disabled', 'permission_error', code: 'key_disabled');
         }
         return $key;
     }
 
     /**
-     * Forwards to the upstream. The client gets a 200 only once the upstream has answered 2xx
-     * with a completion that has choices (non-stream) or a first event with choices (stream);
-     * otherwise a generic error of the same class, with nothing charged (upstream bodies are not
-     * relayed). A client that hangs up stops the upstream request, and so does a stream whose
-     * reported usage passes the reservation; what was delivered is still charged.
+     * One attempt at one upstream. The client gets a 200 only once the upstream has answered 2xx
+     * with a completion that has choices (non-stream) or a first event with choices (stream).
+     * Otherwise nothing is sent and the result says what the failure allows (see attemptResult):
+     * the caller may try again, try the next upstream, or send a generic error of the right class.
+     * Upstream bodies are never relayed; of an error body only a recognised machine code is kept.
+     * A client that hangs up stops the upstream request, and so does a stream whose reported usage
+     * passes the reservation; what was delivered is still charged.
      * @param array{url: string, key: string, stream_options: array<string, mixed>} $route
      * @param array<string, mixed> $body
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
-     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int}
+     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool}
      */
-    private function forward(array $route, array $body, bool $stream, string $alias, array $rates, int $reserved): array
+    private function forward(array $route, array $body, bool $stream, string $alias, array $rates, int $reserved, int $timeout): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
-        /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string} $s */
+        /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int} $s */
         $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
-            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => ''];
+            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
         $handle = static function (string $event) use (&$s, $alias, $rates, $reserved): string {
@@ -610,17 +735,22 @@ final class Proxy
             CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
             CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => $this->config->upstreamTimeout,
+            CURLOPT_TIMEOUT => $timeout,
             CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$s): int {
                 if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $m)) {
                     $s['status'] = (int) $m[1]; // the last status line wins (e.g. after 100 Continue)
+                    $s['retry_after'] = null;
+                } elseif (preg_match('/^retry-after(-ms)?:\s*(\d{1,9})\s*$/i', $line, $m)) {
+                    $s['retry_after'] = $m[1] === '' ? (int) $m[2] : (int) ceil((int) $m[2] / 1000); // seconds; an HTTP-date form is ignored
                 }
                 return strlen($line);
             },
             CURLOPT_WRITEFUNCTION => static function ($ch, string $chunk) use (&$s, $stream, $handle): int {
                 $len = strlen($chunk);
                 if ($s['status'] < 200 || $s['status'] > 299) {
-                    return $len; // error body: read and discard
+                    // Error body: kept (bounded) only to read a machine code from it, never logged or relayed.
+                    $s['err'] .= substr($chunk, 0, max(0, self::MAX_ERROR_BYTES - strlen($s['err'])));
+                    return $len;
                 }
                 if (!$stream) {
                     if (strlen($s['full']) + $len > self::MAX_RESPONSE_BYTES) {
@@ -681,16 +811,18 @@ final class Proxy
         ]);
         curl_exec($ch);
         $curlErr = curl_errno($ch);
+        $sent = curl_getinfo($ch, CURLINFO_PRETRANSFER_TIME) > 0; // false: the request never left (no connection, or TLS failed)
         curl_close($ch);
 
         $status = $s['status'];
-        $result = ['status' => $status, 'usage' => null, 'aborted' => $s['aborted'], 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
+        $result = ['status' => $status, 'aborted' => $s['aborted'], 'kind' => 'final', 'retry_after' => $s['retry_after'], 'code' => null,
+            'timed_out' => false, 'too_big' => $s['too_big']] + self::attemptResult($status);
 
         if ($stream && $s['started']) {
             $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']); // after a hang-up too: it may hold the final report
             if (!$s['aborted']) {
                 if (!$s['done']) {
-                    $tail .= 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error']]) . "\n\n";
+                    $tail .= 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error', 'param' => null, 'code' => 'upstream_error']]) . "\n\n";
                 }
                 echo $tail;
                 flush();
@@ -708,15 +840,7 @@ final class Proxy
             return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
         }
 
-        if ($s['too_big']) {
-            (new HttpError(502, 'upstream response too large', 'api_error'))->send();
-        } elseif ($status === 429) {
-            (new HttpError(429, 'upstream is busy, retry shortly', 'rate_limit_error', 1))->send();
-        } elseif ($status >= 400 && $status <= 499) {
-            (new HttpError($status, "upstream rejected the request (HTTP $status)"))->send();
-        } else {
-            (new HttpError(502, 'upstream unavailable or returned an invalid response', 'api_error'))->send();
-        }
-        return $result;
+        return ['kind' => self::outcome($status, $curlErr, $sent, $s['too_big']), 'timed_out' => $curlErr === CURLE_OPERATION_TIMEDOUT && $sent,
+            'code' => self::errorCode($s['err'])] + $result;
     }
 }

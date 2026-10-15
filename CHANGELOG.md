@@ -2,6 +2,16 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.4.0 (2026-10-15)
+
+No schema change; v0.3.0 configs load unchanged (a global `upstream_url` or a model's own `url` is a one-entry route).
+
+- **Named upstreams and failover routes.** `upstreams` names each upstream once (URL, `key_file`, optional `stream_options`); a model's `route` lists the upstreams that serve it in order, each with the model id sent there. The route's length is the failover depth. Each upstream's key goes to that upstream only; an upstream whose key file is missing or empty is skipped (logged `upstream_skipped`), never served with another key. The global `upstream_url`/`upstream_key_file` are now optional.
+- **Retries.** `retries` (0 to 2, default 1) extra attempts on the same upstream, only after a failure that cost nothing there: no connection, or 408, 409, 429, 502, 503, 504. The wait is the upstream's `Retry-After`/`retry-after-ms` (up to 60 s), else 0.5 s then 1 s. A 500, other 5xx, 401, 402, 403 or 404 moves on to the next upstream. Nothing is retried or failed over once output may exist (a 2xx status, or a sent request that timed out or broke) or when the upstream rejected the request itself. `upstream_timeout` now bounds all attempts of a request together. Failed attempts are logged as `upstream_attempt`.
+- **Model params, descriptions, context length.** A model may set `params`, request fields always sent for it that override the client (a fixed reasoning level, for example), and a route entry may add its own on top; the proxy's own fields are refused. `description` and `context_length` are shown in `/v1/models`, which also gains `created` and `max_completion_tokens`. The prompt bound counts the params too.
+- **Errors.** Every error body has `message`, `type`, `param` and `code`, from a fixed table (see the README). Changed statuses: an upstream that rejects its own key (401, 403) or does not know the model (404) is no longer passed on as the client's 401/403/404; after failover it is a 502 `upstream_error`. An upstream 400, 413 or 422 is now a 400 `upstream_rejected` (422 and 413 used to be passed through), or `context_length_exceeded` when the upstream said so in its error code. An upstream that stays unreachable, keyless, or busy or down (502, 503, 504) through its retries and the rest of the route is a 503 `upstream_unavailable` with `Retry-After` (was 502); a 500 is a 502 `upstream_error` as before, and running out of `upstream_timeout` a 504 `upstream_timeout` (was 502). An upstream 402 (its account out of credit) also moves on to the next upstream. An error after a stream started carries `code` `upstream_error`.
+- **Request id.** An admitted chat request's response carries `X-Request-Id`, the lease id; request log lines carry `lease`.
+
 ## v0.3.0 (2026-10-15)
 
 Schema 3 to 4: the usage table gains `upstream`, `stream`, `duration_ms`, `reasoning_tokens` and `upstream_cost` columns and an index on `ts`. `init` upgrades a schema-2 or schema-3 ledger in place; existing usage rows keep their counts and get the new columns' defaults. Older releases refuse a schema-4 ledger.

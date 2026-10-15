@@ -80,7 +80,27 @@ function configArrayFor(string $dir, array $overrides = []): array
     // A model served by a second upstream with its own key and stream_options (the harness points the url at the fake upstream).
     $models['second-upstream'] = ['model' => 'scenario-ok'] + unitRates() + ['url' => 'http://127.0.0.1:1/second/v1/chat/completions',
         'key_file' => "$dir/second.key", 'stream_options' => ['include_usage' => true]];
+    // Models with several upstreams, for the retry and failover tests (the harness points both urls at the fake upstream).
+    $hop = static fn (string $upstream, string $model, array $params = []): array => ['upstream' => $upstream, 'model' => $model] + ($params === [] ? [] : ['params' => $params]);
+    foreach (['failover' => ['scenario-503', 'scenario-ok'], 'after-2xx' => ['scenario-json-error', 'scenario-ok'],
+        'context' => ['scenario-400-context', 'scenario-ok'], 'bad-key' => ['scenario-401', 'scenario-401'],
+        'all-down' => ['scenario-503', 'scenario-503'], 'server-error' => ['scenario-500', 'scenario-ok']] as $alias => [$first, $second]) {
+        $models[$alias] = ['route' => [$hop('primary', $first), $hop('backup', $second)]] + unitRates();
+    }
+    $models['flaky'] = ['model' => 'scenario-flaky'] + unitRates();
+    $models['flaky-hint'] = ['model' => 'scenario-flaky-hint'] + unitRates();
+    $models['no-key-first'] = ['route' => [$hop('nokey', 'scenario-ok'), $hop('backup', 'scenario-ok')]] + unitRates();
+    // An upstream nothing listens on (the harness leaves its port-1 url as it is).
+    $models['dead-first'] = ['route' => [$hop('dead', 'scenario-ok'), $hop('backup', 'scenario-ok')]] + unitRates();
+    $models['pinned'] = ['route' => [$hop('primary', 'scenario-ok', ['chat_template_kwargs' => ['thinking' => false]])],
+        'params' => ['reasoning_effort' => 'low'], 'description' => 'fast, little reasoning', 'context_length' => 128000] + unitRates();
     return $overrides + [
+        'upstreams' => [
+            'primary' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],
+            'backup' => ['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'key_file' => "$dir/second.key"],
+            'dead' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],
+            'nokey' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/missing.key"],
+        ],
         'db_path' => "$dir/ledger.sqlite",
         'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
         'upstream_key_file' => "$dir/upstream.key",
@@ -122,6 +142,8 @@ final class Harness
         mkdir("$dir/logs", 0700);
         $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
         $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+        $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
+        $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
         file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
         $root = dirname(__DIR__);
         $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
@@ -184,7 +206,7 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
 {
     $ch = curl_init(Harness::get()['proxy'] . $path);
     $out = '';
-    $retryAfter = null;
+    $retryAfter = $requestId = null;
     $headers = ['Content-Type: application/json'];
     if ($bearer !== null) {
         $headers[] = "Authorization: Bearer $bearer";
@@ -193,9 +215,11 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_TIMEOUT => 30,
-        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$retryAfter): int {
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$retryAfter, &$requestId): int {
             if (preg_match('/^Retry-After:\s*(\d+)/i', $line, $m)) {
                 $retryAfter = (int) $m[1];
+            } elseif (preg_match('/^X-Request-Id:\s*(\d+)/i', $line, $m)) {
+                $requestId = (int) $m[1];
             }
             return strlen($line);
         },
@@ -210,7 +234,7 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
     curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
-    return ['status' => $status, 'body' => $out, 'retry_after' => $retryAfter];
+    return ['status' => $status, 'body' => $out, 'retry_after' => $retryAfter, 'request_id' => $requestId];
 }
 
 /**

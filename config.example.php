@@ -5,26 +5,44 @@ return [
     // SQLite database file. The directory must be writable by the PHP process (WAL needs it).
     'db_path' => '/var/lib/virsilipas/ledger.sqlite',
 
-    // Any OpenAI-compatible chat completions endpoint: https, or plain http only to 127.0.0.1, ::1 or localhost.
-    'upstream_url' => 'https://llm.example.com/v1/chat/completions',
+    // The upstreams: name => any OpenAI-compatible chat completions endpoint (https, or plain http only to 127.0.0.1,
+    // ::1 or localhost) and the file holding only its API key (readable by the PHP process, by nobody else). Each
+    // upstream's key goes to that upstream only. 'stream_options' may be set per upstream (default: the one below).
+    'upstreams' => [
+        'main' => ['url' => 'https://llm.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/main.key'],
+        'spare' => ['url' => 'https://other.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/spare.key'],
+    ],
 
-    // File holding only the upstream API key. Readable by the PHP process, by nobody else.
-    'upstream_key_file' => '/etc/virsilipas/upstream.key',
-
-    // Seconds before an upstream request is cut off.
+    // Seconds one request may spend upstream: every attempt, retry and failover together.
     'upstream_timeout' => 600,
 
-    // The models customers may use: alias they send => the model id sent upstream and its rates in credits
-    // per million tokens: fresh prompt tokens, prompt tokens served from the upstream's cache (at most the
-    // input rate) and output tokens (reasoning included). Integers; the values below are only an example.
-    // A model may also name its own 'url', 'key_file' and 'stream_options' to be served by another upstream; anything it
-    // leaves out comes from the settings above. A model with its own 'url' must name its own 'key_file' too, so one
-    // upstream's key is never sent to another.
+    // Extra attempts on the same upstream (0 to 2) after a failure that cost nothing there: the connection failed, or
+    // the upstream answered 408, 409, 429, 502, 503 or 504 before doing any work. The wait between them is the
+    // upstream's Retry-After (up to 60 s), else 0.5 s, then 1 s. Nothing is retried once output may have been generated.
+    'retries' => 1,
+
+    // The models customers may use: alias they send => its rates in credits per million tokens (fresh prompt tokens,
+    // prompt tokens served from the upstream's cache, at most the input rate, and output tokens, reasoning included;
+    // integers, the values below are only an example) and its 'route': the upstreams that serve it, in failover order,
+    // each with the model id sent there. The route's length is the failover depth. A request moves to the next entry
+    // when an upstream fails before answering (its retries used up), is down, or rejects its own key (401, 403) or
+    // the model id (404); never once an answer has started, and never for a request every upstream would reject.
+    // The customer pays the alias's rates whichever upstream answers.
+    // Optional per model: 'description' and 'context_length' (shown in /v1/models), and 'params': request fields
+    // always sent for this model, overriding the client (for example a fixed reasoning level). A route entry may add
+    // 'params' of its own on top, for upstreams that switch reasoning differently. The proxy's own fields (model,
+    // messages, max_tokens, max_completion_tokens, stream, stream_options, n) cannot be set this way.
     'models' => [
-        'default' => ['model' => 'example-org/example-model', 'input' => 1000000, 'cached_input' => 250000, 'output' => 4000000],
-        // 'other' => ['model' => 'other-org/other-model', 'input' => 1000000, 'cached_input' => 1000000, 'output' => 1000000,
-        //     'url' => 'https://other.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/other.key'],
+        'default' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'description' => 'fast, everyday tasks',
+            'route' => [['upstream' => 'main', 'model' => 'example-org/example-model'], ['upstream' => 'spare', 'model' => 'example-org/example-model']]],
+        // 'default-think' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'params' => ['reasoning_effort' => 'high'],
+        //     'route' => [['upstream' => 'main', 'model' => 'example-org/example-model']]],
     ],
+
+    // Older single-upstream form, still accepted: a global 'upstream_url' and 'upstream_key_file', and models naming
+    // only 'model' (or their own 'url' with their own 'key_file'). Such a model has a one-entry route.
+    // 'upstream_url' => 'https://llm.example.com/v1/chat/completions',
+    // 'upstream_key_file' => '/etc/virsilipas/upstream.key',
 
     // Upper bound on max_tokens per request (at most 10^9). Requests are also clamped to the remaining balance.
     'max_tokens_cap' => 16384,

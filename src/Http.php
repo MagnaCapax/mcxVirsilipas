@@ -19,7 +19,7 @@ final class Http
     {
         $h = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
         if (!preg_match('/^Bearer\s+(\S+)$/', $h, $m)) {
-            throw new HttpError(401, 'missing bearer key', 'authentication_error');
+            throw new HttpError(401, 'missing bearer key', 'authentication_error', code: 'invalid_api_key');
         }
         return $m[1];
     }
@@ -29,11 +29,11 @@ final class Http
     {
         $raw = file_get_contents('php://input', false, null, 0, $maxBytes + 1);
         if ($raw === false || strlen($raw) > $maxBytes) {
-            throw new HttpError(413, 'request body too large');
+            throw new HttpError(413, 'request body too large', code: 'request_too_large');
         }
         $body = json_decode($raw, true);
         if (!is_array($body)) {
-            throw new HttpError(400, 'request body must be a JSON object');
+            throw new HttpError(400, 'request body must be a JSON object', code: 'invalid_json');
         }
         return $body;
     }

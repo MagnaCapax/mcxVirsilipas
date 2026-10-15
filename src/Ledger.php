@@ -343,14 +343,14 @@ final class Ledger
             $k = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($k === false || !(int) $k['active']) {
-                throw new HttpError(403, 'key is disabled', 'permission_error');
+                throw new HttpError(403, 'key is disabled', 'permission_error', code: 'key_disabled');
             }
             $limits = self::effectiveLimits(self::overrides($k), $defaults);
 
             $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE key_id = ? AND settled = 0 AND expires_at > ?');
             $st->execute([$keyId, $now]);
             if ((int) $st->fetchColumn() >= $limits['max_concurrent']) {
-                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error', 1);
+                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error', 1, 'rate_limit_exceeded');
             }
 
             if ($limits['requests_per_minute'] !== null || $limits['credits_per_minute'] !== null) {
@@ -358,16 +358,16 @@ final class Ledger
                 // The earliest moment the window can free: when its oldest request turns 60 seconds old.
                 $retry = max(1, $w['oldest'] + self::WINDOW_SECONDS - $now);
                 if ($limits['requests_per_minute'] !== null && $w['requests'] >= $limits['requests_per_minute']) {
-                    throw new HttpError(429, 'requests per minute limit reached for this key', 'rate_limit_error', $retry);
+                    throw new HttpError(429, 'requests per minute limit reached for this key', 'rate_limit_error', $retry, 'rate_limit_exceeded');
                 }
                 if ($limits['credits_per_minute'] !== null && $w['credits'] >= $limits['credits_per_minute']) {
-                    throw new HttpError(429, 'credits per minute limit reached for this key', 'rate_limit_error', $retry);
+                    throw new HttpError(429, 'credits per minute limit reached for this key', 'rate_limit_error', $retry, 'rate_limit_exceeded');
                 }
             }
 
             $maxTokens = min($requestedMax ?? $cap, Credits::affordable((int) $k['balance'], $promptBound, $cap, $rates));
             if ($maxTokens < 1) {
-                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota');
+                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota', code: 'insufficient_quota');
             }
             // Priced like a charge, rounded once: any reported usage within the prompt bound and max_tokens costs no more.
             $reserved = Credits::of($promptBound, 0, $maxTokens, $rates);
@@ -375,7 +375,7 @@ final class Ledger
             $upd = $this->db->prepare('UPDATE keys SET balance = balance - ? WHERE id = ? AND balance >= ?');
             $upd->execute([$reserved, $keyId, $reserved]);
             if ($upd->rowCount() !== 1) {
-                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota');
+                throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota', code: 'insufficient_quota');
             }
             $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at) VALUES (?, ?, ?, ?)')
                 ->execute([$keyId, $reserved, $now, $now + $leaseSeconds]);

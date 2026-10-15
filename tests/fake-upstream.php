@@ -13,11 +13,13 @@ while (ob_get_level() > 0) {
 $req = json_decode((string) file_get_contents('php://input'), true) ?: [];
 $dir = getenv('FAKE_UPSTREAM_DIR') ?: sys_get_temp_dir();
 // Only the fields the tests assert on; never the messages.
-$seen = array_intersect_key($req, array_flip(['model', 'n', 'best_of', 'store', 'modalities', 'stream', 'stream_options', 'max_tokens']));
+$seen = array_intersect_key($req, array_flip(['model', 'n', 'best_of', 'store', 'modalities', 'stream', 'stream_options', 'max_tokens', 'reasoning_effort', 'chat_template_kwargs']));
 // Where the request arrived and with which key, for the per-model upstream test (fake keys only).
 $seen['path'] = (string) ($_SERVER['REQUEST_URI'] ?? '');
 $seen['auth'] = (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? '');
 file_put_contents($dir . '/last-request.json', json_encode($seen));
+// Every request in order, for the retry and failover tests.
+file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPEND | LOCK_EX);
 
 $model = (string) ($req['model'] ?? '');
 $chunks = 10;
@@ -31,6 +33,22 @@ $event = static function (array $data): void {
     flush();
 };
 
+// Failing upstreams for the retry and failover tests. scenario-flaky fails once per counter reset, then answers.
+$flaky = in_array($model, ['scenario-flaky', 'scenario-flaky-hint'], true) && !file_exists($dir . '/flaky-seen');
+if ($flaky && $model === 'scenario-flaky-hint') {
+    header('Retry-After: 1'); // the wait the proxy must honour before its retry
+}
+if ($flaky) {
+    touch($dir . '/flaky-seen');
+}
+$failWith = ['scenario-503' => 503, 'scenario-500' => 500, 'scenario-401' => 401, 'scenario-400-context' => 400][$model] ?? ($flaky ? ($model === 'scenario-flaky-hint' ? 429 : 503) : null);
+if ($failWith !== null) {
+    http_response_code($failWith);
+    header('Content-Type: application/json');
+    echo $failWith === 400 ? '{"error":{"message":"private upstream detail: 9000 tokens over","type":"invalid_request_error","code":"context_length_exceeded"}}'
+        : '{"error":{"message":"private upstream detail: node 7 down"}}';
+    exit;
+}
 switch ($model) {
     case 'scenario-split-shift':
         // A repeat of the same total that moves output tokens over to the prompt side: not a detail, a different split.
