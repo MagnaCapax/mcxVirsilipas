@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.2.1 (2026-10-15)
+
+No schema change; v0.2.0 configs load unchanged.
+
+- **Usage shapes.** The cached input count is read from `prompt_tokens_details.cached_tokens` or, where an upstream reports it that way, a top-level `prompt_cache_hit_tokens`. Before, the second shape was read as 0, so cached input was charged and recorded as fresh.
+- **Client hang-ups are charged by the upstream's count.** After a hang-up the proxy keeps reading the upstream, relaying nothing, until a usage report covers what the client received. Before, it stopped at once and, with an upstream that reports usage only at the end, charged byte upper bounds flagged `estimated`. Known gap: an upstream with running usage that sends the cached count only in its final report still has the cached part of a hung-up request charged as fresh input.
+
 ## v0.2.0 (2026-10-04)
 
 No schema change; v0.1.0 configs load unchanged.

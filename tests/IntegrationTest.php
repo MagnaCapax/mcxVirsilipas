@@ -220,6 +220,18 @@ function testIntegrationTheUpstreamIsLeftAtTheTerminalMarker(): void
     same(12, lastUsage($ref)['charged']);
 }
 
+function testIntegrationHangUpOnAStreamWithUsageOnlyAtTheEndIsChargedTheUpstreamCount(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('slow-final', true), $key, 300);
+    check($r['body'] !== '' && !str_contains($r['body'], '"usage"'), 'the client hung up before any usage report');
+    $s = settled($ref);
+    $u = lastUsage($ref);
+    // The upstream's final report (11 prompt + 10 completion at unit rates), not the byte bounds.
+    same([1, 0, 21, 11, 10], [$u['aborted'], $u['estimated'], $u['charged'], $u['prompt_tokens'], $u['completion_tokens']], 'aborted, exact, the final report');
+    same(10000 - 21, $s['balance']);
+}
+
 function testIntegrationHangUpWithoutUsageIsChargedAtMostTheReservation(): void
 {
     [$ref, $key] = fundedKey(100000);
@@ -475,6 +487,24 @@ function testIntegrationCachedInputIsChargedAtItsOwnRate(): void
             }
             same([800, 1200], [$last['prompt_tokens_details']['cached_tokens'] ?? null, $last['credits'] ?? null], 'the last usage the client sees is what it was charged, after repeats without or with other details');
         }
+        $u = lastUsage($ref);
+        same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
+    }
+}
+
+function testIntegrationTheOtherCachedUsageShapeIsChargedAndTrackedTheSame(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(100000);
+        $r = http('POST', '/v1/chat/completions', ['model' => 'weighted-hit'] + cachedMsg($stream), $key);
+        same(200, $r['status']);
+        checkNoUpstreamDetails($r['body']);
+        foreach (['prompt_cache_hit_tokens', 'prompt_cache_miss_tokens', 'reasoning_tokens'] as $field) {
+            check(!str_contains($r['body'], $field), "the upstream's own usage field $field is not relayed");
+        }
+        // Same counts as the nested shape: 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
+        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"credits":1200'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         $u = lastUsage($ref);
         same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
     }

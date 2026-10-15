@@ -79,6 +79,20 @@ function testUsageValidation(): void
     }
 }
 
+function testCachedInputIsReadFromEitherUsageShape(): void
+{
+    $base = ['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050];
+    $cached = static fn (array $extra): int => Proxy::validUsage($base + $extra)['cached'];
+    same(800, $cached(['prompt_tokens_details' => ['cached_tokens' => 800]]), 'nested count');
+    same(800, $cached(['prompt_tokens_details' => null, 'prompt_cache_hit_tokens' => 800]), 'top-level count with the detail null');
+    same(800, $cached(['prompt_cache_hit_tokens' => 800]), 'top-level count without the detail');
+    same(800, $cached(['prompt_tokens_details' => ['cached_tokens' => 800], 'prompt_cache_hit_tokens' => 100]), 'the nested count wins when both are present');
+    same(100, $cached(['prompt_tokens_details' => ['cached_tokens' => null], 'prompt_cache_hit_tokens' => 100]), 'a null nested count falls through');
+    foreach ([['prompt_cache_hit_tokens' => 1001], ['prompt_cache_hit_tokens' => -1], ['prompt_cache_hit_tokens' => '800'], ['prompt_tokens_details' => null], []] as $extra) {
+        same(0, $cached($extra), 'out of range, wrong type or absent is 0: ' . json_encode($extra));
+    }
+}
+
 function testChargeUsesReportedUsageThenAnUpperBound(): void
 {
     $base = ['status' => 200, 'aborted' => false, 'delivered' => true, 'completion_bound' => 900, 'unmetered' => 0];

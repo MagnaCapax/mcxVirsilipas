@@ -49,7 +49,7 @@ const SCENARIOS = ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage'
             'blank-tool' => 'scenario-blank-tool', 'stream-message' => 'scenario-stream-message', 'invalid-prelude' => 'scenario-invalid-prelude',
             'done-hang' => 'scenario-done-hang', 'stream-message-bytes' => 'scenario-stream-message-bytes', 'private-bytes' => 'scenario-private-bytes',
             'over-batch' => 'scenario-over-batch', 'error-after-start' => 'scenario-error-after-start', 'error-batched' => 'scenario-error-batched',
-            'named-error' => 'scenario-named-error'];
+            'named-error' => 'scenario-named-error', 'slow-final' => 'scenario-slow-final'];
 
 /** One credit per token of every kind: the credit counts equal the token counts. */
 function unitRates(): array
@@ -72,6 +72,8 @@ function configArrayFor(string $dir, array $overrides = []): array
     }
     // Round example weights for the credit tests: cached input a quarter of fresh, output four times fresh.
     $models['weighted'] = ['model' => 'scenario-cached', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    // The same counts in the other usage shape (top-level cache-hit count, usage only at the end of a stream).
+    $models['weighted-hit'] = ['model' => 'scenario-cache-hit-field', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
     // Near-free input, expensive output: the credit count and the token count tell different stories.
     $models['weighted-shift'] = ['model' => 'scenario-split-shift', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
     $models['cheap-input'] = ['model' => 'scenario-ok', 'input' => 1, 'cached_input' => 1, 'output' => 8_000_000];

@@ -60,6 +60,23 @@ switch ($model) {
         header('Content-Type: application/json');
         echo json_encode(['id' => 'c', 'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'cached hello']]], 'usage' => $u]);
         exit;
+    case 'scenario-cache-hit-field':
+        // The same counts as scenario-cached in the other usage shape: the cached count as a top-level
+        // prompt_cache_hit_tokens, prompt_tokens_details null, reasoning at the top level, and on a stream
+        // usage only in the final event (no running reports, whatever stream_options asked for).
+        $u = ['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050, 'prompt_tokens_details' => null,
+            'prompt_cache_hit_tokens' => 800, 'prompt_cache_miss_tokens' => 200, 'reasoning_tokens' => 20,
+            'completion_tokens_details' => ['reasoning_tokens' => 20]];
+        if (!empty($req['stream'])) {
+            header('Content-Type: text/event-stream');
+            $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'cached hello']]]]);
+            $event(['choices' => [], 'usage' => $u]);
+            echo "data: [DONE]\n\n";
+            exit;
+        }
+        header('Content-Type: application/json');
+        echo json_encode(['id' => 'c', 'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => 'cached hello']]], 'usage' => $u]);
+        exit;
     case 'scenario-429':
         http_response_code(429);
         header('Content-Type: application/json');
@@ -237,8 +254,8 @@ if (empty($req['stream'])) {
 header('Content-Type: text/event-stream');
 $runaway = $model === 'scenario-runaway';
 $continuous = ($req['stream_options']['continuous_usage_stats'] ?? false) === true
-    && !in_array($model, ['scenario-final-usage', 'scenario-big-delta', 'scenario-empty-usage'], true);
-$delayUs = in_array($model, ['scenario-slow', 'scenario-big-delta'], true) ? 200000 : 20000;
+    && !in_array($model, ['scenario-final-usage', 'scenario-big-delta', 'scenario-empty-usage', 'scenario-slow-final'], true);
+$delayUs = in_array($model, ['scenario-slow', 'scenario-big-delta', 'scenario-slow-final'], true) ? 200000 : 20000;
 for ($i = 1; $i <= $chunks; $i++) {
     $text = $model === 'scenario-big-delta' && $i === 1 ? str_repeat('word ', 2000) : "t$i ";
     $c = ['id' => 'x', 'object' => 'chat.completion.chunk', 'model' => $model, 'choices' => [['index' => 0, 'delta' => ['content' => $text]]]];
@@ -253,6 +270,7 @@ for ($i = 1; $i <= $chunks; $i++) {
     }
     usleep($delayUs);
 }
+// big-delta never reports usage at all, so a hang-up on it still has nothing but bounds to go by.
 $event(['id' => 'x', 'object' => 'chat.completion.chunk', 'model' => $model, 'choices' => [],
-    'usage' => $model === 'scenario-empty-usage' ? [] : $usage($chunks)]);
+    'usage' => in_array($model, ['scenario-empty-usage', 'scenario-big-delta'], true) ? [] : $usage($chunks)]);
 echo "data: [DONE]\n\n";

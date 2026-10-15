@@ -199,9 +199,10 @@ final class Proxy
      * Token counts from an upstream usage object, or null unless all three counts are integers,
      * in range and consistent (the total is at least prompt plus completion). Anything else is
      * not a report: missing usage is never read as zero, and a malformed report is charged as
-     * missing (an upper bound), never as exact. Cached input (prompt_tokens_details.cached_tokens) is
-     * part of prompt_tokens, so it counts only as an integer from 0 to prompt_tokens; otherwise it is
-     * 0, which prices the whole prompt as fresh input.
+     * missing (an upper bound), never as exact. Cached input is part of prompt_tokens. Upstreams name
+     * it differently: prompt_tokens_details.cached_tokens, or a top-level prompt_cache_hit_tokens (with
+     * prompt_tokens_details null); the first present wins. It counts only as an
+     * integer from 0 to prompt_tokens; otherwise it is 0, which prices the whole prompt as fresh input.
      * @return array{prompt: int, completion: int, total: int, cached: int}|null
      */
     public static function validUsage(mixed $u): ?array
@@ -218,7 +219,8 @@ final class Proxy
             return null;
         }
         $d = $u['prompt_tokens_details'] ?? null;
-        $cached = is_array($d) && is_int($d['cached_tokens'] ?? null) && $d['cached_tokens'] >= 0 && $d['cached_tokens'] <= $p ? $d['cached_tokens'] : 0;
+        $hit = (is_array($d) ? ($d['cached_tokens'] ?? null) : null) ?? ($u['prompt_cache_hit_tokens'] ?? null);
+        $cached = is_int($hit) && $hit >= 0 && $hit <= $p ? $hit : 0;
         return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached];
     }
 
@@ -556,8 +558,9 @@ final class Proxy
             }
             // Nothing is relayed before the first event with a usable delta; such events add no
             // bytes to the charge (their usage, if valid, is still kept). Bytes are counted from
-            // the rebuilt event the client receives, never from raw upstream text.
-            $relay = $s['started'] || $s['start'];
+            // the rebuilt event the client receives, never from raw upstream text, so nothing read
+            // after the client hung up is counted as delivered.
+            $relay = ($s['started'] || $s['start']) && !$s['aborted'];
             $view = self::publicView($j, $alias, $rates, $reserved);
             $n = $relay ? self::viewBytes($view) : 0;
             $s['bytes'] += $n;
@@ -641,13 +644,18 @@ final class Proxy
                     header('Cache-Control: no-cache');
                     header('X-Accel-Buffering: no');
                 }
-                if ($out !== '') {
+                if ($out !== '' && !$s['aborted']) {
                     echo $out;
                     flush();
                 }
-                if (connection_aborted()) {
+                if (!$s['aborted'] && connection_aborted()) {
                     $s['aborted'] = true;
-                    return 0; // a short write makes curl stop the upstream request
+                }
+                // After a hang-up nothing more is relayed, but the upstream is read until a usage report
+                // covers the text the client received, so the charge is the upstream's own count even
+                // where it reports usage only at the end. Then a short write stops the upstream request.
+                if ($s['aborted'] && $s['unmetered'] === 0) {
+                    return 0;
                 }
                 // Usage past the reservation: stop paying for more. [DONE]: the answer is complete, so
                 // do not hold the worker and the key's concurrency slot while the upstream lingers.
@@ -662,8 +670,8 @@ final class Proxy
         $result = ['status' => $status, 'usage' => null, 'aborted' => $s['aborted'], 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
 
         if ($stream && $s['started']) {
+            $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']); // after a hang-up too: it may hold the final report
             if (!$s['aborted']) {
-                $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']);
                 if (!$s['done']) {
                     $tail .= 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error']]) . "\n\n";
                 }
