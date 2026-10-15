@@ -152,7 +152,7 @@ try {
     run(['systemctl', 'stop', $opt['service']], false); // first, so nothing is served while the ledger is compared
     // Restoring is safe only if nothing but the migration wrote since the backup: a request served by
     // the new release, or a grant, key or limit change made with the CLI (which does not need php-fpm),
-    // would be lost. The migration only adds credit_log, so the other tables must match the backup.
+    // would be lost. Migrations only add tables or columns, so the rows of the other tables must match the backup.
     $changed = false;
     if ($restoreNeeded && isset($backupPrint)) {
         try {
@@ -260,10 +260,18 @@ function inFlight(string $db): int
     return (int) run(['sqlite3', '-readonly', '-nofollow', $db, "SELECT COUNT(*) FROM leases WHERE settled = 0 AND expires_at > strftime('%s','now')"]);
 }
 
-/** sha256 of the ledger's tables except credit_log, read-only and streamed (the usage table can be large). */
+/**
+ * sha256 of the rows of every table except credit_log, read-only and streamed (the usage table can be large).
+ * Only the schema-3 columns are read, never the schema text: a migration that adds columns (schema 4 added five
+ * to usage) changes neither, so a deploy that failed after its migration still compares equal and is rolled back.
+ */
 function fingerprint(string $db): string
 {
-    $p = proc_open(['sqlite3', '-readonly', '-nofollow', $db, '.dump keys grants leases usage'], [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+    $sql = 'SELECT id, ref, key_hash, balance, active, created_at, max_concurrent, requests_per_minute, credits_per_minute FROM keys ORDER BY id;'
+        . ' SELECT grant_id, key_id, credits, created_at FROM grants ORDER BY grant_id;'
+        . ' SELECT id, key_id, reserved, created_at, expires_at, settled FROM leases ORDER BY id;'
+        . ' SELECT id, ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation FROM usage ORDER BY id;';
+    $p = proc_open(['sqlite3', '-readonly', '-nofollow', '-batch', '-list', $db, $sql], [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
     if (!is_resource($p)) {
         throw new RuntimeException("cannot read $db");
     }
