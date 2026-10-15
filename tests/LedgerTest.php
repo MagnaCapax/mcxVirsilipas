@@ -380,6 +380,71 @@ function testCreditLogRefusesUpdateAndDelete(): void
     same('1', (string) $raw->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'the row is still there');
 }
 
+function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
+{
+    $path = tempDir() . '/ledger.sqlite';
+    $old = new \PDO('sqlite:' . $path);
+    $old->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v3.sql'));
+    $old->exec("INSERT INTO keys (id, ref, key_hash, balance, created_at) VALUES (1, 'a', 'h1', 90, 0)");
+    $old->exec("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (0, 1, 'grant', 100, 100, 'g'), (0, 1, 'reserve', -10, 90, 'lease:1')");
+    $old->exec('INSERT INTO leases (id, key_id, reserved, created_at, expires_at, settled) VALUES (1, 1, 10, 0, 0, 1)');
+    $old->exec("INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (86400, 1, 1, 'm', 7, 3, 2, 10, 10, 200, 0, 0, 0)");
+    $old = null;
+    chmod($path, 0600);
+
+    $l = new Ledger($path);
+    $l->migrate();
+    $db = new \PDO('sqlite:' . $path);
+    same(4, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
+    same([], $l->verify()['problems'], 'balances untouched');
+    same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');
+    $l->migrate(); // re-running init adds nothing
+    same(1, (int) $db->query('SELECT COUNT(*) FROM usage')->fetchColumn());
+    same([['bucket' => '1970-01-02', 'model' => 'm', 'requests' => 1, 'prompt_tokens' => 7, 'cached_tokens' => 2, 'completion_tokens' => 3, 'reasoning_tokens' => 0,
+        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0]], $l->stats('day', ['model']));
+}
+
+function testStatsGroupsUsageByTimeAndDimension(): void
+{
+    [$l, $id, $raw] = ledgerWithHandle(100000);
+    $rows = [ // ts, model, upstream, status, prompt, cached, completion, reasoning, cost, duration, aborted, estimated
+        [3600 * 24 * 10 + 60, 'a', 'up1', 200, 100, 40, 10, 4, 500, 1000, false, false],
+        [3600 * 24 * 10 + 7200, 'a', 'up2', 200, 200, 0, 20, 0, null, 3000, true, false],
+        [3600 * 24 * 10 + 7300, 'b', 'up1', 502, 0, 0, 0, 0, null, 50, false, false],
+        [3600 * 24 * 11, 'a', 'up1', 200, 10, 0, 5, 1, 70, 200, false, true],
+    ];
+    foreach ($rows as $i => [$ts, $model, $up, $status, $p, $c, $o, $r, $cost, $ms, $ab, $est]) {
+        $lease = $l->reserve($id, 300, 1000, 1000, unitRates(), lim(10), 60)['lease_id']; // 1300 held, more than any row uses
+        $l->settle($lease, $id, $p + $o, ['model' => $model, 'prompt' => $p, 'completion' => $o, 'cached' => $c, 'status' => $status, 'aborted' => $ab, 'estimated' => $est,
+            'upstream' => $up, 'stream' => true, 'duration_ms' => $ms, 'reasoning' => $r, 'cost' => $cost]);
+        $raw->prepare('UPDATE usage SET ts = ? WHERE lease_id = ?')->execute([$ts, $lease]);
+    }
+    $all = $l->stats('all');
+    same(1, count($all));
+    // Hand-computed: 4 requests; prompt 310, cached 40, output 35, reasoning 5; credits = prompt + output = 345;
+    // cost 500 + 70 = 570 over 2 costed requests; 1 hang-up, 1 estimate, 1 failure (502); mean duration (1000+3000+50+200)/4 = 1062.
+    same([4, 310, 40, 35, 5, 345, 570, 2, 1, 1, 1, 1062], [$all[0]['requests'], $all[0]['prompt_tokens'], $all[0]['cached_tokens'], $all[0]['completion_tokens'],
+        $all[0]['reasoning_tokens'], $all[0]['credits'], $all[0]['upstream_cost'], $all[0]['costed_requests'], $all[0]['aborted'], $all[0]['estimated'], $all[0]['failed'], $all[0]['mean_duration_ms']]);
+    $byDayUp = array_map(static fn (array $r): array => [$r['bucket'], $r['upstream'], $r['requests'], $r['credits']], $l->stats('day', ['upstream']));
+    same([['1970-01-11', 'up1', 2, 110], ['1970-01-11', 'up2', 1, 220], ['1970-01-12', 'up1', 1, 15]], $byDayUp, 'per day and upstream, oldest first');
+    $byHour = array_map(static fn (array $r): array => [$r['bucket'], $r['model'], $r['status'], $r['requests']], $l->stats('hour', ['model', 'status'], 3600 * 24 * 10, 3600 * 24 * 11));
+    same([['1970-01-11T00', 'a', 200, 1], ['1970-01-11T02', 'a', 200, 1], ['1970-01-11T02', 'b', 502, 1]], $byHour, 'since inclusive, until exclusive');
+    same(['a'], array_column($l->stats('month', ['key']), 'key'), 'grouped by the key ref');
+    check(refusesArgument(fn () => $l->stats('week')), 'unknown bucket refused');
+    check(refusesArgument(fn () => $l->stats('day', ['ts; DROP TABLE usage'])), 'only the fixed groupings reach SQL');
+}
+
+function refusesArgument(callable $fn): bool
+{
+    try {
+        $fn();
+    } catch (\InvalidArgumentException) {
+        return true;
+    }
+    return false;
+}
+
 function testMigrateUpgradesASchemaTwoLedgerWithOpeningBalances(): void
 {
     $path = tempDir() . '/ledger.sqlite';

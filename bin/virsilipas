@@ -21,6 +21,11 @@ Usage: virsilipas <command> [args]
   status <ref>                      show balance, holds, limits and the last minute's use
   history <ref> [N]                 show the last N credit changes (default 100), newest first
   verify                            check every balance against its credit log; exit 1 on a mismatch
+  stats <hour|day|month|all> [by] [since] [until]
+                                    usage over time, one JSON line per UTC bucket and group: requests,
+                                    tokens, credits, upstream-reported cost, hang-ups, failures;
+                                    by = comma list of model,upstream,key,status (or -); since/until =
+                                    YYYY-MM-DD (UTC, until exclusive)
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
 TXT;
@@ -41,6 +46,8 @@ try {
         'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
         'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
         'verify' => verifyOrExit($ledger),
+        'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
+            ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
         default => null,
     };
     if ($out === null) {
@@ -70,6 +77,22 @@ function intArg(array $a, int $i): int
         throw new \InvalidArgumentException('expected an integer of at most 16 digits');
     }
     return (int) $v;
+}
+
+/**
+ * An optional YYYY-MM-DD argument as the Unix time of that day's start in UTC, or null when absent.
+ * @param list<string> $a
+ */
+function dateArg(array $a, int $i): ?int
+{
+    if (!isset($a[$i]) || $a[$i] === '') {
+        return null;
+    }
+    $d = \DateTimeImmutable::createFromFormat('!Y-m-d', $a[$i], new \DateTimeZone('UTC'));
+    if ($d === false || $d->format('Y-m-d') !== $a[$i]) {
+        throw new \InvalidArgumentException('expected a date as YYYY-MM-DD');
+    }
+    return $d->getTimestamp();
 }
 
 /** Prints the verify summary; exits 1 when any balance disagrees with its credit log. */

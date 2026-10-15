@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.3.0 (2026-10-15)
+
+Schema 3 to 4: the usage table gains `upstream`, `stream`, `duration_ms`, `reasoning_tokens` and `upstream_cost` columns and an index on `ts`. `init` upgrades a schema-2 or schema-3 ledger in place; existing usage rows keep their counts and get the new columns' defaults. Older releases refuse a schema-4 ledger.
+
+- **Usage tracked over time.** Settling a request now also records which upstream served it (the host of its route URL), whether it streamed, how long it took, the reasoning share of the output tokens and the cost the upstream itself reported (`estimated_cost`, kept in millionths of its unit). None of this changes a charge: `estimated_cost` is read for tracking only and is never relayed to a client. In a stream, a repeat report with the same three counts may add a detail the adopted report lacked (the cached split, the reasoning count, the cost) once; a later repeat cannot change or remove it.
+- **`bin/virsilipas stats <hour|day|month|all> [by] [since] [until]`** prints one JSON line per UTC time bucket and group (`by` = comma list of `model`, `upstream`, `key`, `status`, or `-` for none) with requests, prompt/cached/completion/reasoning tokens, credits charged, upstream cost and costed requests, hang-ups, estimated charges, failed requests and the mean duration. CLI only, no HTTP route.
+- The request log line gains `upstream`, `duration_ms`, prompt/completion/reasoning token counts and `upstream_cost`.
+
 ## v0.2.1 (2026-10-15)
 
 No schema change; v0.2.0 configs load unchanged.

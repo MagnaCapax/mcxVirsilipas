@@ -71,14 +71,17 @@ final class Proxy
         );
 
         $result = ['status' => 0, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0];
+        [$upstream, $started] = ['', hrtime(true)];
         try {
             Log::write('debug', 'admit', ['ref' => $key['ref'], 'alias' => $alias, 'stream' => $stream,
                 'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
             $route = $this->config->route($alias);
+            $upstream = (string) parse_url($route['url'], PHP_URL_HOST); // which upstream served it, for tracking per upstream
             $body = self::rewrite($req, $rates['model'], $lease['max_tokens'], $stream, $route['stream_options']);
             $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved']);
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
+            $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000)];
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
             self::logRequest($key['ref'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }
@@ -88,15 +91,17 @@ final class Proxy
      * One record per request, after it settled: counts and statuses only. An upstream failure,
      * an estimated charge or usage above the reservation is a warning (it points at the
      * upstream or its configuration); everything else, client hang-ups included, is info.
-     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool} $meta
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, reasoning: int, cost: ?int, upstream: string, duration_ms: int} $meta
      */
     private static function logRequest(string $ref, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
     {
         $failed = !$delivered && !$meta['aborted'];
         $over = $used > $reserved;
         Log::write($failed || $meta['estimated'] || $over ? 'warn' : 'info', 'request', [
-            'ref' => $ref, 'alias' => $meta['model'], 'stream' => $stream, 'upstream_status' => $meta['status'],
-            'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'], 'cached_tokens' => $meta['cached'],
+            'ref' => $ref, 'alias' => $meta['model'], 'upstream' => $meta['upstream'], 'stream' => $stream, 'upstream_status' => $meta['status'],
+            'duration_ms' => $meta['duration_ms'], 'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
+            'prompt_tokens' => $meta['prompt'], 'cached_tokens' => $meta['cached'], 'completion_tokens' => $meta['completion'],
+            'reasoning_tokens' => $meta['reasoning'], 'upstream_cost' => $meta['cost'],
             'reserved' => $reserved, 'reported' => $used, 'charged' => min($used, $reserved), 'over_reservation' => $over,
         ]);
     }
@@ -203,7 +208,11 @@ final class Proxy
      * it differently: prompt_tokens_details.cached_tokens, or a top-level prompt_cache_hit_tokens (with
      * prompt_tokens_details null); the first present wins. It counts only as an
      * integer from 0 to prompt_tokens; otherwise it is 0, which prices the whole prompt as fresh input.
-     * @return array{prompt: int, completion: int, total: int, cached: int}|null
+     * Two details are kept for tracking only, never for charging: the reasoning part of the output
+     * (completion_tokens_details.reasoning_tokens or a top-level reasoning_tokens, an integer from 0 to
+     * completion_tokens, else 0) and the cost the upstream reports itself (estimated_cost, a number from 0
+     * to 10^6, kept in millionths; anything else is null).
+     * @return array{prompt: int, completion: int, total: int, cached: int, reasoning: int, cost: ?int}|null
      */
     public static function validUsage(mixed $u): ?array
     {
@@ -221,7 +230,12 @@ final class Proxy
         $d = $u['prompt_tokens_details'] ?? null;
         $hit = (is_array($d) ? ($d['cached_tokens'] ?? null) : null) ?? ($u['prompt_cache_hit_tokens'] ?? null);
         $cached = is_int($hit) && $hit >= 0 && $hit <= $p ? $hit : 0;
-        return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached];
+        $cd = $u['completion_tokens_details'] ?? null;
+        $r = (is_array($cd) ? ($cd['reasoning_tokens'] ?? null) : null) ?? ($u['reasoning_tokens'] ?? null);
+        $cost = $u['estimated_cost'] ?? null;
+        return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached,
+            'reasoning' => is_int($r) && $r >= 0 && $r <= $c ? $r : 0,
+            'cost' => (is_int($cost) || is_float($cost)) && is_finite((float) $cost) && $cost >= 0 && $cost <= 1e6 ? (int) round($cost * 1e6) : null];
     }
 
     /**
@@ -244,11 +258,12 @@ final class Proxy
      * the ledger caps any charge at the reservation.
      * @param array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int} $r
      * @param array{input: int, cached_input: int, output: int} $rates
-     * @return array{0: int, 1: array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool}}
+     * @return array{0: int, 1: array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, reasoning: int, cost: ?int}}
      */
     public static function charge(array $r, int $promptBound, string $alias, array $rates): array
     {
         $u = $r['usage'];
+        [$reasoning, $cost] = [$u['reasoning'] ?? 0, $u['cost'] ?? null];
         if ($u !== null) {
             [$prompt, $completion, $cached] = [$u['prompt'], $u['completion'] + $r['unmetered'], $u['cached']];
             [$used, $estimated] = [self::usageCredits($u, $r['unmetered'], $rates), $r['unmetered'] > 0];
@@ -259,7 +274,7 @@ final class Proxy
             [$prompt, $completion, $cached, $used, $estimated] = [0, 0, 0, 0, false];
         }
         return [$used, ['model' => $alias, 'prompt' => $prompt, 'completion' => $completion, 'cached' => $cached,
-            'status' => $r['status'], 'aborted' => $r['aborted'], 'estimated' => $estimated]];
+            'status' => $r['status'], 'aborted' => $r['aborted'], 'estimated' => $estimated, 'reasoning' => $reasoning, 'cost' => $cost]];
     }
 
     /**
@@ -572,12 +587,14 @@ final class Proxy
                 $s['usage'] = $u;
                 $s['unmetered'] = 0;
                 $s['over'] = self::usageCredits($u, 0, $rates) > $reserved;
-            } elseif ($u !== null && $s['usage']['cached'] === 0
-                && array_diff_key($u, ['cached' => 1]) === array_diff_key($s['usage'], ['cached' => 1])) {
-                // The same counts again with a cached split: upstreams that report running usage send it only
-                // with the final report. It is added once and never changed or removed by a later repeat; it
-                // covers no text delivered since the last advance.
-                $s['usage']['cached'] = $u['cached'];
+            } elseif ($u !== null && [$u['prompt'], $u['completion'], $u['total']] === [$s['usage']['prompt'], $s['usage']['completion'], $s['usage']['total']]) {
+                // The same counts again with details: upstreams that report running usage may send the cached
+                // split (and other details) only with the final report. A detail the adopted report lacks is
+                // added once and never changed or removed by a later repeat; it covers no text delivered since
+                // the last advance.
+                $s['usage']['cached'] = $s['usage']['cached'] === 0 ? $u['cached'] : $s['usage']['cached'];
+                $s['usage']['reasoning'] = $s['usage']['reasoning'] === 0 ? $u['reasoning'] : $s['usage']['reasoning'];
+                $s['usage']['cost'] ??= $u['cost'];
             }
             // A relayed usage object shows the report the request is charged by, not a repeat or a lower
             // report the proxy did not adopt, so the client sees the same credits as the ledger.

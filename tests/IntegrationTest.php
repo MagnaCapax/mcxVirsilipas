@@ -507,6 +507,21 @@ function testIntegrationTheOtherCachedUsageShapeIsChargedAndTrackedTheSame(): vo
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         $u = lastUsage($ref);
         same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
+        // Tracking columns: the upstream that served it, the stream flag, a duration, reasoning, and no cost (none reported).
+        same(['127.0.0.1', (int) $stream, 20, null], [$u['upstream'], $u['stream'], $u['reasoning_tokens'], $u['upstream_cost']]);
+        check($u['duration_ms'] >= 0 && $u['duration_ms'] < 60000, 'duration recorded');
+    }
+}
+
+function testIntegrationTheUpstreamReportedCostIsRecordedButNeverRelayed(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(100000);
+        $r = http('POST', '/v1/chat/completions', cachedMsg($stream), $key);
+        same(200, $r['status']);
+        checkNoUpstreamDetails($r['body']); // estimated_cost never reaches the client
+        $u = lastUsage($ref);
+        same([100, '127.0.0.1', (int) $stream], [$u['upstream_cost'], $u['upstream'], $u['stream']], 'estimated_cost 0.0001 kept in millionths');
     }
 }
 

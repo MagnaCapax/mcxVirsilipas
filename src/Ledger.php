@@ -27,9 +27,20 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 3;
-    /** The one older schema migrate() upgrades in place (it adds credit_log). */
-    private const UPGRADABLE_FROM = 2;
+    private const SCHEMA_VERSION = 4;
+    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 and 3 gain the usage columns below. */
+    private const UPGRADABLE_FROM = [2, 3];
+    /**
+     * Usage columns added in schema 4, for tracking over time: the upstream that served the request (the host
+     * of its route URL), whether it streamed, how long it took, the reasoning share of the output tokens, and
+     * the cost the upstream itself reported, in millionths of its unit (NULL when it reports none).
+     */
+    private const USAGE_COLUMNS_4 = ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
+        'duration_ms' => 'INTEGER NOT NULL DEFAULT 0', 'reasoning_tokens' => 'INTEGER NOT NULL DEFAULT 0', 'upstream_cost' => 'INTEGER'];
+    /** stats(): time bucket name => its SQL expression, and grouping name => its column. Only these reach SQL. */
+    private const STATS_BUCKETS = ['hour' => "strftime('%Y-%m-%dT%H', u.ts, 'unixepoch')", 'day' => "strftime('%Y-%m-%d', u.ts, 'unixepoch')",
+        'month' => "strftime('%Y-%m', u.ts, 'unixepoch')", 'all' => "'all'"];
+    private const STATS_GROUPS = ['model' => 'u.model', 'upstream' => 'u.upstream', 'key' => 'k.ref', 'status' => 'u.http_status'];
     /** Per-key limits: the name used by the admin API and CLI => its column. Only these names reach SQL. */
     private const LIMITS = ['max_concurrent' => 'max_concurrent', 'requests_per_minute' => 'requests_per_minute', 'credits_per_minute' => 'credits_per_minute'];
     private const WINDOW_SECONDS = 60;
@@ -61,23 +72,32 @@ final class Ledger
     }
 
     /**
-     * Creates the schema, or upgrades a schema-2 ledger in place in one transaction: credit_log is
-     * added and each key with a nonzero balance gets one 'opening' row carrying that balance, so the
-     * sum check holds from the first moment. Any other older or newer schema is refused.
+     * Creates the schema, or upgrades an older ledger in place in one transaction. From schema 2,
+     * credit_log is added and each key with a nonzero balance gets one 'opening' row carrying that
+     * balance, so the sum check holds from the first moment. From schema 2 or 3, the usage table gains
+     * the schema-4 columns; existing rows keep their counts and get the columns' defaults. Any other
+     * older or newer schema is refused.
      */
     public function migrate(): void
     {
         $version = (int) $this->db->query('PRAGMA user_version')->fetchColumn();
         $tables = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'keys'")->fetchColumn();
-        if ($tables > 0 && $version !== self::SCHEMA_VERSION && $version !== self::UPGRADABLE_FROM) {
+        if ($tables > 0 && $version !== self::SCHEMA_VERSION && !in_array($version, self::UPGRADABLE_FROM, true)) {
             throw new \RuntimeException('this ledger was created by another version of virsilipas (schema ' . $version . ', expected ' . self::SCHEMA_VERSION . '); start a new ledger');
         }
-        $upgrade = $tables > 0 && $version === self::UPGRADABLE_FROM;
-        $this->tx(function () use ($upgrade): void {
+        $openingRows = $tables > 0 && $version === 2;
+        $this->tx(function () use ($openingRows): void {
             $this->createSchema();
-            if ($upgrade) {
-                $this->db->prepare("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) SELECT ?, id, 'opening', balance, balance, 'schema-" . self::SCHEMA_VERSION . "' FROM keys WHERE balance != 0 ORDER BY id")
+            if ($openingRows) {
+                $this->db->prepare("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) SELECT ?, id, 'opening', balance, balance, 'schema-3' FROM keys WHERE balance != 0 ORDER BY id")
                     ->execute([time()]);
+            }
+            // One definition for new and upgraded ledgers alike: whatever schema-4 column is missing is added.
+            $have = array_column($this->db->query('PRAGMA table_info(usage)')->fetchAll(\PDO::FETCH_ASSOC), 'name');
+            foreach (self::USAGE_COLUMNS_4 as $name => $type) {
+                if (!in_array($name, $have, true)) {
+                    $this->db->exec("ALTER TABLE usage ADD COLUMN $name $type");
+                }
             }
             $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
         });
@@ -143,6 +163,7 @@ final class Ledger
                 -- the cause: the grant id, 'lease:<id>', or 'schema-<n>' for an opening balance
                 ref TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
             CREATE INDEX IF NOT EXISTS credit_log_key ON credit_log(key_id, id);
             CREATE TRIGGER IF NOT EXISTS credit_log_no_update BEFORE UPDATE ON credit_log
                 BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
@@ -369,7 +390,8 @@ final class Ledger
      * Settles a request exactly once: charges the credits the request used, never more than the
      * reservation, returns the rest, and writes the usage row in the same transaction.
      * Settling an already settled lease does nothing and returns false.
-     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool} $meta
+     * The tracking fields (upstream, stream, duration_ms, reasoning, cost) are optional and default to empty.
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, reasoning?: int, cost?: ?int} $meta
      */
     public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
@@ -387,10 +409,53 @@ final class Ledger
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
             $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
-            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
-                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved)]);
+            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
+                    $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null]);
             return true;
         });
+    }
+
+    /**
+     * Usage over time, from the usage rows: one row per time bucket (UTC hour, day or month, or 'all') and
+     * per value of each grouping asked for (model alias, upstream, key ref, upstream HTTP status), oldest
+     * first, with request counts, token sums, credits charged, the upstream's reported cost (and how many
+     * requests carried one), hang-ups, estimated charges, failed requests and the mean duration.
+     * @param list<string> $groups any of model, upstream, key, status
+     * @return list<array<string, int|string|null>>
+     */
+    public function stats(string $bucket, array $groups = [], ?int $since = null, ?int $until = null): array
+    {
+        if (!isset(self::STATS_BUCKETS[$bucket])) {
+            throw new \InvalidArgumentException('bucket must be one of ' . implode(', ', array_keys(self::STATS_BUCKETS)));
+        }
+        $cols = [];
+        foreach (array_unique($groups) as $g) {
+            if (!isset(self::STATS_GROUPS[$g])) {
+                throw new \InvalidArgumentException('group by any of ' . implode(', ', array_keys(self::STATS_GROUPS)));
+            }
+            $cols[$g] = self::STATS_GROUPS[$g];
+        }
+        $select = self::STATS_BUCKETS[$bucket] . ' AS bucket';
+        foreach ($cols as $g => $col) {
+            $select .= ", $col AS \"$g\"";
+        }
+        $group = implode(', ', ['bucket', ...array_map(static fn (string $g): string => "\"$g\"", array_keys($cols))]);
+        $st = $this->db->prepare("SELECT $select, COUNT(*) AS requests, SUM(u.prompt_tokens) AS prompt_tokens,
+                SUM(u.cached_tokens) AS cached_tokens, SUM(u.completion_tokens) AS completion_tokens,
+                SUM(u.reasoning_tokens) AS reasoning_tokens, SUM(u.charged) AS credits, SUM(u.upstream_cost) AS upstream_cost,
+                COUNT(u.upstream_cost) AS costed_requests, SUM(u.aborted) AS aborted, SUM(u.estimated) AS estimated,
+                SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms
+            FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ? GROUP BY $group ORDER BY $group");
+        $st->execute([$since ?? 0, $until ?? PHP_INT_MAX]);
+        $rows = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            foreach ($r as $name => $v) {
+                $r[$name] = ($v === null || $name === 'bucket' || in_array($name, ['model', 'upstream', 'key'], true)) ? $v : (int) $v;
+            }
+            $rows[] = $r;
+        }
+        return $rows;
     }
 
     /**

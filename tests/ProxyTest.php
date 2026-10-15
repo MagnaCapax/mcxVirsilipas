@@ -70,8 +70,8 @@ function testRequestedMaxTokensValidation(): void
 
 function testUsageValidation(): void
 {
-    same(['prompt' => 10, 'completion' => 5, 'total' => 15, 'cached' => 0], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
-    same(['prompt' => 10, 'completion' => 5, 'total' => 17, 'cached' => 0], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 17]), 'a larger total is charged');
+    same(['prompt' => 10, 'completion' => 5, 'total' => 15, 'cached' => 0, 'reasoning' => 0, 'cost' => null], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 15]));
+    same(['prompt' => 10, 'completion' => 5, 'total' => 17, 'cached' => 0, 'reasoning' => 0, 'cost' => null], Proxy::validUsage(['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 17]), 'a larger total is charged');
     foreach ([null, [], ['prompt_tokens' => 10], ['prompt_tokens' => 10, 'completion_tokens' => 5], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 3],
         ['prompt_tokens' => 1, 'completion_tokens' => 0, 'total_tokens' => -1], ['prompt_tokens' => 10, 'completion_tokens' => 5, 'total_tokens' => 'x'],
         ['prompt_tokens' => 0, 'completion_tokens' => 0, 'total_tokens' => 0], ['prompt_tokens' => -1, 'completion_tokens' => 5, 'total_tokens' => 4], ['prompt_tokens' => '10', 'completion_tokens' => 5, 'total_tokens' => 15]] as $u) {
@@ -91,6 +91,23 @@ function testCachedInputIsReadFromEitherUsageShape(): void
     foreach ([['prompt_cache_hit_tokens' => 1001], ['prompt_cache_hit_tokens' => -1], ['prompt_cache_hit_tokens' => '800'], ['prompt_tokens_details' => null], []] as $extra) {
         same(0, $cached($extra), 'out of range, wrong type or absent is 0: ' . json_encode($extra));
     }
+}
+
+function testReasoningAndUpstreamCostAreReadForTrackingOnly(): void
+{
+    $base = ['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050];
+    $u = static fn (array $extra): array => Proxy::validUsage($base + $extra);
+    same(20, $u(['completion_tokens_details' => ['reasoning_tokens' => 20]])['reasoning'], 'nested reasoning count');
+    same(20, $u(['reasoning_tokens' => 20])['reasoning'], 'top-level reasoning count');
+    same(0, $u(['reasoning_tokens' => 51])['reasoning'], 'more reasoning than output is not a count');
+    same(100, $u(['estimated_cost' => 0.0001])['cost'], 'cost in millionths');
+    same(2, $u(['estimated_cost' => 0.0000015])['cost'], 'rounded to the nearest millionth');
+    same(0, $u(['estimated_cost' => 0])['cost'], 'a reported zero is kept');
+    foreach ([null, -0.1, '0.1', 1e7, INF] as $bad) {
+        same(null, $u(['estimated_cost' => $bad])['cost'], 'not a usable cost: ' . var_export($bad, true));
+    }
+    $rates = ['input' => 1_000_000, 'cached_input' => 1_000_000, 'output' => 1_000_000];
+    same(Proxy::usageCredits($u([]), 0, $rates), Proxy::usageCredits($u(['reasoning_tokens' => 20, 'estimated_cost' => 5.0]), 0, $rates), 'neither changes the charge');
 }
 
 function testChargeUsesReportedUsageThenAnUpperBound(): void

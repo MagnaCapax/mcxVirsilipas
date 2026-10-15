@@ -46,12 +46,12 @@ switch ($model) {
         if (!empty($req['stream'])) {
             header('Content-Type: text/event-stream');
             // Like real upstreams with running usage: the running reports carry the counts only, and the
-            // cached split arrives with the final report, whose counts are the same.
+            // cached split and the cost arrive with the final report, whose counts are the same.
             $event(['choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'cached hello']]],
-                'usage' => array_diff_key($u, ['prompt_tokens_details' => 1])]);
+                'usage' => array_diff_key($u, ['prompt_tokens_details' => 1, 'estimated_cost' => 1])]);
             $event(['choices' => [], 'usage' => $u]);
             // A further repeat without the detail must not take the cached split away again.
-            $event(['choices' => [], 'usage' => array_diff_key($u, ['prompt_tokens_details' => 1])]);
+            $event(['choices' => [], 'usage' => array_diff_key($u, ['prompt_tokens_details' => 1, 'estimated_cost' => 1])]);
             // Nor may a repeat with a different cached count change it.
             $event(['choices' => [], 'usage' => ['prompt_tokens_details' => ['cached_tokens' => 1000]] + $u]);
             echo "data: [DONE]\n\n";
