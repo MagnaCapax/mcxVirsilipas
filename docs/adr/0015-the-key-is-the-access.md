@@ -17,9 +17,11 @@ Customers call the proxy from home connections, servers and agents whose address
 ## Decision
 The proxy authorizes every client request by its key and never by the client's address. Which networks can reach it at all is a firewall decision for the deployer. The web server may mark a caller as internal (the `VIRSILIPAS_SOURCE` server variable, set from the client address and never from anything the client sends); that only selects the caller's priority factor and busy pool (ADR 0016). It never grants access and never lifts a limit or cap (ADR 0012).
 
+Because the key is the whole credential, the proxy never stores it: only its sha256 hash is kept, a new key is shown once when it is created or rotated, and rotation replaces the hash while the ref keeps its balance, limits and history. The admin endpoints are authenticated the same way, by comparing the sha256 of the bearer token with `admin_token_sha256` in the configuration. Billing works by ref and is never given a customer key after creation.
+
 ## Consequences
 - A leaked key is handled by rotating it (`POST /admin/keys/rotate`), not by address rules.
 - Running the proxy only for one network is a firewall setting, not a code change.
 
 ## References
-src/Proxy.php (`authenticate`, `internalCaller`); invariants 16 and 17; README "Access control".
+src/Proxy.php (`authenticate`, `internalCaller`); src/Ledger.php (`createKey`, `rotateKey`, `findKey`); src/Admin.php (admin token check); invariants 16 and 17; README "Access control".
