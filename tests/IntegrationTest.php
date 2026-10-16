@@ -656,3 +656,16 @@ function testIntegrationModelWithItsOwnUpstreamUsesItsOwnUrlAndKey(): void
     same('/v1/chat/completions', $up['path']);
     same('Bearer fake-upstream-key', $up['auth'], 'other models keep the global upstream and key');
 }
+
+function testIntegrationRequestBodyMustBeAJsonObject(): void
+{
+    [, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', ['ok', 'x'], $key); // encodes as a JSON array
+    same(400, $r['status'], $r['body']);
+    same('invalid_json', json_decode($r['body'], true)['error']['code'] ?? null, 'a JSON array is not a request object');
+    // An empty object decodes to an empty array and is still an object: refused by the field check, not as JSON.
+    $r = http('POST', '/admin/keys', [], 'admin-secret');
+    same(400, $r['status'], $r['body']);
+    $e = json_decode($r['body'], true)['error'] ?? [];
+    check(array_key_exists('code', $e) && $e['code'] === null, 'an empty object reaches the ref check: ' . $r['body']);
+}

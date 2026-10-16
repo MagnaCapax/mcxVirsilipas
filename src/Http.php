@@ -32,7 +32,8 @@ final class Http
             throw new HttpError(413, 'request body too large', code: 'request_too_large');
         }
         $body = json_decode($raw, true);
-        if (!is_array($body)) {
+        // A JSON array decodes to a PHP list too; only an object is a request ({} decodes to []).
+        if (!is_array($body) || ($body !== [] && array_is_list($body))) {
             throw new HttpError(400, 'request body must be a JSON object', code: 'invalid_json');
         }
         return $body;

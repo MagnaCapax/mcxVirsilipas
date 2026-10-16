@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## Unreleased
+
+No schema change.
+
+- **docs/API.md:** the complete HTTP API in one place: every route, request field, response shape, header and error, with the order of checks for a chat request. The README keeps a route list and links to it. `tests/DocsTest.php` fails when the code has a route, error code, error message or response header the doc does not mention.
+- **A JSON array as the request body answers 400 `invalid_json`**, as its message ("request body must be a JSON object") always said; before, it was read as an object with numbered fields and refused by a later check (for chat, 404 `model_not_found`). An empty object is accepted as before.
+- **README:** the refusal order for a chat request now includes the server-wide requests per minute and the spend caps, as the code checks them.
+
 ## v0.7.1 (2026-10-16)
 
 No schema change.
