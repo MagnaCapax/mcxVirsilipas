@@ -2,6 +2,12 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.6.1 (2026-10-16)
+
+No schema change.
+
+- **Upstream usage of unusable answers is recorded.** When an upstream answers 2xx without a usable answer (the client gets a 502 and pays nothing), its usage report is now kept in the usage row (counts and cost, `charged` 0) instead of being dropped, so cost tracking includes what the upstream billed for it. Found live: a reasoning model that spent all of a small `max_tokens` on thinking returned no answer.
+
 ## v0.6.0 (2026-10-16)
 
 Schema 5 to 6: `usage` gains `source` and `cost_computed`, `keys` gains `key_group`. `init` upgrades a schema-2 to 5 ledger in place; existing usage rows count as external with a reported (or no) cost, and keys have no group. An older release's `init` refuses a schema-6 ledger.

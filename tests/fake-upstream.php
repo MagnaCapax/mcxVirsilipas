@@ -109,6 +109,12 @@ switch ($model) {
         header('Content-Type: application/json');
         echo '{"error":{"message":"private upstream detail: refused"}}';
         exit;
+    case 'scenario-usage-only':
+        // A stream that reports usage but never a completion choice.
+        header('Content-Type: text/event-stream');
+        $event(['choices' => [], 'usage' => $usage(4)]);
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-empty-choices':
         header('Content-Type: application/json');
         echo json_encode(['choices' => [], 'usage' => $usage(0)]);

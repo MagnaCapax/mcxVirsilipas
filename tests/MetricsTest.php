@@ -107,3 +107,16 @@ function testMigrateUpgradesASchemaFiveLedger(): void
     same([7, 50, ''], [$s['balance'], $s['bonus_pct'], $s['key_group']], 'balance and bonus kept, no group');
     same([], $l->verify()['problems'], 'credit log still sums');
 }
+
+function testIntegrationAnUnusableAnswerIsFreeButItsUpstreamUsageIsRecorded(): void
+{
+    // A 2xx with no usable answer: the client gets a 502 and pays nothing, but the upstream billed it, so the usage
+    // row keeps the upstream's own counts and cost for cost tracking.
+    foreach ([['empty-choices', 0, false], ['empty-choice', 1, false], ['usage-only', 4, true]] as [$model, $completion, $stream]) {
+        [$ref, $key] = fundedKey(10000);
+        same(502, http('POST', '/v1/chat/completions', msg($model, $stream), $key)['status']);
+        same(10000, settled($ref)['balance'], "$model: nothing charged");
+        $u = lastUsage($ref);
+        same([11, $completion, 100, 0, 200], [$u['prompt_tokens'], $u['completion_tokens'], $u['upstream_cost'], $u['charged'], $u['http_status']], "$model: the upstream's usage is kept");
+    }
+}

@@ -404,7 +404,10 @@ final class Proxy
     {
         $u = $r['usage'];
         [$reasoning, $cost] = [$u['reasoning'] ?? 0, $u['cost'] ?? null];
-        if ($u !== null) {
+        if ($u !== null && !$r['delivered']) {
+            // Nothing reached the client: no charge, but the upstream's own counts are recorded for cost tracking.
+            [$prompt, $completion, $cached, $used, $estimated] = [$u['prompt'], $u['completion'], $u['cached'], 0, false];
+        } elseif ($u !== null) {
             [$prompt, $completion, $cached] = [$u['prompt'], $u['completion'] + $r['unmetered'], $u['cached']];
             [$used, $estimated] = [self::usageCredits($u, $r['unmetered'], $rates), $r['unmetered'] > 0];
         } elseif ($r['delivered']) {
@@ -908,7 +911,8 @@ final class Proxy
             return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
         }
 
+        // A 2xx without a usable answer is free for the client, but its usage report (what the upstream billed) is kept for tracking.
         return ['kind' => self::outcome($status, $curlErr, $sent, $s['too_big']), 'timed_out' => $curlErr === CURLE_OPERATION_TIMEDOUT && $sent,
-            'code' => self::errorCode($s['err'])] + $result;
+            'code' => self::errorCode($s['err']), 'usage' => $stream ? $s['usage'] : (is_array($json) ? self::validUsage($json['usage'] ?? null) : null)] + $result;
     }
 }
