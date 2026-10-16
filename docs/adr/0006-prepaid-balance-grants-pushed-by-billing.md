@@ -15,7 +15,7 @@ Taking payments is a separate, regulated job with its own systems. The proxy has
 - One balance per user that only a trusted billing system changes.
 
 ## Decision
-Each user (`ref`) has one prepaid balance that never expires. Only grants change it, pushed by the billing system through `POST /admin/grants` or the CLI. A grant applies once per `grant_id`; a retry is a no-op and a reused id with another ref or amount is a conflict. Negative grants remove credits for refunds, and may take a balance below zero, after which requests answer 402 until a grant brings it back. The proxy never refills a balance by itself and has no purchase flow.
+Each user (`ref`) has one prepaid balance that never expires. Requests spend from it; only grants add to it (or, negative, take from it), pushed by the billing system through `POST /admin/grants` or the CLI. A grant applies once per `grant_id`; a retry is a no-op and a reused id with another ref or amount is a conflict. Negative grants remove credits for refunds, and may take a balance below zero, after which requests answer 402 until a grant brings it back. The proxy never refills a balance by itself and has no purchase flow.
 
 ## Consequences
 - Billing retries are safe; renewals need a unique `grant_id` per period.

@@ -8,7 +8,8 @@ namespace MagnaCapax\Virsilipas;
  * The credit ledger: keys with one never-resetting balance each, idempotent grants,
  * per-request leases (reserve -> settle), per-key limits and a metadata-only usage log.
  *
- * Every write is a short BEGIN IMMEDIATE transaction. Nothing is held open while a
+ * Every balance change is a short BEGIN IMMEDIATE transaction; creating, rotating and enabling
+ * a key are single statements. Nothing is held open while a
  * request streams, so a slow client never blocks other keys.
  *
  * A lease's reservation is taken from the balance when the request starts and stays

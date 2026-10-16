@@ -20,6 +20,7 @@ A release is a git tag `vX.Y.Z` with a CHANGELOG entry that says whether the sch
 ## Consequences
 - Every running release is a known tag; a bad release is a one-step rollback.
 - Documentation-only commits need no tag or deploy.
+- `tools/deploy.php` has no automated test: it drives systemd, `runuser` and the live ledger. Its own checks run on every deploy (the configuration pre-check, the backup's integrity, `verify`, `REVISION` through the symlink and the keyless 401), and `tools/smoke.php` checks a real request afterwards.
 
 ## References
 tools/deploy.php; tools/smoke.php; CHANGELOG.md; README "Releasing and upgrading".

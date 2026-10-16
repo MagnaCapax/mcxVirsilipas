@@ -279,7 +279,7 @@ Client routes take `Authorization: Bearer <key>`; admin routes take `Authorizati
 
 ## Privacy
 
-Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address if you do not need it.
+Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address, or with only its network (for example the /24 or /48), if you do not need it.
 
 ## Logging
 
