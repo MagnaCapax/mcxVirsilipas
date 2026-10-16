@@ -129,7 +129,7 @@ function testPublicViewHidesUpstreamDetails(): void
 {
     $j = ['model' => 'vendor/secret-model', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3,
         'estimated_cost' => 0.1, 'prompt_tokens_details' => ['cached_tokens' => 0, 'account' => 'x']]];
-    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3, 'prompt_tokens_details' => ['cached_tokens' => 0]]], Proxy::publicView($j, 'alias'), 'only cached_tokens survives from the details');
+    same(['model' => 'alias', 'choices' => [], 'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3, 'prompt_tokens_details' => ['cached_tokens' => 0], 'completion_tokens_details' => ['reasoning_tokens' => 0]]], Proxy::publicView($j, 'alias'), 'only cached_tokens and the reasoning count survive from the details');
     $top = ['id' => 'x', 'provider' => 'p', 'choices' => [['index' => 0, 'message' => ['content' => 'hi', 'note' => 'n'], 'x' => 1]]];
     same(['id' => 'x', 'model' => 'alias', 'choices' => [['index' => 0, 'message' => ['content' => 'hi']]]], Proxy::publicView($top, 'alias'), 'unknown fields dropped at every level; alias added');
     $typed = ['id' => ['x'], 'created' => '1', 'choices' => [['index' => '0', 'message' => ['content' => ['private' => 'SECRET'], 'role' => 'assistant'], 'finish_reason' => 7], [], ['delta' => 'x']]];

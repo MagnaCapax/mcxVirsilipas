@@ -18,12 +18,14 @@ Usage: virsilipas <command> [args]
   grant <ref> <credits> <grant_id>  add (or, if negative, remove) credits, once per grant_id
   limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
                                     credits_per_minute; 'default' follows the config again
+  bonus <ref> <0..300>              set a key's bonus percent, which raises its priority weight
   status <ref>                      show balance, holds, limits and the last minute's use
   history <ref> [N]                 show the last N credit changes (default 100), newest first
   verify                            check every balance against its credit log; exit 1 on a mismatch
   stats <hour|day|month|all> [by] [since] [until]
                                     usage over time, one JSON line per UTC bucket and group: requests,
-                                    tokens, credits, upstream-reported cost, hang-ups, failures;
+                                    tokens, credits, upstream-reported cost, hang-ups, failures,
+                                    requests slowed down and the mean delay;
                                     by = comma list of model,upstream,key,status (or -); since/until =
                                     YYYY-MM-DD (UTC, until exclusive)
 Config: $VIRSILIPAS_CONFIG or ./config.php
@@ -43,6 +45,7 @@ try {
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
         'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
         'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
+        'bonus' => json_encode(['ref' => arg($args, 0), 'bonus_pct' => $ledger->setBonus(arg($args, 0), intArg($args, 1))]),
         'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
         'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
         'verify' => verifyOrExit($ledger),

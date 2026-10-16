@@ -54,6 +54,23 @@ return [
     // 'requests_per_minute' => 60,
     // 'credits_per_minute' => 2000000,
 
+    // Optional soft throttling (see README, Priority and throttling). Leave out to turn it off. It never refuses what
+    // the limits above allow, except busy shedding: a 503 with Retry-After for low-weight keys while the server is busy.
+    // 'throttle' => [
+    //     // Credits charged across all keys over the last 24 hours. Past pace_start of it, requests wait before they
+    //     // start: base_delay_ms x pressure x 100 / weight, at most max_delay_ms. Unset means no pacing.
+    //     'daily_budget' => 50000000,
+    //     'pace_start' => 0.8,
+    //     'base_delay_ms' => 1000,
+    //     'max_delay_ms' => 3000,
+    //     // Requests in flight per source at which keys below busy_min_weight are told to retry (keep below each
+    //     // source's php-fpm pm.max_children). The web server sets the source: fastcgi_param VIRSILIPAS_SOURCE internal.
+    //     'busy' => ['internal' => 36, 'external' => 24],
+    //     'busy_min_weight' => 100,
+    //     // Weight multiplier for internal callers, and the credits that count as one unit of money in the weight.
+    //     'internal_factor' => 2,
+    //     'credits_per_unit' => 1000000,
+    // ],
     // How long a reservation survives if its worker dies. Must exceed upstream_timeout.
     'lease_seconds' => 900,
 

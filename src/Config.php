@@ -43,6 +43,8 @@ final class Config
     public readonly ?string $logDir;
     /** error | warn | info | debug */
     public readonly string $logLevel;
+    /** Soft throttling and per-key priority weights (the optional `throttle` block; see Throttle). */
+    public readonly Throttle $throttle;
 
     /** @param array<string, mixed> $c */
     public function __construct(array $c)
@@ -68,6 +70,7 @@ final class Config
             throw new \InvalidArgumentException('config: log_level must be error, warn, info or debug');
         }
 
+        $this->throttle = Throttle::fromConfig($c['throttle'] ?? null);
         $this->streamOptions = self::streamOptions($c, 'stream_options');
         $retries = $c['retries'] ?? 1;
         if (!is_int($retries) || $retries < 0 || $retries > self::MAX_RETRIES) {

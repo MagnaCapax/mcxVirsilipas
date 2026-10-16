@@ -25,7 +25,7 @@ function testIntegrationNonStreamDebitsReportedUsage(): void
     $j = json_decode($r['body'], true);
     same('hello world', $j['choices'][0]['message']['content'] ?? null);
     same('ok', $j['model'], 'the alias, not the upstream model id');
-    same(['prompt_tokens' => 11, 'completion_tokens' => 7, 'total_tokens' => 18, 'prompt_tokens_details' => ['cached_tokens' => 0], 'credits' => 18], $j['usage']);
+    same(['prompt_tokens' => 11, 'completion_tokens' => 7, 'total_tokens' => 18, 'prompt_tokens_details' => ['cached_tokens' => 0], 'completion_tokens_details' => ['reasoning_tokens' => 0], 'credits' => 18], $j['usage']);
     checkNoUpstreamDetails($r['body']);
     same(10000 - 18, settled($ref)['balance']);
     $u = lastUsage($ref);
@@ -283,7 +283,8 @@ function testIntegrationModelsAndBalance(): void
     same(['input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000], $w['credits_per_million_tokens'], 'rates are listed per alias');
     check(!str_contains(json_encode($m), 'scenario-'), 'upstream model ids stay hidden');
     same(['balance' => 777, 'reserved' => 0, 'in_flight' => 0, 'limits' => ['max_concurrent' => 5, 'requests_per_minute' => null, 'credits_per_minute' => null],
-        'window' => ['requests' => 0, 'credits' => 0]], json_decode(http('GET', '/v1/balance', null, $key)['body'], true));
+        'window' => ['requests' => 0, 'credits' => 0], 'bonus_pct' => 0, 'weight' => 3], json_decode(http('GET', '/v1/balance', null, $key)['body'], true),
+        'weight: 100 x sqrt(777 / 1000000 credits per unit), rounded');
 }
 
 function testIntegrationAdminFlow(): void
@@ -477,7 +478,7 @@ function testIntegrationCachedInputIsChargedAtItsOwnRate(): void
         same(200, $r['status']);
         checkNoUpstreamDetails($r['body']);
         // 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
-        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"credits":1200'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         if ($stream) {
             $last = null;
@@ -499,11 +500,14 @@ function testIntegrationTheOtherCachedUsageShapeIsChargedAndTrackedTheSame(): vo
         $r = http('POST', '/v1/chat/completions', ['model' => 'weighted-hit'] + cachedMsg($stream), $key);
         same(200, $r['status']);
         checkNoUpstreamDetails($r['body']);
-        foreach (['prompt_cache_hit_tokens', 'prompt_cache_miss_tokens', 'reasoning_tokens'] as $field) {
+        foreach (['prompt_cache_hit_tokens', 'prompt_cache_miss_tokens'] as $field) {
             check(!str_contains($r['body'], $field), "the upstream's own usage field $field is not relayed");
         }
+        // The reasoning count reaches the client only in the standard place, never in the upstream's top-level shape.
+        check(substr_count($r['body'], '"reasoning_tokens"') === substr_count($r['body'], '"completion_tokens_details":{"reasoning_tokens":20}')
+            && str_contains($r['body'], '"completion_tokens_details":{"reasoning_tokens":20}'), 'reasoning count relayed in the standard place only');
         // Same counts as the nested shape: 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
-        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"credits":1200'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         $u = lastUsage($ref);
         same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
@@ -533,7 +537,7 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     same(401, http('POST', '/admin/keys/limits', $set, $key)['status'], 'a client key is not the admin token');
     $r = json_decode(http('POST', '/admin/keys/limits', $set, 'admin-secret')['body'], true);
     same(['ref' => $ref, 'overrides' => ['max_concurrent' => null, 'requests_per_minute' => 1, 'credits_per_minute' => null],
-        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null]], $r);
+        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null], 'bonus_pct' => 0], $r);
     same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'burst' => 3], 'admin-secret')['status'], 'unknown limit');
     same(404, http('POST', '/admin/keys/limits', ['ref' => 'nobody-' . $ref, 'max_concurrent' => 2], 'admin-secret')['status']);
 

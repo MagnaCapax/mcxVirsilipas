@@ -57,7 +57,8 @@ final class Proxy
         $key = $this->authenticate();
         $s = $this->ledger->status($key['ref'], $this->config->limitDefaults());
         Http::json(200, ['balance' => $s['balance'], 'reserved' => $s['reserved'], 'in_flight' => $s['in_flight'],
-            'limits' => $s['limits'], 'window' => $s['window']]);
+            'limits' => $s['limits'], 'window' => $s['window'], 'bonus_pct' => $s['bonus_pct'],
+            'weight' => $this->config->throttle->weight($s['balance'], $s['bonus_pct'], self::internalCaller())]);
     }
 
     public function chat(): void
@@ -74,6 +75,12 @@ final class Proxy
         $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params']), $this->config->routes[$alias]));
         $rates = $this->config->models[$alias];
 
+        $internal = self::internalCaller();
+        [$weight, $delayMs] = $this->admission($key, $internal);
+        if ($delayMs > 0) {
+            usleep($delayMs * 1000);
+        }
+
         $lease = $this->ledger->reserve(
             $key['id'],
             $promptBound,
@@ -82,6 +89,7 @@ final class Proxy
             $rates,
             $this->config->limitDefaults(),
             $this->config->leaseSeconds,
+            $internal ? 1 : 0,
         );
 
         $result = self::attemptResult(0);
@@ -137,7 +145,7 @@ final class Proxy
             }
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
-            $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000)];
+            $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs];
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
             self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }
@@ -434,14 +442,15 @@ final class Proxy
     /**
      * The usage object a client sees for a report: the standard counts, the cached count and, given
      * rates, the credits the report costs (at most the reservation).
-     * @param array{prompt: int, completion: int, total: int, cached: int} $u
+     * @param array{prompt: int, completion: int, total: int, cached: int, reasoning: int} $u
      * @param ?array{input: int, cached_input: int, output: int} $rates
      * @return array<string, mixed>
      */
     private static function usageView(array $u, ?array $rates, int $reserved): array
     {
         $view = ['prompt_tokens' => $u['prompt'], 'completion_tokens' => $u['completion'], 'total_tokens' => $u['total'],
-            'prompt_tokens_details' => ['cached_tokens' => $u['cached']]];
+            'prompt_tokens_details' => ['cached_tokens' => $u['cached']],
+            'completion_tokens_details' => ['reasoning_tokens' => $u['reasoning']]];
         if ($rates !== null) {
             $view['credits'] = min(self::usageCredits($u, 0, $rates), $reserved);
         }
@@ -639,6 +648,56 @@ final class Proxy
     }
 
     /** @return array{id: int, ref: string, balance: int, active: bool} */
+    /**
+     * Whether the request came from an internal caller, as the web server says in the VIRSILIPAS_SOURCE server variable
+     * (a FastCGI parameter it sets from the client address). Only that variable counts: a client header of the same
+     * name arrives as HTTP_VIRSILIPAS_SOURCE and is ignored, and a server that sets nothing makes every caller external.
+     */
+    private static function internalCaller(): bool
+    {
+        return ($_SERVER['VIRSILIPAS_SOURCE'] ?? null) === 'internal';
+    }
+
+    /**
+     * The throttle's decision before a request takes a reservation: the key's weight and how long to wait. A key below the
+     * busy weight while its source is at its busy line is refused with 503 server_busy and a Retry-After instead of
+     * waiting. A throttle that cannot read its state lets the request through unslowed: it only ever slows requests down,
+     * the hard limits stay in reserve().
+     * @param array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} $key
+     * @return array{0: int, 1: int} weight and delay in milliseconds
+     */
+    private function admission(array $key, bool $internal): array
+    {
+        $t = $this->config->throttle;
+        $weight = $t->weight($key['balance'], $key['bonus_pct'], $internal);
+        $delay = 0;
+        try {
+            $line = $t->busyLine($internal);
+            // While busy nothing waits in a worker: a low weight is shed, any other request is served at once.
+            $busy = $line !== null && $this->ledger->openLeases($internal ? 1 : 0) >= $line;
+            if ($busy && $weight < $t->busyMinWeight) {
+                $retry = $t->shedRetryAfter($weight);
+                Log::write('info', 'throttled', ['ref' => $key['ref'], 'action' => 'shed', 'weight' => $weight, 'retry_after' => $retry]);
+                $shed = new HttpError(503, 'the server is busy; retry shortly', 'server_error', $retry, 'server_busy');
+            } elseif (!$busy && $t->dailyBudget !== null) {
+                $delay = $t->delayMs($t->pressure($this->ledger->chargedSince(time() - 86400)), $weight);
+            }
+        } catch (\Throwable $e) {
+            Log::write('warn', 'throttle_error', ['ref' => $key['ref'], 'error' => $e::class]);
+        }
+        if (isset($shed)) {
+            throw $shed;
+        }
+        if ($delay > 0) {
+            Log::write('info', 'throttled', ['ref' => $key['ref'], 'action' => 'delay', 'weight' => $weight, 'delay_ms' => $delay]);
+        }
+        if (!headers_sent()) {
+            header('X-Virsilipas-Weight: ' . $weight);
+            header('X-Virsilipas-Delay-Ms: ' . $delay);
+        }
+        return [$weight, $delay];
+    }
+
     private function authenticate(): array
     {
         $key = $this->ledger->findKey(Http::bearer());

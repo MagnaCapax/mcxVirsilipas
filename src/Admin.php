@@ -53,7 +53,7 @@ final class Admin
     }
 
     /**
-     * POST /admin/keys/limits {"ref", "max_concurrent"?, "requests_per_minute"?, "credits_per_minute"?}:
+     * POST /admin/keys/limits {"ref", "max_concurrent"?, "requests_per_minute"?, "credits_per_minute"?, "bonus_pct"?}:
      * a given limit is set to a positive integer, or to null to follow the configured default again;
      * limits not given are left as they are. Returns the key's own settings and the limits in force.
      */
@@ -62,9 +62,23 @@ final class Admin
         $b = $this->body();
         $ref = self::ref($b);
         unset($b['ref']);
+        // The bonus percent rides along with the limits: billing sets both, and it only raises the key's priority weight.
+        // Validated before anything changes, applied after the limits, so a refused request changes nothing.
+        $newBonus = null;
+        if (array_key_exists('bonus_pct', $b)) {
+            $newBonus = $b['bonus_pct'];
+            if (!is_int($newBonus) || $newBonus < 0 || $newBonus > Ledger::MAX_BONUS_PCT) {
+                throw new HttpError(400, 'bonus_pct must be an integer from 0 to ' . Ledger::MAX_BONUS_PCT);
+            }
+            unset($b['bonus_pct']);
+        }
         $overrides = $this->ledger->setLimits($ref, $b);
-        Log::write('info', 'key_limits', ['ref' => $ref] + $overrides);
-        Http::json(200, ['ref' => $ref, 'overrides' => $overrides, 'limits' => Ledger::effectiveLimits($overrides, $this->config->limitDefaults())]);
+        if ($newBonus !== null) {
+            $this->ledger->setBonus($ref, $newBonus);
+        }
+        $bonus = $this->ledger->status($ref, $this->config->limitDefaults())['bonus_pct'];
+        Log::write('info', 'key_limits', ['ref' => $ref, 'bonus_pct' => $bonus] + $overrides);
+        Http::json(200, ['ref' => $ref, 'overrides' => $overrides, 'limits' => Ledger::effectiveLimits($overrides, $this->config->limitDefaults()), 'bonus_pct' => $bonus]);
     }
 
     /** @return array<string, mixed> */

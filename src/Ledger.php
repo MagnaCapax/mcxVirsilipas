@@ -27,16 +27,25 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 4;
-    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 and 3 gain the usage columns below. */
-    private const UPGRADABLE_FROM = [2, 3];
+    private const SCHEMA_VERSION = 5;
+    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 4 gain the columns below. */
+    private const UPGRADABLE_FROM = [2, 3, 4];
     /**
-     * Usage columns added in schema 4, for tracking over time: the upstream that served the request (the host
-     * of its route URL), whether it streamed, how long it took, the reasoning share of the output tokens, and
-     * the cost the upstream itself reported, in millionths of its unit (NULL when it reports none).
+     * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
+     * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
+     * the output tokens, and the cost the upstream itself reported, in millionths of its unit (NULL when it reports
+     * none). Schema 5, for throttling and priority: a key's bonus percent (part of its weight), whether a lease came
+     * from an internal caller (each source has its own busy line), and how long a request was slowed down.
      */
-    private const USAGE_COLUMNS_4 = ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
-        'duration_ms' => 'INTEGER NOT NULL DEFAULT 0', 'reasoning_tokens' => 'INTEGER NOT NULL DEFAULT 0', 'upstream_cost' => 'INTEGER'];
+    private const ADDED_COLUMNS = [
+        'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
+            'duration_ms' => 'INTEGER NOT NULL DEFAULT 0', 'reasoning_tokens' => 'INTEGER NOT NULL DEFAULT 0', 'upstream_cost' => 'INTEGER',
+            'delay_ms' => 'INTEGER NOT NULL DEFAULT 0'],
+        'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)'],
+        'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))'],
+    ];
+    /** The largest bonus percent a key can carry (the same ceiling as the hosting bonus it mirrors). */
+    public const MAX_BONUS_PCT = 300;
     /** stats(): time bucket name => its SQL expression, and grouping name => its column. Only these reach SQL. */
     private const STATS_BUCKETS = ['hour' => "strftime('%Y-%m-%dT%H', u.ts, 'unixepoch')", 'day' => "strftime('%Y-%m-%d', u.ts, 'unixepoch')",
         'month' => "strftime('%Y-%m', u.ts, 'unixepoch')", 'all' => "'all'"];
@@ -74,9 +83,9 @@ final class Ledger
     /**
      * Creates the schema, or upgrades an older ledger in place in one transaction. From schema 2,
      * credit_log is added and each key with a nonzero balance gets one 'opening' row carrying that
-     * balance, so the sum check holds from the first moment. From schema 2 or 3, the usage table gains
-     * the schema-4 columns; existing rows keep their counts and get the columns' defaults. Any other
-     * older or newer schema is refused.
+     * balance, so the sum check holds from the first moment. From schema 2 to 4, the tables gain the
+     * added columns they lack (ADDED_COLUMNS); existing rows keep their values and get the columns'
+     * defaults (bonus 0, external source, no delay). Any other older or newer schema is refused.
      */
     public function migrate(): void
     {
@@ -92,13 +101,16 @@ final class Ledger
                 $this->db->prepare("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) SELECT ?, id, 'opening', balance, balance, 'schema-3' FROM keys WHERE balance != 0 ORDER BY id")
                     ->execute([time()]);
             }
-            // One definition for new and upgraded ledgers alike: whatever schema-4 column is missing is added.
-            $have = array_column($this->db->query('PRAGMA table_info(usage)')->fetchAll(\PDO::FETCH_ASSOC), 'name');
-            foreach (self::USAGE_COLUMNS_4 as $name => $type) {
-                if (!in_array($name, $have, true)) {
-                    $this->db->exec("ALTER TABLE usage ADD COLUMN $name $type");
+            // One definition for new and upgraded ledgers alike: whatever added column is missing is added.
+            foreach (self::ADDED_COLUMNS as $table => $columns) {
+                $have = array_column($this->db->query("PRAGMA table_info($table)")->fetchAll(\PDO::FETCH_ASSOC), 'name');
+                foreach ($columns as $name => $type) {
+                    if (!in_array($name, $have, true)) {
+                        $this->db->exec("ALTER TABLE $table ADD COLUMN $name $type");
+                    }
                 }
             }
+            $this->db->exec('CREATE INDEX IF NOT EXISTS leases_source_open ON leases(source, settled, expires_at)');
             $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
         });
     }
@@ -235,17 +247,50 @@ final class Ledger
         });
     }
 
-    /** @return array{id: int, ref: string, balance: int, active: bool}|null */
+    /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}|null */
     public function findKey(string $plainKey): ?array
     {
-        $st = $this->db->prepare('SELECT id, ref, balance, active FROM keys WHERE key_hash = ?');
+        $st = $this->db->prepare('SELECT id, ref, balance, active, bonus_pct FROM keys WHERE key_hash = ?');
         $st->execute([hash('sha256', $plainKey)]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
         $st->closeCursor();
         if ($row === false) {
             return null;
         }
-        return ['id' => (int) $row['id'], 'ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active']];
+        return ['id' => (int) $row['id'], 'ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
+            'bonus_pct' => (int) $row['bonus_pct']];
+    }
+
+    /** Sets a key's bonus percent (0 to MAX_BONUS_PCT), one of the two inputs of its priority weight. */
+    public function setBonus(string $ref, int $pct): int
+    {
+        if ($pct < 0 || $pct > self::MAX_BONUS_PCT) {
+            throw new HttpError(400, 'bonus_pct must be an integer from 0 to ' . self::MAX_BONUS_PCT);
+        }
+        return $this->tx(function () use ($ref, $pct): int {
+            $this->db->prepare('UPDATE keys SET bonus_pct = ? WHERE id = ?')->execute([$pct, $this->keyIdByRef($ref)]);
+            return $pct;
+        });
+    }
+
+    /** Credits charged by all keys since a unix time: the spend the throttle paces against its budget. */
+    public function chargedSince(int $since): int
+    {
+        $st = $this->db->prepare('SELECT COALESCE(SUM(charged), 0) FROM usage WHERE ts >= ?');
+        $st->execute([$since]);
+        $n = (int) $st->fetchColumn();
+        $st->closeCursor();
+        return $n;
+    }
+
+    /** Requests in flight from one source (1 = internal callers, 0 = everyone else), across all keys. */
+    public function openLeases(int $source): int
+    {
+        $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE source = ? AND settled = 0 AND expires_at > ?');
+        $st->execute([$source, time()]);
+        $n = (int) $st->fetchColumn();
+        $st->closeCursor();
+        return $n;
     }
 
     /**
@@ -256,12 +301,12 @@ final class Ledger
      * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
      * @return array{ref: string, balance: int, active: bool, in_flight: int, held: int, reserved: int,
      *     overrides: array<string, ?int>, limits: array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int},
-     *     window: array{requests: int, credits: int}}
+     *     window: array{requests: int, credits: int}, bonus_pct: int}
      */
     public function status(string $ref, array $defaults): array
     {
         $now = time();
-        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
+        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.bonus_pct, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held,
                 (SELECT COALESCE(SUM(l.reserved), 0) FROM leases l WHERE l.key_id = k.id AND l.settled = 0) AS reserved
@@ -277,7 +322,7 @@ final class Ledger
         return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
             'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held'], 'reserved' => (int) $row['reserved'],
             'overrides' => $overrides, 'limits' => self::effectiveLimits($overrides, $defaults),
-            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']]];
+            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']], 'bonus_pct' => (int) $row['bonus_pct']];
     }
 
     /**
@@ -334,9 +379,9 @@ final class Ledger
      * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
      * @return array{lease_id: int, max_tokens: int, reserved: int}
      */
-    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, array $rates, array $defaults, int $leaseSeconds): array
+    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, array $rates, array $defaults, int $leaseSeconds, int $source = 0): array
     {
-        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds): array {
+        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds, $source): array {
             $now = time();
             $st = $this->db->prepare('SELECT balance, active, ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
             $st->execute([$keyId]);
@@ -377,8 +422,8 @@ final class Ledger
             if ($upd->rowCount() !== 1) {
                 throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota', code: 'insufficient_quota');
             }
-            $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at) VALUES (?, ?, ?, ?)')
-                ->execute([$keyId, $reserved, $now, $now + $leaseSeconds]);
+            $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at, source) VALUES (?, ?, ?, ?, ?)')
+                ->execute([$keyId, $reserved, $now, $now + $leaseSeconds, $source === 1 ? 1 : 0]);
             $leaseId = (int) $this->db->lastInsertId();
             $this->logCredit($keyId, 'reserve', -$reserved, 'lease:' . $leaseId);
 
@@ -391,7 +436,7 @@ final class Ledger
      * reservation, returns the rest, and writes the usage row in the same transaction.
      * Settling an already settled lease does nothing and returns false.
      * The tracking fields (upstream, stream, duration_ms, reasoning, cost) are optional and default to empty.
-     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, reasoning?: int, cost?: ?int} $meta
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, reasoning?: int, cost?: ?int, delay_ms?: int} $meta
      */
     public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
@@ -409,9 +454,9 @@ final class Ledger
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
             $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
-            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
                 ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
-                    $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null]);
+                    $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0)]);
             return true;
         });
     }
@@ -445,7 +490,8 @@ final class Ledger
                 SUM(u.cached_tokens) AS cached_tokens, SUM(u.completion_tokens) AS completion_tokens,
                 SUM(u.reasoning_tokens) AS reasoning_tokens, SUM(u.charged) AS credits, SUM(u.upstream_cost) AS upstream_cost,
                 COUNT(u.upstream_cost) AS costed_requests, SUM(u.aborted) AS aborted, SUM(u.estimated) AS estimated,
-                SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms
+                SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms,
+                SUM(u.delay_ms > 0) AS delayed, CAST(AVG(u.delay_ms) AS INTEGER) AS mean_delay_ms
             FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ? GROUP BY $group ORDER BY $group");
         $st->execute([$since ?? 0, $until ?? PHP_INT_MAX]);
         $rows = [];

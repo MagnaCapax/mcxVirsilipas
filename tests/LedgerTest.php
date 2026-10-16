@@ -395,14 +395,14 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(4, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(5, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');
     $l->migrate(); // re-running init adds nothing
     same(1, (int) $db->query('SELECT COUNT(*) FROM usage')->fetchColumn());
     same([['bucket' => '1970-01-02', 'model' => 'm', 'requests' => 1, 'prompt_tokens' => 7, 'cached_tokens' => 2, 'completion_tokens' => 3, 'reasoning_tokens' => 0,
-        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0]], $l->stats('day', ['model']));
+        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0, 'delayed' => 0, 'mean_delay_ms' => 0]], $l->stats('day', ['model']));
 }
 
 function testStatsGroupsUsageByTimeAndDimension(): void

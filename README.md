@@ -5,7 +5,8 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 - One key per user, one balance per key. The balance never expires and never resets.
 - Your billing system adds credits through an admin endpoint ("grants"). Each grant applies once, however often it is retried.
 - Clients can read their remaining credits, their limits and their last minute's use; you set per-key limits on concurrency, requests per minute and credits per minute.
-- Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests.
+- Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests. Two example clients are in `examples/`.
+- Optional soft throttling: when the day's spend nears a budget, or the server is busy, requests slow down or are asked to retry, by a per-key priority weight (more credit and a larger bonus mean higher priority), instead of being refused.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
 - Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
 - No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions. Storage is one SQLite file.
@@ -32,14 +33,52 @@ rounded up once per request. The counts come from the upstream's usage report: `
 Details that matter in production:
 
 - **Client hangs up mid-stream.** The proxy stops relaying and keeps reading the upstream until a usage report covers what the client received, then stops the upstream request, so the charge follows the upstream's own count. With an upstream that reports usage on every chunk (configure it in `stream_options`) that is the next report, and the charge can include a few chunks the client never received. If such an upstream sends the cached count only with its final report, that next report has none, so a hang-up charges the cached part of the prompt as fresh input. With an upstream that reports usage only at the end, it is the final report: the upstream finishes the answer (at most `max_tokens`, capped at the reservation) and the whole generation is charged. If no report comes before the stream ends, the charge is an upper bound (the prompt bound at the input rate plus the bytes delivered at the output rate), capped at the reservation, and the usage row is flagged `estimated`.
-- **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and as usage `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` and `credits` (what the reported usage costs, at most the reservation). In a stream, each event that carries usage shows the report the request is charged by, so the last one matches the charge unless text arrived after the last report that advanced the counts; a later equal or lower report does not cover that text, and the charge adds an upper bound for it (flagged `estimated`). Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
+- **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and as usage `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` (the output tokens spent thinking, 0 when the upstream reports none) and `credits` (what the reported usage costs, at most the reservation). In a stream, each event that carries usage shows the report the request is charged by, so the last one matches the charge unless text arrived after the last report that advanced the counts; a later equal or lower report does not cover that text, and the charge adds an upper bound for it (flagged `estimated`). Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
 - **Upstream errors** never produce a 200 before a stream has started; once it has (the 200 is already sent), an upstream error ends the stream with a generic error event and no `[DONE]`, and the output relayed until then is charged. A non-streaming answer must arrive complete and carry a usable answer: non-empty text, reasoning or refusal, or a function tool call with a non-empty id, name and arguments. A stream starts only with an event that carries a completion choice (a delta with at least one valid field); events dropped before that add nothing to the charge, and at `[DONE]` the proxy stops reading the upstream, so nothing after it is relayed or charged. Otherwise the client gets one of the proxy's own errors (see *Errors* under Endpoints), no upstream text, and no charge. A stream that ends without its final marker gets an error event at the end (`code` `upstream_error`).
 - **Retries and failover.** Before anything has been sent to the client, a failed attempt is retried on the same upstream (`retries`, 0 to 2, default 1) only when the upstream cannot have done the work: the connection failed before the request was sent, or it answered 408, 409, 429, 502, 503 or 504. Between tries the proxy waits the upstream's `Retry-After` (or `retry-after-ms`) when it is at most 60 seconds, else 0.5 s, then 1 s. When the tries are used up, or the upstream answered 500 (or another 5xx), 401, 402, 403 or 404, the request moves to the next upstream in the alias's route. It ends at once, with no retry and no failover, when output may already exist (a 2xx status arrived, or a sent request timed out or broke) and when the upstream rejected the request itself (400, 413, 422 and other statuses), because every upstream would. All attempts together get `upstream_timeout`. One reservation covers them all, the customer pays the alias's rates whichever upstream answered, and only the answer delivered is charged. The usage row records the upstream that served the request (or was tried last), and each failed attempt is logged as `upstream_attempt` (warn).
 - **Credit log.** Every change to a balance writes one row to `credit_log` in the same transaction: a grant (its `grant_id`), a reservation taken when a request starts and the unused part returned when it settles (both `lease:<id>`), or the `opening` balance carried over by a schema upgrade. Each row holds the change and the balance after it; a change of zero (a request that used its whole reservation) writes no row. The table is append-only: the database refuses UPDATE and DELETE on it. `bin/virsilipas history <ref> [N]` shows a key's last N changes; `bin/virsilipas verify` checks that every key's changes sum to its balance and that each row's balance is the running sum, and exits 1 on any mismatch, which means something changed a balance outside the proxy.
-- **Usage over time.** Each usage row also carries `upstream` (the host of the route URL that served the request), `stream`, `duration_ms`, `reasoning_tokens` (the reasoning share of the output tokens, read from `completion_tokens_details.reasoning_tokens` or a top-level `reasoning_tokens`) and `upstream_cost` (the upstream's own `estimated_cost`, kept in millionths of its unit; `NULL` when it reports none). None of these change what is charged; a request with none of this detail still gets a usage row. In a stream, a repeat report with the same three counts may add a detail the adopted report lacked (the cached split, the reasoning count, the cost) once; a later repeat cannot change or remove it. `bin/virsilipas stats <hour|day|month|all> [by] [since] [until]` prints one JSON line per UTC time bucket and group (`by` is a comma list of `model`, `upstream`, `key`, `status`, or `-` for none; `since`/`until` are `YYYY-MM-DD` in UTC, `until` exclusive) with requests, prompt/cached/completion/reasoning tokens, credits charged, the upstream's reported cost and how many requests carried one, hang-ups, estimated charges, failed requests (non-2xx) and the mean duration.
+- **Usage over time.** Each usage row also carries `upstream` (the host of the route URL that served the request), `stream`, `duration_ms`, `reasoning_tokens` (the reasoning share of the output tokens, read from `completion_tokens_details.reasoning_tokens` or a top-level `reasoning_tokens`) and `upstream_cost` (the upstream's own `estimated_cost`, kept in millionths of its unit; `NULL` when it reports none). None of these change what is charged; a request with none of this detail still gets a usage row. In a stream, a repeat report with the same three counts may add a detail the adopted report lacked (the cached split, the reasoning count, the cost) once; a later repeat cannot change or remove it. `bin/virsilipas stats <hour|day|month|all> [by] [since] [until]` prints one JSON line per UTC time bucket and group (`by` is a comma list of `model`, `upstream`, `key`, `status`, or `-` for none; `since`/`until` are `YYYY-MM-DD` in UTC, `until` exclusive) with requests, prompt/cached/completion/reasoning tokens, credits charged, the upstream's reported cost and how many requests carried one, hang-ups, estimated charges, failed requests (non-2xx), the mean duration, and the requests that waited for spend pacing (`delayed`) with their mean wait (`mean_delay_ms`).
 - **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered (a worker that dies just before forwarding also leaves its reservation charged); if the request is settled late, the difference is returned. `bin/virsilipas status <ref>` counts such leases as `held`. `lease_seconds` must be longer than `upstream_timeout`.
 - **Runaway output.** If the credits for a stream's reported usage pass the reservation, the proxy stops the upstream request there. Output delivered after the last usage report that advanced the count is charged as an upper bound (its bytes); a repeated or lower report does not cover it. Upstreams that report usage on every chunk often send the cached split only with the final report, whose counts repeat the last running report; such a repeat adds the cached split once and nothing else; a later repeat cannot change or remove it.
 - **Limits.** Each key has three: `max_concurrent` (requests in flight; stops one key from using up a shared upstream rate limit), `requests_per_minute` and `credits_per_minute` (over the last 60 seconds, counting each request's charge, or its reservation while it runs). The config sets the defaults (`max_concurrent_per_key`, `requests_per_minute`, `credits_per_minute`; the last two unset means no limit) and the admin endpoint sets a key's own values, higher or lower. A request is refused (429) when the key is at a limit; the credits limit is checked when a request starts and a request is admitted while the window is below it, so a window holds at most the limit plus one request; the request that crosses it is served in full, never shortened. Further requests are refused until the window falls below the limit again, either because requests age out of it or because a running request settles for less than it reserved. The refusal order is disabled key, concurrency, requests, credits, balance. Refusals carry `Retry-After`: for the per-minute limits, the seconds until the oldest request in the window turns a minute old (the latest the window can start to free; a settling request can free it sooner); for concurrency, 1.
+
+### Priority and throttling
+
+Each key has a priority **weight** on the scale Linux uses for CPU and disk shares (cgroup `cpu.weight` and `io.weight`): 1 to 10,000, with 100 as the reference.
+
+```
+weight = 100 x sqrt(balance / credits_per_unit) x (1 + bonus_pct / 100) x (internal_factor, for internal callers)
+```
+
+rounded and clamped to 1..10,000. `credits_per_unit` (default 1,000,000) is the number of credits you treat as one unit of money, so a key holding one unit with no bonus has weight 100. The square root keeps a large balance from crowding everyone else out: four times the credit doubles the weight. `bonus_pct` (0 to 300, default 0) is the key's loyalty bonus, set with `bin/virsilipas bonus <ref> <pct>` or `POST /admin/keys/limits`; 300% multiplies the weight by 4. Internal callers (see *Access control*) are multiplied by `internal_factor` (default 2). A subscription that adds credits raises the weight through the balance. Clients see their weight in `/v1/balance` and in the `X-Virsilipas-Weight` response header.
+
+With the defaults:
+
+| Balance | Bonus | Weight, external | Weight, internal | `Retry-After` when shed |
+|---|---|---|---|---|
+| 0.25 unit | 0% | 50 | 100 | 10 s |
+| 1 unit | 0% | 100 | 200 | not shed |
+| 1 unit | 50% | 150 | 300 | not shed |
+| 1 unit | 300% | 400 | 800 | not shed |
+| 4 units | 0% | 200 | 400 | not shed |
+| 25 units | 0% | 500 | 1000 | not shed |
+| 25 units | 300% | 2000 | 4000 | not shed |
+
+The weight changes no price and no limit. It only orders who slows down first, in two cases, both off until you configure them under `throttle`:
+
+- **Spend pacing** (`daily_budget`, in credits over the last 24 hours). Once the credits charged across all keys in the last 24 hours pass `pace_start` (default 0.8) of the budget, each chat request waits before it starts: `base_delay_ms x pressure x 100 / weight`, at most `max_delay_ms` (defaults 1000 and 3000), where pressure rises from 0 at `pace_start` to 1 at the full budget and keeps rising past it. Nothing is refused: past the budget requests still run, just slower, and low weights wait longest. The wait is recorded in the usage row (`delay_ms`) and sent as `X-Virsilipas-Delay-Ms`. While pacing is on, each request sums the last 24 hours of usage rows: about 2 ms at 25,000 requests a day and 20 ms at 250,000 (measured on SQLite with the `ts` index). With a budget of 1,000 credits:
+
+  | Spent in 24 h | Pressure | Wait, weight 25 | Wait, weight 100 | Wait, weight 400 |
+  |---|---|---|---|---|
+  | 800 or less | 0 | 0 | 0 | 0 |
+  | 850 | 0.25 | 1000 ms | 250 ms | 62 ms |
+  | 900 | 0.5 | 2000 ms | 500 ms | 125 ms |
+  | 1000 | 1 | 3000 ms | 1000 ms | 250 ms |
+  | 1200 | 2 | 3000 ms | 2000 ms | 500 ms |
+
+- **Busy shedding** (`busy`, requests in flight per source: `internal` and `external`). While a source has that many requests in flight, a request from a key whose weight is below `busy_min_weight` (default 100) gets 503 `server_busy` with `Retry-After` `ceil(5 x busy_min_weight / weight)` seconds (1 to 60) instead of a worker; keys at or above the line are served as usual. Nothing ever waits inside a worker while the server is busy, because a waiting request holds the worker another request needs. Set each line below that pool's `pm.max_children` (for example three quarters of it) so that higher weights still find a free worker.
+
+The hard limits (balance, concurrency, requests and credits per minute) are unchanged and still refuse. A throttle failure (for example a database error while reading the spend) never fails a request: the request goes ahead without a wait and the failure is logged as `throttle_error`.
 
 ### Before enabling a model
 
@@ -66,6 +105,19 @@ Point your web server at `public/index.php` for every path. The config path can 
 ### Access control
 
 The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, stop the php-fpm pool or block the port. To stop one customer, disable their key.
+
+The web server tells the proxy where a request comes from: the FastCGI parameter `VIRSILIPAS_SOURCE` set to `internal` marks a caller from your own network; anything else, or no parameter, is external. Set it from the client address, never from a request header (the proxy reads only the server variable, so a client cannot send it). With nginx:
+
+```nginx
+geo $virsilipas_source {
+    default external;
+    192.0.2.0/24 internal;   # your own networks
+}
+# in the location that passes to php-fpm:
+fastcgi_param VIRSILIPAS_SOURCE $virsilipas_source;
+```
+
+The source sets the `internal_factor` in the weight and which `busy` line applies. Giving internal and external callers separate php-fpm pools (nginx can pick the pool by the same `geo`) keeps a flood from outside from taking the workers your own network uses.
 
 ### Backups
 
@@ -145,7 +197,7 @@ Customer side, authenticated with `Authorization: Bearer <key>`:
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible chat completions, streaming or not. `model` must be one of your aliases. |
 | `GET /v1/models` | Lists the aliases: `id`, `object`, `created`, `owned_by`, the configured `description` and `context_length` when set, `max_completion_tokens` (the `max_tokens_cap`) and `credits_per_million_tokens` (`input`, `cached_input`, `output`). Upstream model ids and URLs are never shown. |
-| `GET /v1/balance` | For the calling key: `balance` (credits left, already net of running requests), `reserved` (credits held by running or unsettled requests), `in_flight`, `limits` (`max_concurrent`, `requests_per_minute`, `credits_per_minute`; `null` = no limit) and `window` (`requests` and `credits` over the last 60 seconds). |
+| `GET /v1/balance` | For the calling key: `balance` (credits left, already net of running requests), `reserved` (credits held by running or unsettled requests), `in_flight`, `limits` (`max_concurrent`, `requests_per_minute`, `credits_per_minute`; `null` = no limit), `window` (`requests` and `credits` over the last 60 seconds), `bonus_pct` and `weight` (the key's priority, for the caller's source; see *Priority and throttling*). |
 
 Errors use OpenAI's shape: `{"error": {"message": "...", "type": "...", "param": ..., "code": "..."}}`, with fixed messages and these codes:
 
@@ -162,10 +214,11 @@ Errors use OpenAI's shape: `{"error": {"message": "...", "type": "...", "param":
 | 429 | `rate_limit_exceeded` | a key limit (concurrency, requests or credits per minute; the message says which) |
 | 429 | `upstream_busy` | the upstreams were busy |
 | 502 | `upstream_error` | an upstream failed (500, or rejected its own key or model id) or answered without a usable answer |
+| 503 | `server_busy` | the server is busy and the key's weight is below the busy line (see *Priority and throttling*) |
 | 503 | `upstream_unavailable` | no upstream could take the request: unreachable, without its key, or still busy or down (502, 503, 504) after its retries |
 | 504 | `upstream_timeout` | `upstream_timeout` passed before an answer |
 
-429 and 503 carry `Retry-After`. A chat request that got past its key, model and balance checks carries `X-Request-Id` in its response, an upstream error included: the lease id of its usage row and log lines, for support. Only `context_length_exceeded` is ever taken from an upstream, and only as that code; nothing else an upstream said reaches the client.
+429 and 503 carry `Retry-After`. A chat request that got past its key, model and balance checks carries `X-Request-Id` in its response, an upstream error included: the lease id of its usage row and log lines, for support. Every admitted chat request also carries `X-Virsilipas-Weight` and `X-Virsilipas-Delay-Ms` (the wait before it started, 0 when none). Only `context_length_exceeded` is ever taken from an upstream, and only as that code; nothing else an upstream said reaches the client.
 
 Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long random token (32 bytes or more); only its sha256 is stored in the config. The grant response returns the new balance; `bin/virsilipas status <ref>` shows it at any time.
 
@@ -174,7 +227,7 @@ Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long
 | `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for a user. `ref` must be your billing system's stable id for the user (not a per-service id), so all of the user's purchases add to one balance. Returns the key once (201). |
 | `POST /admin/keys/active` | `{"ref": "...", "active": false}` | Disables or re-enables a key (for suspend and unsuspend). |
 | `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "credits": 1000000}` | Adds credits once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative credits remove credits (refunds). At most 10^15 per grant. |
-| `POST /admin/keys/limits` | `{"ref": "...", "requests_per_minute": 60}` | Sets any of `max_concurrent`, `requests_per_minute` and `credits_per_minute` for a key: an integer from 1 to 10^15, or `null` to follow the config default again. Limits left out are unchanged; any other field is refused (400). Returns the key's own settings (`overrides`) and the limits in force (`limits`). |
+| `POST /admin/keys/limits` | `{"ref": "...", "requests_per_minute": 60}` | Sets any of `max_concurrent`, `requests_per_minute` and `credits_per_minute` for a key: an integer from 1 to 10^15, or `null` to follow the config default again. Also sets `bonus_pct`, an integer from 0 to 300 (the bonus in the key's weight). Fields left out are unchanged; any other field is refused (400), and nothing changes when any field is invalid. Returns the key's own settings (`overrides`), the limits in force (`limits`) and `bonus_pct`. |
 
 Use a `grant_id` that is unique per payment, for example the invoice number or the subscription id plus its billing period, so that a retried push never credits twice and a renewal is never dropped.
 
@@ -189,8 +242,8 @@ Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMM
 | `log_level` | Adds | Events |
 |---|---|---|
 | `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
-| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `key_create`, `key_active`, `key_limits`, `grant` |
+| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `admin_auth_failed` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `key_create`, `key_active`, `key_limits`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
 The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
@@ -213,8 +266,21 @@ Runs the requests with `--concurrency` in flight per process across `--processes
 ```
 virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
            | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
-           | history <ref> [N] | verify | stats <hour|day|month|all> [by] [since] [until]
+           | bonus <ref> <0..300> | history <ref> [N] | verify | stats <hour|day|month|all> [by] [since] [until]
 ```
+
+## Example clients
+
+```sh
+VIRSILIPAS_URL=https://proxy.example VIRSILIPAS_KEY=... php examples/hello-world.php "Say hello"
+
+export VIRSILIPAS_URL=https://proxy.example
+php examples/client.php models --key-file /path/to/key
+php examples/client.php balance --key-file /path/to/key
+php examples/client.php chat "one word, please" --model default --key-file /path/to/key
+```
+
+`examples/hello-world.php` is the smallest client: one question to the `default` alias (or `VIRSILIPAS_MODEL`), the answer, and the credits it cost. `examples/client.php` is a fuller one with no dependencies beyond the `curl` and `json` extensions. The key comes from `--key-file` or `VIRSILIPAS_KEY`, never the command line, so it never shows in `ps` and is never printed. `chat` streams the answer as it arrives (`--no-stream` for one JSON answer) and hides reasoning unless `--show-thinking` is given; it ends with a `usage:` line (prompt, completion, cached and reasoning tokens, and the credits charged). `models` prints each alias's rates; `balance` prints the balance, reservations, requests in flight, weight, bonus, limits and the last minute's use. On a 429 or 503 with `Retry-After` it waits and retries once; any other refusal prints the proxy's error (`message`, `type`, `code`) to stderr. Exit codes: 0 ok, 1 request failed, 2 usage error.
 
 ## Tests
 

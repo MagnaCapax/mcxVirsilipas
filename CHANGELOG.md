@@ -2,6 +2,17 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.5.0 (2026-10-16)
+
+Schema 4 to 5: `keys` gains `bonus_pct`, `leases` gains `source`, `usage` gains `delay_ms`, plus an index on open leases by source. `init` upgrades a schema-2, 3 or 4 ledger in place; existing rows get the defaults (no bonus, external, no wait). Older releases refuse a schema-5 ledger. Configs without a `throttle` block load unchanged and behave as before.
+
+- **Priority weight per key.** `100 x sqrt(balance / credits_per_unit) x (1 + bonus_pct / 100)`, doubled (`internal_factor`) for internal callers, clamped to 1..10,000: the scale of cgroup CPU and disk weights. `bonus_pct` (0 to 300) is set with `bin/virsilipas bonus <ref> <pct>` or `POST /admin/keys/limits`. `/v1/balance` shows `bonus_pct` and `weight`; chat responses carry `X-Virsilipas-Weight`. The weight changes no price and no limit.
+- **Spend pacing** (`throttle.daily_budget`). Past `pace_start` of the budget, charged over the last 24 hours across all keys, each chat request waits up to `max_delay_ms` before it starts, longer for lower weights; nothing is refused. The wait is in the usage row (`delay_ms`), the `X-Virsilipas-Delay-Ms` header and `stats` (`delayed`, `mean_delay_ms`).
+- **Busy shedding** (`throttle.busy`, requests in flight per source). While a source is at its line, keys below `busy_min_weight` get 503 `server_busy` with a weight-scaled `Retry-After`; others are served at once. Nothing waits inside a worker while busy.
+- **Source.** The web server marks internal callers with the FastCGI parameter `VIRSILIPAS_SOURCE=internal`; anything else is external. A client header cannot set it.
+- **Reasoning count in usage.** Responses' `usage` now carries `completion_tokens_details.reasoning_tokens` (0 when the upstream reports none).
+- **Example clients.** `examples/hello-world.php` (one question, the answer and its credits) and `examples/client.php` (models, balance, streaming chat), both covered by the tests.
+- A throttle failure never fails a request; it is logged as `throttle_error` (warn). Delays and sheds are logged as `throttled` (info).
 ## v0.4.0 (2026-10-15)
 
 No schema change; v0.3.0 configs load unchanged (a global `upstream_url` or a model's own `url` is a one-entry route).

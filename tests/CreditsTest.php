@@ -73,7 +73,7 @@ function testPublicViewReportsCreditsCappedAtTheReservation(): void
 {
     $j = ['choices' => [], 'usage' => ['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050,
         'prompt_tokens_details' => ['cached_tokens' => 800, 'account' => 'PRIVATE-DETAIL']]];
-    same(['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050, 'prompt_tokens_details' => ['cached_tokens' => 800], 'credits' => 1200],
+    same(['prompt_tokens' => 1000, 'completion_tokens' => 50, 'total_tokens' => 1050, 'prompt_tokens_details' => ['cached_tokens' => 800], 'completion_tokens_details' => ['reasoning_tokens' => 0], 'credits' => 1200],
         Proxy::publicView($j, 'w', weightedRates(), 5000)['usage']);
     same(900, Proxy::publicView($j, 'w', weightedRates(), 900)['usage']['credits'], 'never more than the reservation');
     check(!array_key_exists('credits', Proxy::publicView($j, 'w')['usage']), 'no rates: no credits field');
