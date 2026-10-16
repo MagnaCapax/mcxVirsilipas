@@ -74,6 +74,15 @@ return [
     //     'internal_factor' => 2,
     //     'credits_per_unit' => 1000000,
     // ],
+    // Optional hard caps for the whole server (see README, Caps). Leave out for none. Spend is the upstream's cost in its
+    // currency unit (1 = 1.00) per UTC hour, day and calendar month; 0 stops every request. With any spend cap set, every
+    // route entry must carry a 'cost'. requests_per_minute counts requests started across all keys in the last 60 seconds.
+    // 'caps' => [
+    //     'hour' => 1,
+    //     'day' => 5,
+    //     'month' => 50,
+    //     'requests_per_minute' => 600,
+    // ],
     // How long a reservation survives if its worker dies. Must exceed upstream_timeout.
     'lease_seconds' => 900,
 

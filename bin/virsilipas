@@ -23,6 +23,10 @@ Usage: virsilipas <command> [args]
   status <ref>                      show balance, holds, limits and the last minute's use
   history <ref> [N]                 show the last N credit changes (default 100), newest first
   verify                            check every balance against its credit log; exit 1 on a mismatch
+  caps                              the server-wide caps in force and their use now: per spend window the
+                                    limit, settled cost, cost held by requests running, what remains
+                                    (millionths of the upstream unit) and when it resets (unix time);
+                                    requests started in the last minute against requests_per_minute
   stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
                                     usage over time, one JSON line per UTC bucket and group: requests,
                                     tokens, credits, upstream-reported cost, hang-ups, failures,
@@ -51,6 +55,7 @@ try {
         'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
         'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
         'verify' => verifyOrExit($ledger),
+        'caps' => json_encode($ledger->capStatus($config->caps), JSON_FORCE_OBJECT),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
             ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
         default => null,

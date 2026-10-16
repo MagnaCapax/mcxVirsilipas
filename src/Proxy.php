@@ -78,16 +78,25 @@ final class Proxy
         $internal = self::internalCaller();
         [$weight, $delayMs] = $this->admission($key, $internal);
 
-        $lease = $this->ledger->reserve(
-            $key['id'],
-            $promptBound,
-            self::requestedMaxTokens($req),
-            $this->config->maxTokensCap,
-            $rates,
-            $this->config->limitDefaults(),
-            $this->config->leaseSeconds,
-            $internal ? 1 : 0,
-        );
+        try {
+            $lease = $this->ledger->reserve(
+                $key['id'],
+                $promptBound,
+                self::requestedMaxTokens($req),
+                $this->config->maxTokensCap,
+                $rates,
+                $this->config->limitDefaults(),
+                $this->config->leaseSeconds,
+                $internal ? 1 : 0,
+                $this->config->caps,
+                $this->config->costBounds[$alias],
+            );
+        } catch (HttpError $e) {
+            if (in_array($e->errorCode, ['spend_cap_reached', 'server_rate_limit'], true)) {
+                Log::write('info', 'capped', ['ref' => $key['ref'], 'code' => $e->errorCode, 'retry_after' => $e->retryAfter]);
+            }
+            throw $e;
+        }
 
         $result = self::attemptResult(0);
         [$upstream, $servedHop, $started] = ['', 0, hrtime(true)];
@@ -150,13 +159,44 @@ final class Proxy
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs];
-            // An upstream that reports no cost of its own is costed from the route entry's configured prices, flagged as computed.
+            // An upstream that reports no cost of its own is costed from the route entry's configured prices, flagged as
+            // computed: from its usage report, or, for an answer delivered without one, from the counts charged for it.
             $price = $this->config->routes[$alias][$servedHop]['cost'];
             if ($meta['cost'] === null && $price !== null && $result['usage'] !== null) {
                 $meta = array_replace($meta, ['cost' => self::usageCredits($result['usage'], $result['unmetered'], $price), 'cost_computed' => true]);
+            } elseif ($meta['cost'] === null && $price !== null && $meta['estimated']) {
+                $meta = array_replace($meta, ['cost' => Credits::of($meta['prompt'], 0, $meta['completion'], $price), 'cost_computed' => true]);
             }
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
             self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
+            $this->logCapCrossing($meta['cost'] ?? 0);
+        }
+    }
+
+    /**
+     * A warn line when this request's cost carried a spend window past 80% or 100% of its cap: one line per crossing,
+     * from the spend before and after it, with no state of its own. A failure here never fails the request.
+     */
+    private function logCapCrossing(int $cost): void
+    {
+        if ($cost <= 0) {
+            return;
+        }
+        try {
+            foreach ($this->config->caps['spend'] as $window => $limit) {
+                if ($limit === null || $limit === 0) {
+                    continue;
+                }
+                $after = $this->ledger->costSince(Ledger::capWindow($window, time())[0]);
+                foreach ([80, 100] as $pct) {
+                    $line = intdiv($limit * $pct, 100);
+                    if ($after - $cost < $line && $after >= $line) {
+                        Log::write('warn', 'spend_cap_crossed', ['window' => $window, 'percent' => $pct, 'spent' => $after, 'limit' => $limit]);
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::write('warn', 'cap_log_error', ['error' => $e::class]);
         }
     }
 

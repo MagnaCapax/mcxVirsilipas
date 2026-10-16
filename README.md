@@ -7,12 +7,27 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 - Clients can read their remaining credits, their limits and their last minute's use; you set per-key limits on concurrency, requests per minute and credits per minute.
 - Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests. Two example clients are in `examples/`.
 - Optional soft throttling: when the day's spend nears a budget, or the server is busy, requests slow down or are asked to retry, by a per-key priority weight (more credit and a larger bonus mean higher priority), instead of being refused.
+- Optional hard caps for the whole server: upstream spend per hour, day and month, and requests per minute across all keys. Set a spend cap to 0 to stop everything at once.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
 - Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
 - No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions. Storage is one SQLite file.
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
+## Run your own
+
+mcxVirsilipas is open source under the Apache License 2.0. Anyone may run their own copy for their own needs, read and review the code, change it, and build on it under the terms of the [License](LICENSE). The repository is the software only: your copy, its configuration, its upstream accounts and its bills are your own.
+
+Nothing about a particular deployment is in this repository. Upstream providers, model names, prices, keys, hostnames and addresses live only in your `config.php` and key files, which are never committed (`.gitignore` covers them, and `tests/SecretGuardTest.php` fails if one is tracked). Keep it that way in your own fork.
+
+## No warranty: use at your own risk
+
+The software is provided "as is", without warranties or conditions of any kind, and the authors are not liable for any damages arising from its use; sections 7 and 8 of the [License](LICENSE) are the binding text. Your mileage may vary. In particular:
+
+- You are responsible for your upstream accounts, their terms of service (including whether they allow you to resell or share access), the prices you set, and the bills you receive.
+- The credit metering and the caps below limit what the proxy lets through, but a cost the proxy computes from configured prices is an estimate. Your provider's own bill is the authoritative figure. Where your provider offers spending limits of its own, set them too.
+- Check every model before enabling it (see *Before enabling a model*), test a client hang-up on your own stack, and back up the ledger.
+- Nothing here is legal, tax or financial advice.
 ## Credits
 
 A credit is an abstract unit: you decide what it is worth and how many you grant for a payment. Each model alias has three rates, in credits per million tokens: `input` (fresh prompt tokens), `cached_input` (prompt tokens the upstream served from its prompt cache) and `output` (completion tokens, reasoning included). A request costs
@@ -80,6 +95,53 @@ The weight changes no price and no limit. It only orders who slows down first, i
 
 The hard limits (balance, concurrency, requests and credits per minute) are unchanged and still refuse. A throttle failure (for example a database error while reading the spend) never fails a request: the request goes ahead without a wait and the failure is logged as `throttle_error`.
 
+### Caps: hard limits for the whole server
+
+The optional `caps` block stops spending and request bursts across all keys, internal callers included. Unlike the throttle it refuses.
+
+```php
+'caps' => [
+    'hour' => 1,      // upstream spend per UTC hour, in your upstream's currency unit (1 = 1.00)
+    'day' => 5,       // per UTC day
+    'month' => 50,    // per UTC calendar month
+    'requests_per_minute' => 600,   // requests started across all keys in the last 60 seconds
+],
+```
+
+Every setting is optional. A spend cap of `0` stops every request at once, which is the quickest way to pause the service without touching the web server. The config file is read on every request, so a change applies to the next request (with `opcache.validate_timestamps=0`, reload php-fpm).
+
+- **What counts.** A spend window holds the upstream cost settled in it plus, for every request still running that started in it, an upper bound of its cost: its prompt bound and `max_tokens` priced at the highest `cost` of its route's upstreams. A new request is admitted only if its own bound still fits, checked in the same transaction as its reservation, so parallel requests cannot overshoot together. A request that does not fit is refused, never shortened: no one pays for an answer cut short by the server's budget.
+- **Prices are required.** With any spend cap set, every route entry needs a `cost` (that upstream's prices in millionths of its currency unit per million tokens), or the config is refused: a request the proxy cannot price would escape the cap. A model without a route cannot carry prices, so give it a route. Keep every route's prices in one currency.
+- **Settled cost.** When the upstream reports its own cost, that figure is recorded; otherwise the cost is computed from the configured prices and the counts charged (`cost_computed` in the usage row). If your configured prices are below what the upstream actually bills, the bounds and computed costs are low by the same factor, so keep them current.
+- **Refusals.** A spend cap answers 503 `spend_cap_reached` with `Retry-After` until the window ends; `requests_per_minute` answers 429 `server_rate_limit` with `Retry-After` until the oldest request in the window is a minute old. Both are logged as `capped` (info). When a request's cost carries a window past 80% or 100% of its cap, a `spend_cap_crossed` line is logged at `warn`, once per crossing.
+- **What runs across a boundary.** A request that started before a window began counts in that window only once it settles.
+- `bin/virsilipas caps` shows each cap in force with what is settled, what running requests hold, what remains and when it resets.
+
+### Cost and rate controls at a glance
+
+| Control | Scope | Where you set it | When it is reached |
+|---|---|---|---|
+| Balance | one key | grants (`POST /admin/grants`, `bin/virsilipas grant`) | 402; `max_tokens` is first lowered to what the balance covers |
+| `max_tokens_cap` | one request | config | `max_tokens` is lowered to it |
+| `max_concurrent_per_key` | one key | config default; `bin/virsilipas limit` per key | 429 |
+| `requests_per_minute`, `credits_per_minute` | one key | config defaults; `bin/virsilipas limit` per key | 429 with `Retry-After` |
+| Disabled key | one key | `bin/virsilipas key-disable`, `POST /admin/keys/active` | 403 |
+| `caps.requests_per_minute` | whole server | config `caps` | 429 `server_rate_limit` |
+| `caps.hour`, `caps.day`, `caps.month` | whole server, upstream cost | config `caps` | 503 `spend_cap_reached` |
+| `throttle.daily_budget` | whole server, credits | config `throttle` | requests wait, lower weights longer; nothing refused |
+| `throttle.busy` | requests in flight per source | config `throttle` | keys below `busy_min_weight` get 503 `server_busy` |
+| `limit_req` and `limit_conn` | client address | nginx | nginx answers 429 or 503 before the proxy runs |
+| Spending limits at the provider | an upstream key | your provider | that upstream refuses (typically 402, 403 or 429); after retries the next upstream in the route is tried |
+
+A sensible order: per-key limits and balances bound any one key; `throttle.daily_budget` (set below your day cap) slows everyone down, low priorities first, as spend rises; the caps are the hard stop; provider-side limits are the last line. Per client address, use the web server, for example:
+
+```nginx
+# in the http block:
+limit_req_zone $binary_remote_addr zone=virsilipas:10m rate=10r/s;
+# in the location that passes to php-fpm:
+limit_req zone=virsilipas burst=20 nodelay;
+limit_req_status 429;
+```
 ### Before enabling a model
 
 Check, with that model at its upstream (a model served by a second upstream is checked there), and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), its `prompt_tokens` include the cached tokens it reports in `prompt_tokens_details.cached_tokens` or `prompt_cache_hit_tokens` (send the same long prompt twice; on a cache hit `prompt_tokens` must not drop by the cached count), its cache writes, if it reports `cache_write_tokens` at all, cost no more than your `input` rate covers, and a client hang-up is detected under your real php-fpm and nginx (see below). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
@@ -104,7 +166,7 @@ Point your web server at `public/index.php` for every path. The config path can 
 
 ### Access control
 
-The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, stop the php-fpm pool or block the port. To stop one customer, disable their key.
+The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, set a spend cap to 0 (see *Caps*), stop the php-fpm pool or block the port. To stop one customer, disable their key.
 
 The web server tells the proxy where a request comes from: the FastCGI parameter `VIRSILIPAS_SOURCE` set to `internal` marks a caller from your own network; anything else, or no parameter, is external. Set it from the client address, never from a request header (the proxy reads only the server variable, so a client cannot send it). Behind a reverse proxy or load balancer `$remote_addr` is that proxy's address, which would make every caller internal: use the real client address there (nginx `realip` with your proxies listed in `set_real_ip_from`). With nginx:
 
@@ -244,8 +306,8 @@ Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMM
 | `log_level` | Adds | Events |
 |---|---|---|
 | `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
-| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `key_create`, `key_active`, `key_limits`, `grant` |
+| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `spend_cap_crossed` (a request's cost carried a spend window past 80% or 100% of its cap); `admin_auth_failed` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `capped` (refused by a server-wide cap: the code and `Retry-After`), `key_create`, `key_active`, `key_limits`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
 The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
@@ -268,7 +330,7 @@ Runs the requests with `--concurrency` in flight per process across `--processes
 ```
 virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
            | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
-           | bonus <ref> <0..300> | group <ref> <name|-> | history <ref> [N] | verify
+           | bonus <ref> <0..300> | group <ref> <name|-> | history <ref> [N] | verify | caps
            | stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
 ```
 

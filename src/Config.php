@@ -45,6 +45,20 @@ final class Config
     public readonly string $logLevel;
     /** Soft throttling and per-key priority weights (the optional `throttle` block; see Throttle). */
     public readonly Throttle $throttle;
+    /** Spend windows a cap may be set for, in the order they are checked. */
+    public const CAP_WINDOWS = ['hour', 'day', 'month'];
+    /**
+     * Server-wide hard caps (the optional `caps` block): upstream spend per UTC hour, day and month, in millionths of the
+     * upstream currency unit (null = no cap, 0 = nothing may start), and requests started per 60 seconds across all keys.
+     * @var array{spend: array<string, ?int>, requests_per_minute: ?int}
+     */
+    public readonly array $caps;
+    /**
+     * alias => the highest price any of its upstreams charges, per field (millionths per million tokens), or null when an
+     * upstream of the alias has no 'cost'. A request's cost bound for the spend caps is priced at these.
+     * @var array<string, ?array{input: int, cached_input: int, output: int}>
+     */
+    public readonly array $costBounds;
 
     /** @param array<string, mixed> $c */
     public function __construct(array $c)
@@ -109,6 +123,25 @@ final class Config
         $this->models = $parsed;
         $this->routes = $routes;
         $this->info = $info;
+        $this->caps = self::caps($c['caps'] ?? null);
+        $bounds = [];
+        foreach ($routes as $alias => $hops) {
+            $bounds[$alias] = null;
+            foreach ($hops as $i => $h) {
+                if ($h['cost'] === null) {
+                    // A spend cap only binds requests it can price: with a cap set, every upstream must carry its prices.
+                    if (array_filter($this->caps['spend'], static fn (?int $v): bool => $v !== null) !== []) {
+                        throw new \InvalidArgumentException("config: caps needs a cost on every route entry; models.$alias.route.$i has none (a model without a route cannot have one: give it a route)");
+                    }
+                    $bounds[$alias] = null;
+                    break;
+                }
+                foreach ($h['cost'] as $field => $price) {
+                    $bounds[$alias][$field] = max($bounds[$alias][$field] ?? 0, $price);
+                }
+            }
+        }
+        $this->costBounds = $bounds;
 
         if (!preg_match('/^[0-9a-f]{64}$/', $this->adminTokenSha256)) {
             throw new \InvalidArgumentException('config: admin_token_sha256 must be a sha256 hex digest');
@@ -308,12 +341,34 @@ final class Config
         return $opts;
     }
 
+    /**
+     * The `caps` block: hour, day and month in plain upstream currency units (5 means 5.00, 0 stops everything),
+     * and requests_per_minute across all keys. Every setting is optional; an absent block sets no cap.
+     * @return array{spend: array<string, ?int>, requests_per_minute: ?int}
+     */
+    private static function caps(mixed $c): array
+    {
+        $c ??= [];
+        if (!is_array($c) || array_diff(array_keys($c), [...self::CAP_WINDOWS, 'requests_per_minute']) !== []) {
+            throw new \InvalidArgumentException('config: caps may set only ' . implode(', ', self::CAP_WINDOWS) . ' and requests_per_minute');
+        }
+        $spend = [];
+        foreach (self::CAP_WINDOWS as $w) {
+            $v = $c[$w] ?? null;
+            if ($v !== null && ((!is_int($v) && !is_float($v)) || !is_finite((float) $v) || $v < 0 || $v > 1_000_000_000)) {
+                throw new \InvalidArgumentException("config: caps.$w must be a number from 0 to 1000000000 (upstream currency units), or unset");
+            }
+            $spend[$w] = $v === null ? null : (int) round($v * 1_000_000);
+        }
+        return ['spend' => $spend, 'requests_per_minute' => self::limit($c, 'requests_per_minute', 'caps.')];
+    }
+
     /** @param array<string, mixed> $c */
-    private static function limit(array $c, string $k): ?int
+    private static function limit(array $c, string $k, string $prefix = ''): ?int
     {
         $v = $c[$k] ?? null;
         if ($v !== null && (!is_int($v) || $v < 1 || $v > Ledger::MAX_GRANT)) {
-            throw new \InvalidArgumentException("config: $k must be a positive integer of at most " . Ledger::MAX_GRANT . ' (or unset for no limit)');
+            throw new \InvalidArgumentException("config: $prefix$k must be a positive integer of at most " . Ledger::MAX_GRANT . ' (or unset for no limit)');
         }
         return $v;
     }

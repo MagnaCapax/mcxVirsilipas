@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.7.0 (2026-10-16)
+
+Schema 6 to 7: `leases` gains `cost_reserved` (the upper bound of a running request's upstream cost) and an index on `created_at`; `spend_hourly` gains `cost` (upstream cost settled per UTC hour, filled from the existing usage rows on upgrade). `init` upgrades a schema-2 to 6 ledger in place. An older release's `init` refuses a schema-7 ledger. Configs without a `caps` block load unchanged and behave as before.
+
+- **Hard caps for the whole server** (`caps`). Upstream spend per UTC hour, day and calendar month, in the upstream's currency unit, and requests started per minute across all keys. They bind every request, internal callers included, in the reservation transaction: settled cost plus the cost bounds of running requests plus the new request's bound must fit. A request that does not fit is refused (503 `spend_cap_reached`, 429 `server_rate_limit`, with `Retry-After`), never shortened. A spend cap of 0 stops everything. With a spend cap set, every route entry needs a `cost`.
+- **Cost for answers delivered without a usage report.** When the upstream reports neither usage nor cost, the cost is computed from the estimated counts charged and flagged `cost_computed`.
+- **`bin/virsilipas caps`** shows each cap, what is settled, what running requests hold, what remains and when the window resets. Refusals are logged as `capped` (info); a cost that carries a window past 80% or 100% of its cap logs `spend_cap_crossed` (warn).
+- **README:** running your own copy, a no-warranty section, and one table of every cost and rate control (per key, whole server, web server, provider).
 ## v0.6.1 (2026-10-16)
 
 No schema change.

@@ -132,7 +132,7 @@ function testMigrateUpgradesASchemaFourLedger(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(6, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(7, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same([0, 0, 0, 'u'], array_values($db->query('SELECT k.bonus_pct, l.source, u.delay_ms, u.upstream FROM keys k, leases l, usage u')->fetch(\PDO::FETCH_NUM)),
         'old rows get the defaults and keep their values');
     same([], $l->verify()['problems'], 'balances untouched');
@@ -144,15 +144,25 @@ function testMigrateUpgradesASchemaFourLedger(): void
 /** A separate proxy instance on the shared fake upstream, with its own ledger and config, for throttle behaviour. */
 function throttledProxy(array $throttle, array $env = []): array
 {
+    return configuredProxy(static fn (array $cfg): array => ['throttle' => $throttle] + $cfg, $env);
+}
+
+/**
+ * A proxy process of its own on the shared fake upstream, with the test config changed by $edit first.
+ * @param callable(array<string, mixed>): array<string, mixed> $edit
+ */
+function configuredProxy(callable $edit, array $env = []): array
+{
     $h = Harness::get();
     $dir = tempDir();
     file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
     $shared = require $h['dir'] . '/config.php';
-    $cfg = configArrayFor($dir, ['upstream_url' => $shared['upstream_url'], 'throttle' => $throttle]);
+    $cfg = configArrayFor($dir, ['upstream_url' => $shared['upstream_url']]);
     $cfg['upstreams'] = $shared['upstreams'];
     foreach (array_keys($cfg['upstreams']) as $name) {
         $cfg['upstreams'][$name]['key_file'] = $shared['upstreams'][$name]['key_file'];
     }
+    $cfg = $edit($cfg);
     file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
     $s = stream_socket_server('tcp://127.0.0.1:0');
     $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);

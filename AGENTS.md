@@ -31,6 +31,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 14. An upstream key goes only to its own upstream: each upstream (named, or a model's own `url`) has its own `key_file`, every route entry is served with its own upstream's key, an upstream whose key file is missing is skipped rather than served with another key, and every upstream URL is https or plain http to the local machine.
 15. The throttle never refuses what the hard limits allow, except busy shedding: a 503 `server_busy` with `Retry-After`, only while the caller's source has its `busy` line of requests in flight and only for weights below `busy_min_weight`. No pacing wait starts while the caller's source is at its busy line; a pacing wait is at most `max_delay_ms`, happens after the reservation (so the waiting request counts as in flight) and before the upstream clock starts. The weight changes no price and no limit.
 16. A caller is internal only when the server variable `VIRSILIPAS_SOURCE` is exactly `internal`, set by the web server from the client address. Nothing the client sends (headers, body, query) can set it; anything else, or nothing, is external.
+17. The server-wide caps bind every request, internal callers and free upstreams included, inside the reservation transaction: a spend window admits a request only if its settled cost, the cost bounds of the requests still running that started in it, and the new request's bound fit the cap; a cap of 0 admits nothing. A request that does not fit is refused, never shortened. A spend cap can be set only when every route entry has a `cost`, so no request escapes it unpriced.
 
 ## Layout
 
@@ -39,7 +40,7 @@ public/index.php   front controller and routes
 src/Config.php     config loading and validation
 src/Ledger.php     SQLite: keys, grants, leases, usage, per-key limits, credit log
 src/Credits.php    credit arithmetic
-src/Throttle.php   priority weight, spend pacing and busy shedding
+src/Throttle.php   priority weight, spend pacing and busy shedding (soft); the hard caps live in Config and Ledger::reserve
 src/Proxy.php      customer endpoints, request rewrite, streaming, charging
 src/Admin.php      billing/provisioning endpoints
 src/Http.php       request/response helpers; HttpError.php maps refusals to HTTP

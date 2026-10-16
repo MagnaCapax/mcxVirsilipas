@@ -27,9 +27,9 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 6;
-    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 5 gain the columns below. */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5];
+    private const SCHEMA_VERSION = 7;
+    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 6 gain the columns below. */
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -37,7 +37,9 @@ final class Ledger
      * none). Schema 5, for throttling and priority: a key's bonus percent (part of its weight), whether a lease came
      * from an internal caller (each source has its own busy line), and how long a request was slowed down. Schema 6, for
      * cost tracking: the source of each usage row, whether its cost was computed from configured prices because the
-     * upstream reported none, and a key's group (an operator-chosen name such as a plan or customer group).
+     * upstream reported none, and a key's group (an operator-chosen name such as a plan or customer group). Schema 7, for
+     * the spend caps: the upper bound of a lease's upstream cost, held against the caps while the request runs
+     * (spend_hourly gains the settled upstream cost per hour as well).
      */
     private const ADDED_COLUMNS = [
         'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
@@ -45,7 +47,7 @@ final class Ledger
             'delay_ms' => 'INTEGER NOT NULL DEFAULT 0', 'source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))',
             'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))'],
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''"],
-        'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))'],
+        'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
     /** The largest bonus percent a key can carry (also the CHECK in ADDED_COLUMNS). */
     public const MAX_BONUS_PCT = 300;
@@ -118,11 +120,16 @@ final class Ledger
                 }
             }
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_source_open ON leases(source, settled, expires_at)');
-            // Credits charged per UTC hour, kept by settle, so spend pacing reads at most 25 rows however busy the day was.
+            $this->db->exec('CREATE INDEX IF NOT EXISTS leases_created ON leases(created_at)');
+            // Credits charged and upstream cost per UTC hour, kept by settle, so spend pacing and the spend caps read at
+            // most one row per hour of their window however busy it was. Both are rebuilt from the usage rows when added.
             $newHourly = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'spend_hourly'")->fetchColumn() === 0;
-            $this->db->exec('CREATE TABLE IF NOT EXISTS spend_hourly (hour INTEGER PRIMARY KEY, charged INTEGER NOT NULL)');
+            $this->db->exec('CREATE TABLE IF NOT EXISTS spend_hourly (hour INTEGER PRIMARY KEY, charged INTEGER NOT NULL, cost INTEGER NOT NULL DEFAULT 0)');
             if ($newHourly) {
-                $this->db->exec('INSERT INTO spend_hourly (hour, charged) SELECT ts / 3600, SUM(charged) FROM usage GROUP BY ts / 3600');
+                $this->db->exec('INSERT INTO spend_hourly (hour, charged, cost) SELECT ts / 3600, SUM(charged), COALESCE(SUM(upstream_cost), 0) FROM usage GROUP BY ts / 3600');
+            } elseif (!in_array('cost', array_column($this->db->query('PRAGMA table_info(spend_hourly)')->fetchAll(\PDO::FETCH_ASSOC), 'name'), true)) {
+                $this->db->exec('ALTER TABLE spend_hourly ADD COLUMN cost INTEGER NOT NULL DEFAULT 0');
+                $this->db->exec('UPDATE spend_hourly SET cost = COALESCE((SELECT SUM(u.upstream_cost) FROM usage u WHERE u.ts >= spend_hourly.hour * 3600 AND u.ts < spend_hourly.hour * 3600 + 3600), 0)');
             }
             $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
         });
@@ -405,14 +412,21 @@ final class Ledger
     /**
      * Reserves credits for one request: the prompt bound at the input rate plus max_tokens at the
      * output rate. max_tokens is clamped so the reservation never exceeds the balance. Refusals, in
-     * order: disabled key, concurrency, requests per minute, credits per minute, balance.
+     * order: disabled key, concurrency, requests per minute, credits per minute, the server's requests per
+     * minute, balance, the spend caps.
+     * A spend cap holds the request's upper-bound upstream cost (its prompt bound and max_tokens at $costRates) against
+     * the window's settled cost plus the bounds of the requests still running that started in it; a request that does
+     * not fit is refused, never shortened, so no one pays for an answer cut short by the server's budget.
      * @param array{input: int, cached_input: int, output: int} $rates
      * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
+     * @param array{spend?: array<string, ?int>, requests_per_minute?: ?int} $caps Config::$caps
+     * @param ?array{input: int, cached_input: int, output: int} $costRates the alias's Config::$costBounds entry
      * @return array{lease_id: int, max_tokens: int, reserved: int}
      */
-    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, array $rates, array $defaults, int $leaseSeconds, int $source = 0): array
+    public function reserve(int $keyId, int $promptBound, ?int $requestedMax, int $cap, array $rates, array $defaults, int $leaseSeconds, int $source = 0,
+        array $caps = [], ?array $costRates = null): array
     {
-        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds, $source): array {
+        return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds, $source, $caps, $costRates): array {
             $now = time();
             $st = $this->db->prepare('SELECT balance, active, ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
             $st->execute([$keyId]);
@@ -441,6 +455,18 @@ final class Ledger
                 }
             }
 
+            $serverRpm = $caps['requests_per_minute'] ?? null;
+            if ($serverRpm !== null) {
+                $st = $this->db->prepare('SELECT COUNT(*), COALESCE(MIN(created_at), ?) FROM leases WHERE created_at > ?');
+                $st->execute([$now, $now - self::WINDOW_SECONDS]);
+                [$started, $oldest] = array_map('intval', $st->fetch(\PDO::FETCH_NUM));
+                $st->closeCursor();
+                if ($started >= $serverRpm) {
+                    throw new HttpError(429, 'the server is at its request rate limit; retry shortly', 'rate_limit_error',
+                        max(1, $oldest + self::WINDOW_SECONDS - $now), 'server_rate_limit');
+                }
+            }
+
             $maxTokens = min($requestedMax ?? $cap, Credits::affordable((int) $k['balance'], $promptBound, $cap, $rates));
             if ($maxTokens < 1) {
                 throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota', code: 'insufficient_quota');
@@ -448,13 +474,24 @@ final class Ledger
             // Priced like a charge, rounded once: any reported usage within the prompt bound and max_tokens costs no more.
             $reserved = Credits::of($promptBound, 0, $maxTokens, $rates);
 
+            $costBound = $costRates === null ? 0 : Credits::of($promptBound, 0, $maxTokens, $costRates);
+            foreach ($caps['spend'] ?? [] as $window => $limit) {
+                if ($limit === null) {
+                    continue;
+                }
+                [$start, $end] = self::capWindow($window, $now);
+                if ($limit === 0 || $this->costSince($start) + $this->costInFlight($start) + $costBound > $limit) {
+                    throw new HttpError(503, "the server has reached its spending limit for this $window", 'server_error', max(1, $end - $now), 'spend_cap_reached');
+                }
+            }
+
             $upd = $this->db->prepare('UPDATE keys SET balance = balance - ? WHERE id = ? AND balance >= ?');
             $upd->execute([$reserved, $keyId, $reserved]);
             if ($upd->rowCount() !== 1) {
                 throw new HttpError(402, 'credit balance too low for this request', 'insufficient_quota', code: 'insufficient_quota');
             }
-            $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at, source) VALUES (?, ?, ?, ?, ?)')
-                ->execute([$keyId, $reserved, $now, $now + $leaseSeconds, $source === 1 ? 1 : 0]);
+            $this->db->prepare('INSERT INTO leases (key_id, reserved, created_at, expires_at, source, cost_reserved) VALUES (?, ?, ?, ?, ?, ?)')
+                ->execute([$keyId, $reserved, $now, $now + $leaseSeconds, $source === 1 ? 1 : 0, $costBound]);
             $leaseId = (int) $this->db->lastInsertId();
             $this->logCredit($keyId, 'reserve', -$reserved, 'lease:' . $leaseId);
 
@@ -490,10 +527,68 @@ final class Ledger
             $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms, source, cost_computed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
                 ->execute([$now, $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
                     $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0), $source, (int) ($meta['cost_computed'] ?? false)]);
-            $this->db->prepare('INSERT INTO spend_hourly (hour, charged) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET charged = charged + excluded.charged')
-                ->execute([intdiv($now, 3600), $charged]);
+            $this->db->prepare('INSERT INTO spend_hourly (hour, charged, cost) VALUES (?, ?, ?) ON CONFLICT(hour) DO UPDATE SET charged = charged + excluded.charged, cost = cost + excluded.cost')
+                ->execute([intdiv($now, 3600), $charged, max(0, $meta['cost'] ?? 0)]);
             return true;
         });
+    }
+
+    /** UTC start and end (unix seconds) of the hour, day or month holding $now: a spend cap's window. */
+    public static function capWindow(string $window, int $now): array
+    {
+        return match ($window) {
+            'hour' => [$now - $now % 3600, $now - $now % 3600 + 3600],
+            'day' => [$now - $now % 86400, $now - $now % 86400 + 86400],
+            'month' => [gmmktime(0, 0, 0, (int) gmdate('n', $now), 1, (int) gmdate('Y', $now)), gmmktime(0, 0, 0, (int) gmdate('n', $now) + 1, 1, (int) gmdate('Y', $now))],
+            default => throw new \InvalidArgumentException("unknown cap window $window"),
+        };
+    }
+
+    /** Upstream cost settled since $start (a whole UTC hour), in millionths of the upstream unit. */
+    public function costSince(int $start): int
+    {
+        $st = $this->db->prepare('SELECT COALESCE(SUM(cost), 0) FROM spend_hourly WHERE hour >= ?');
+        $st->execute([intdiv($start, 3600)]);
+        $n = (int) $st->fetchColumn();
+        $st->closeCursor();
+        return $n;
+    }
+
+    /** The cost bounds of requests started since $start and not settled yet, a dead worker's included. */
+    private function costInFlight(int $start): int
+    {
+        $st = $this->db->prepare('SELECT COALESCE(SUM(cost_reserved), 0) FROM leases WHERE settled = 0 AND created_at >= ?');
+        $st->execute([$start]);
+        $n = (int) $st->fetchColumn();
+        $st->closeCursor();
+        return $n;
+    }
+
+    /**
+     * Each configured cap with its use now: spend windows (limit, settled, in flight, remaining, reset time) and the
+     * server's requests over the last 60 seconds.
+     * @param array{spend: array<string, ?int>, requests_per_minute: ?int} $caps Config::$caps
+     * @return array<string, array<string, int>>
+     */
+    public function capStatus(array $caps): array
+    {
+        $now = time();
+        $out = [];
+        foreach ($caps['spend'] as $window => $limit) {
+            if ($limit === null) {
+                continue;
+            }
+            [$start, $end] = self::capWindow($window, $now);
+            [$settled, $inFlight] = [$this->costSince($start), $this->costInFlight($start)];
+            $out[$window] = ['limit' => $limit, 'settled' => $settled, 'in_flight' => $inFlight, 'remaining' => max(0, $limit - $settled - $inFlight), 'resets_at' => $end];
+        }
+        if ($caps['requests_per_minute'] !== null) {
+            $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE created_at > ?');
+            $st->execute([$now - self::WINDOW_SECONDS]);
+            $out['requests_per_minute'] = ['limit' => $caps['requests_per_minute'], 'last_minute' => (int) $st->fetchColumn()];
+            $st->closeCursor();
+        }
+        return $out;
     }
 
     /**
