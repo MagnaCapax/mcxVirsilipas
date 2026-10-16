@@ -60,7 +60,7 @@ function testTopShowsRateLatencyCostAndRecentRequestsAsMetadataOnly(): void
     check((bool) preg_match('/^requests\s+3\s+3\s+3$/m', $out), "three requests in every window:\n$out");
     check((bool) preg_match('/^failed\s+1 \(33%\)/m', $out), 'one failure of three');
     check((bool) preg_match('/^first byte p50 ms\s+80\s/m', $out), 'first byte over the delivered requests (80, 120)');
-    check((bool) preg_match('/^upstream cost\s+0\.0025\s/m', $out), 'reported cost in units');
+    check((bool) preg_match('/^upstream cost\s+0\.002500\s/m', $out), 'reported cost in units, to the millionth it is stored in');
     check((bool) preg_match('/^retried\/failover\s+2\s/m', $out), 'two requests needed more than one attempt');
     check(str_contains($out, 'chat-small') && str_contains($out, 'llm.example.com'), 'the per-model, per-upstream rows');
     check((bool) preg_match('/^\s+\d\d:\d\d:\d\d a\s+chat-small\s+llm\.example\.com\s+503\s+900\s+-\s+30\/20\s+5 retry$/m', $out),

@@ -2,6 +2,12 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.8.1 (2026-10-16)
+
+No schema change.
+
+- **`top` shows the upstream cost to six decimals**, the millionth it is stored in; with four, a real but small cost read as 0.0000.
+
 ## v0.8.0 (2026-10-16)
 
 Schema 7 to 8: `usage` gains `first_byte_ms` and `attempts`, plus an index on `(key_id, ts)`. `init` upgrades a schema-2 to 7 ledger in place; existing usage rows get no first-byte time and 0 attempts. An older release's `init` refuses a schema-8 ledger.

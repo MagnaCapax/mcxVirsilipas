@@ -104,8 +104,8 @@ final class Top
             'tps' => number_format($out / $seconds, 1),
             'tokens' => array_sum(array_column($rows, 'prompt_tokens')) . '/' . $out,
             'credits' => (string) array_sum(array_column($rows, 'charged')),
-            // millionths of the upstream's currency unit, shown in units; "-" when no request carried a cost
-            'cost' => $costs === [] ? '-' : number_format(array_sum($costs) / 1_000_000, 4),
+            // millionths of the upstream's currency unit, shown in units to the last stored digit; "-" when no request carried a cost
+            'cost' => $costs === [] ? '-' : number_format(array_sum($costs) / 1_000_000, 6),
             'retried' => (string) count(array_filter($rows, static fn (array $r): bool => $r['attempts'] > 1)),
             'aborted' => (string) count(array_filter($rows, static fn (array $r): bool => $r['aborted'])),
         ];
