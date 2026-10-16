@@ -7,6 +7,10 @@ declare(strict_types=1);
 // VIRSILIPAS_MODEL picks another alias from /v1/models (default: default).
 
 $url = rtrim((string) getenv('VIRSILIPAS_URL'), '/') . '/v1/chat/completions';
+if (!preg_match('#^(https://|http://(127\.0\.0\.1|localhost)[:/])#', $url)) {
+    fwrite(STDERR, "error: VIRSILIPAS_URL must be https (the key travels with the request)\n");
+    exit(2);
+}
 $body = ['model' => getenv('VIRSILIPAS_MODEL') ?: 'default', 'messages' => [['role' => 'user', 'content' => $argv[1] ?? 'Say hello in one sentence.']]];
 
 $ch = curl_init($url);
@@ -23,5 +27,5 @@ if (!isset($reply['choices'][0]['message']['content'])) {
     fwrite(STDERR, 'error: ' . ($reply['error']['message'] ?? curl_error($ch) ?: 'no answer') . "\n");
     exit(1);
 }
-echo $reply['choices'][0]['message']['content'], "\n";
+echo preg_replace('/[\x00-\x08\x0B-\x1F\x7F]/', '', $reply['choices'][0]['message']['content']), "\n"; // no terminal control codes
 echo 'credits: ', $reply['usage']['credits'] ?? '?', "\n";

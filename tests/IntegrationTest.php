@@ -478,7 +478,7 @@ function testIntegrationCachedInputIsChargedAtItsOwnRate(): void
         same(200, $r['status']);
         checkNoUpstreamDetails($r['body']);
         // 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
-        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        check((bool) preg_match('/"prompt_tokens_details":\{"cached_tokens":800\},"completion_tokens_details":\{"reasoning_tokens":\d+\},"credits":1200/', $r['body']), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         if ($stream) {
             $last = null;
@@ -507,7 +507,7 @@ function testIntegrationTheOtherCachedUsageShapeIsChargedAndTrackedTheSame(): vo
         check(substr_count($r['body'], '"reasoning_tokens"') === substr_count($r['body'], '"completion_tokens_details":{"reasoning_tokens":20}')
             && str_contains($r['body'], '"completion_tokens_details":{"reasoning_tokens":20}'), 'reasoning count relayed in the standard place only');
         // Same counts as the nested shape: 200 fresh x 2 + 800 cached x 0.5 + 50 output x 8 credits.
-        check(str_contains($r['body'], '"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":'), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
+        check((bool) preg_match('/"prompt_tokens_details":\{"cached_tokens":800\},"completion_tokens_details":\{"reasoning_tokens":\d+\},"credits":1200/', $r['body']), 'usage shows cached tokens and credits: ' . substr($r['body'], -300));
         same(100000 - 1200, settled($ref)['balance'], $stream ? 'stream' : 'non-stream');
         $u = lastUsage($ref);
         same([1000, 50, 800, 1200, 1200, 0], [$u['prompt_tokens'], $u['completion_tokens'], $u['cached_tokens'], $u['reported'], $u['charged'], $u['estimated']]);
@@ -554,6 +554,15 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     same([10000, null, ['requests' => 0, 'credits' => 0]], [$o['balance'], $o['limits']['requests_per_minute'], $o['window']], 'another key sees only its own balance, limits and window');
 
     same(200, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_minute' => null], 'admin-secret')['status']);
+    $set = json_decode(http('POST', '/admin/keys/limits', ['ref' => $ref, 'bonus_pct' => 300], 'admin-secret')['body'], true);
+    same([300, null], [$set['bonus_pct'], $set['overrides']['requests_per_minute']], 'bonus set, limits left alone');
+    $b = json_decode(http('GET', '/v1/balance', null, $key)['body'], true);
+    same([300, \MagnaCapax\Virsilipas\Throttle::fromConfig(null)->weight($b['balance'], 300, false)], [$b['bonus_pct'], $b['weight']], 'the client sees its bonus and the weight it gives');
+    foreach ([301, -1, '5', null, 1.5] as $bad) {
+        same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_minute' => 7, 'bonus_pct' => $bad], 'admin-secret')['status'], 'bonus_pct ' . var_export($bad, true) . ' refused');
+    }
+    $s = Harness::get()['ledger']->status($ref, lim(5));
+    same([300, null], [$s['bonus_pct'], $s['overrides']['requests_per_minute']], 'a refused request changes nothing, not even its valid fields');
     same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'back to the default: no limit');
 }
 function testIntegrationStreamStopsWhenTheCreditsPassTheReservation(): void

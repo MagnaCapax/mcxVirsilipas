@@ -65,7 +65,7 @@ function testShedRetryAfterIsLongerForLowWeights(): void
 function testThrottleConfigIsValidated(): void
 {
     $bad = [['daily_budget' => 0], ['daily_budget' => '5'], ['pace_start' => 1.0], ['max_delay_ms' => 60001], ['busy' => ['other' => 3]],
-        ['busy' => ['external' => 0]], ['internal_factor' => 0.5], ['credits_per_unit' => 0], ['speed' => 1], 'yes'];
+        ['busy' => ['external' => 0]], ['internal_factor' => 0.5], ['credits_per_unit' => 0], ['speed' => 1], 'yes', ['pace_start' => NAN], ['internal_factor' => NAN]];
     foreach ($bad as $t) {
         $ok = false;
         try {
@@ -73,7 +73,7 @@ function testThrottleConfigIsValidated(): void
         } catch (\InvalidArgumentException) {
             $ok = true;
         }
-        check($ok, 'refused: ' . json_encode($t));
+        check($ok, 'refused: ' . var_export($t, true));
     }
     $d = Throttle::fromConfig(null);
     same([null, 0.8, 1000, 3000, ['internal' => null, 'external' => null], 100, 2.0, 1_000_000],
@@ -112,7 +112,7 @@ function testOpenLeasesAreCountedPerSourceAndChargesSummed(): void
         'aborted' => false, 'estimated' => false, 'delay_ms' => 250]);
     same([2, 0], [$l->openLeases(0), $l->openLeases(1)], 'a settled lease is no longer in flight');
     same(7, $l->chargedSince(time() - 60), 'charges in the window are summed');
-    same(0, $l->chargedSince(time() + 60), 'nothing after now');
+    same(0, $l->chargedSince(time() + 3600), 'nothing in the next hour');
     $s = $l->stats('all');
     same([1, 250], [$s[0]['delayed'], $s[0]['mean_delay_ms']], 'the delay is recorded with the usage row');
 }
@@ -168,7 +168,7 @@ function throttledProxy(array $throttle, array $env = []): array
     }
     $ledger = new Ledger(Config::load("$dir/config.php")->dbPath);
     $ledger->migrate();
-    return ['url' => "http://127.0.0.1:$port", 'ledger' => $ledger, 'proc' => $p];
+    return ['url' => "http://127.0.0.1:$port", 'ledger' => $ledger, 'proc' => $p, 'log' => "$dir/proxy.log"];
 }
 
 /** @return array{status: int, headers: array<string, string>, body: string, ms: int} */
@@ -220,6 +220,26 @@ function testIntegrationSpendPacingDelaysByWeightAndRecordsIt(): void
         check($expectBig > 0 && $expectBig < 600, 'high weight waits, but far less');
         check($s['ms'] >= 600 && $s['ms'] - $b['ms'] > 400, 'the low-weight request really waited');
         same(600, $l->stats('all', ['key'])[array_search('small', array_column($l->stats('all', ['key']), 'key'), true)]['mean_delay_ms'], 'the wait is recorded with the usage row');
+        $db = new \PDO('sqlite:' . dirname($p['log']) . '/ledger.sqlite');
+        $duration = (int) $db->query("SELECT u.duration_ms FROM usage u JOIN keys k ON k.id = u.key_id WHERE k.ref = 'small' ORDER BY u.id DESC LIMIT 1")->fetchColumn();
+        check($duration < 600, "the upstream duration starts after the wait ($duration ms)");
+        // A waiting request already holds its lease: it counts as in flight for the busy line and the key's limits.
+        $mh = curl_multi_init();
+        $ch = curl_init($p['url'] . '/v1/chat/completions');
+        curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', "Authorization: Bearer $small"], CURLOPT_POSTFIELDS => json_encode(msg('ok', false))]);
+        curl_multi_add_handle($mh, $ch);
+        [$t0, $seen] = [microtime(true), 0];
+        do {
+            curl_multi_exec($mh, $running);
+            $age = microtime(true) - $t0;
+            if ($age > 0.15 && $age < 0.45) {
+                $seen = max($seen, $l->openLeases(0));
+            }
+            usleep(10000);
+        } while ($running > 0);
+        curl_multi_close($mh);
+        same(1, $seen, 'in flight during its wait');
     } finally {
         proc_terminate($p['proc']);
     }
@@ -286,6 +306,53 @@ function testIntegrationBusyShedsLowWeightsAndKeepsHighWeightsServing(): void
         $after = rawRequest($p['url'] . '/v1/chat/completions', 'POST', msg('ok', false), $low);
         same(200, $after['status'], 'once not busy, the low weight is served again');
         same('200', $after['headers']['x-virsilipas-delay-ms'] ?? '', 'after a pacing wait, now that the server is not busy');
+    } finally {
+        proc_terminate($p['proc']);
+    }
+}
+
+function testSpendIsKeptPerHourAndBackfilledOnUpgrade(): void
+{
+    $l = freshLedger();
+    $l->createKey('a');
+    $l->grant('a', 'g', 1_000_000);
+    $key = $l->findKey($l->createKey('b'));
+    $l->grant('b', 'g2', 1_000_000);
+    $lease = $l->reserve($key['id'], 10, 10, 100, unitRates(), lim(), 60);
+    $l->settle($lease['lease_id'], $key['id'], 15, ['model' => 'm', 'prompt' => 10, 'completion' => 5, 'cached' => 0, 'status' => 200, 'aborted' => false, 'estimated' => false]);
+    same(15, $l->chargedSince(time() - 86400), 'a settle adds to the current hour');
+    same(15, $l->chargedSince(time()), 'the current hour counts whole');
+    same(0, $l->chargedSince(time() + 3600), 'nothing in a later hour');
+    // Upgrading a schema-4 ledger with usage rows fills the hours from them.
+    $dir = tempDir();
+    $db = new \PDO("sqlite:$dir/v4.sqlite");
+    $db->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v4.sql'));
+    $db->exec("INSERT INTO keys (id, ref, key_hash, balance, active, created_at) VALUES (1, 'old', 'h', 0, 1, 0)");
+    $db->exec('INSERT INTO leases (id, key_id, reserved, created_at, expires_at, settled) VALUES (1, 1, 50, 0, 0, 1), (2, 1, 50, 0, 0, 1)');
+    $now = time();
+    $db->exec("INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation) VALUES ($now, 1, 1, 'm', 1, 1, 0, 40, 40, 200, 0, 0, 0), (" . ($now - 7200) . ", 1, 2, 'm', 1, 1, 0, 2, 2, 200, 0, 0, 0)");
+    unset($db);
+    $up = new Ledger("$dir/v4.sqlite");
+    $up->migrate();
+    same([42, 40], [$up->chargedSince($now - 86400), $up->chargedSince($now)], 'old usage rows counted by hour after the upgrade');
+    $up->migrate();
+    same(42, $up->chargedSince($now - 86400), 'a second init does not count them twice');
+}
+
+function testIntegrationAThrottleFailureNeverFailsTheRequest(): void
+{
+    $p = throttledProxy(['daily_budget' => 10, 'base_delay_ms' => 100, 'max_delay_ms' => 600]);
+    try {
+        $l = $p['ledger'];
+        $key = $l->createKey('k');
+        $l->grant('k', 'g', 1_000_000);
+        // Two earlier hours whose sum overflows 64 bits: reading the day's spend fails, settling the current hour does not.
+        $db = new \PDO('sqlite:' . dirname($p['log']) . '/ledger.sqlite');
+        $h = intdiv(time(), 3600);
+        $db->exec('INSERT INTO spend_hourly (hour, charged) VALUES (' . ($h - 1) . ', ' . PHP_INT_MAX . '), (' . ($h - 2) . ', ' . PHP_INT_MAX . ')');
+        $r = rawRequest($p['url'] . '/v1/chat/completions', 'POST', msg('ok', false), $key);
+        same([200, '0'], [$r['status'], $r['headers']['x-virsilipas-delay-ms'] ?? ''], 'served at once, without a wait');
+        check(str_contains((string) file_get_contents($p['log']), 'throttle_error'), 'the failure is logged');
     } finally {
         proc_terminate($p['proc']);
     }

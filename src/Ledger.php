@@ -44,7 +44,7 @@ final class Ledger
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)'],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))'],
     ];
-    /** The largest bonus percent a key can carry (the same ceiling as the hosting bonus it mirrors). */
+    /** The largest bonus percent a key can carry (also the CHECK in ADDED_COLUMNS). */
     public const MAX_BONUS_PCT = 300;
     /** stats(): time bucket name => its SQL expression, and grouping name => its column. Only these reach SQL. */
     private const STATS_BUCKETS = ['hour' => "strftime('%Y-%m-%dT%H', u.ts, 'unixepoch')", 'day' => "strftime('%Y-%m-%d', u.ts, 'unixepoch')",
@@ -111,6 +111,12 @@ final class Ledger
                 }
             }
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_source_open ON leases(source, settled, expires_at)');
+            // Credits charged per UTC hour, kept by settle, so spend pacing reads at most 25 rows however busy the day was.
+            $newHourly = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'spend_hourly'")->fetchColumn() === 0;
+            $this->db->exec('CREATE TABLE IF NOT EXISTS spend_hourly (hour INTEGER PRIMARY KEY, charged INTEGER NOT NULL)');
+            if ($newHourly) {
+                $this->db->exec('INSERT INTO spend_hourly (hour, charged) SELECT ts / 3600, SUM(charged) FROM usage GROUP BY ts / 3600');
+            }
             $this->db->exec('PRAGMA user_version = ' . self::SCHEMA_VERSION);
         });
     }
@@ -273,11 +279,11 @@ final class Ledger
         });
     }
 
-    /** Credits charged by all keys since a unix time: the spend the throttle paces against its budget. */
+    /** Credits charged by all keys since the start of the UTC hour that holds a unix time (so up to an hour more than asked): the spend the throttle paces against its budget. */
     public function chargedSince(int $since): int
     {
-        $st = $this->db->prepare('SELECT COALESCE(SUM(charged), 0) FROM usage WHERE ts >= ?');
-        $st->execute([$since]);
+        $st = $this->db->prepare('SELECT COALESCE(SUM(charged), 0) FROM spend_hourly WHERE hour >= ?');
+        $st->execute([intdiv($since, 3600)]);
         $n = (int) $st->fetchColumn();
         $st->closeCursor();
         return $n;
@@ -454,9 +460,12 @@ final class Ledger
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
             $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
+            $now = time();
             $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-                ->execute([time(), $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
+                ->execute([$now, $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
                     $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0)]);
+            $this->db->prepare('INSERT INTO spend_hourly (hour, charged) VALUES (?, ?) ON CONFLICT(hour) DO UPDATE SET charged = charged + excluded.charged')
+                ->execute([intdiv($now, 3600), $charged]);
             return true;
         });
     }

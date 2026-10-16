@@ -87,6 +87,12 @@ function request(string $method, string $url, ?array $body, string $key, bool $s
     return $r;
 }
 
+/** Model text without terminal control codes (escape sequences, carriage returns); newlines and tabs stay. */
+function plain(string $s): string
+{
+    return (string) preg_replace('/[\x00-\x08\x0B-\x1F\x7F]/', '', $s);
+}
+
 /** Prints the proxy's fixed error shape ({"error": {message, type, code, ...}}) and exits 1. */
 function failApi(array $error): never
 {
@@ -132,6 +138,9 @@ if ($key === '') {
     usageError('missing API key: pass --key-file or set VIRSILIPAS_KEY');
 }
 $base = rtrim($opt['url'], '/');
+if (!preg_match('#^(https://|http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$))#', $base . '/')) {
+    usageError('the base URL must be https (plain http only to this machine): the key travels with every request');
+}
 
 if ($cmd === 'models') {
     foreach (getJson($base, '/v1/models', $key)['data'] ?? [] as $m) {
@@ -167,9 +176,9 @@ $onEvent = function (?array $j) use (&$usage, &$sawError, $opt): void {
         if (!is_array($d)) {
             continue;
         }
-        echo is_string($d['content'] ?? null) ? $d['content'] : '';
+        echo is_string($d['content'] ?? null) ? plain($d['content']) : '';
         if ($opt['show-thinking'] && is_string($d['reasoning_content'] ?? null)) {
-            echo "\033[2m" . $d['reasoning_content'] . "\033[0m";
+            echo "\033[2m" . plain($d['reasoning_content']) . "\033[0m";
         }
     }
     $usage = $j['usage'] ?? $usage; // the latest report is the one the request is charged by
@@ -183,7 +192,7 @@ if ($sawError !== null) {
     failApi($sawError);
 }
 if (!$stream) {
-    echo $j['choices'][0]['message']['content'] ?? '';
+    echo plain((string) ($j['choices'][0]['message']['content'] ?? ''));
     $usage = $j['usage'] ?? null;
 }
 echo "\n";

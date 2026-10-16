@@ -14,12 +14,12 @@ namespace MagnaCapax\Virsilipas;
  * bonus multiplies by 4. More credit or a larger bonus means more priority, the same shape as a plan's disk/CPU weight.
  *
  * Spend pacing (when daily_budget is set): over the last 24 hours, once spend passes pace_start of the budget each
- * request waits base_delay_ms x pressure x 100 / weight before it starts, at most max_delay_ms, where pressure grows
+ * request waits base_delay_ms x pressure x 100 / weight, holding its lease, before it goes upstream, at most max_delay_ms, where pressure grows
  * from 0 at pace_start to 1 at the full budget and keeps growing past it. Low weights wait longer.
  *
  * Busy shedding (when busy lines are set): while a source's requests in flight are at its busy line, a key with a
- * weight below busy_min_weight gets 503 server_busy with Retry-After instead of a worker; nothing waits in a worker
- * while the server is busy, since a waiting request holds the worker another request needs.
+ * weight below busy_min_weight gets 503 server_busy with Retry-After instead of a worker, and no pacing wait starts
+ * while the source is busy, since a waiting request holds the worker another request needs.
  */
 final class Throttle
 {
@@ -61,7 +61,7 @@ final class Throttle
         };
         $float = static function (string $k, float $default, float $min, float $max) use ($t): float {
             $v = $t[$k] ?? $default;
-            if ((!is_int($v) && !is_float($v)) || $v < $min || $v > $max) {
+            if ((!is_int($v) && !is_float($v)) || is_nan((float) $v) || $v < $min || $v > $max) {
                 throw new \InvalidArgumentException("config: throttle.$k must be a number from $min to $max");
             }
             return (float) $v;

@@ -77,9 +77,6 @@ final class Proxy
 
         $internal = self::internalCaller();
         [$weight, $delayMs] = $this->admission($key, $internal);
-        if ($delayMs > 0) {
-            usleep($delayMs * 1000);
-        }
 
         $lease = $this->ledger->reserve(
             $key['id'],
@@ -96,6 +93,13 @@ final class Proxy
         [$upstream, $started] = ['', hrtime(true)];
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
+            // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
+            if ($delayMs > 0) {
+                usleep($delayMs * 1000);
+                // The upstream time and duration start after the wait (delay_ms records the wait itself).
+                $started = hrtime(true);
+                $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
+            }
             if (!headers_sent()) {
                 header('X-Request-Id: ' . $lease['lease_id']); // the client can quote it; it is the lease id in the usage rows and the log
             }
@@ -647,7 +651,6 @@ final class Proxy
         return is_array($j) ? ['json' => $j, 'done' => false] : null;
     }
 
-    /** @return array{id: int, ref: string, balance: int, active: bool} */
     /**
      * Whether the request came from an internal caller, as the web server says in the VIRSILIPAS_SOURCE server variable
      * (a FastCGI parameter it sets from the client address). Only that variable counts: a client header of the same
@@ -698,6 +701,7 @@ final class Proxy
         return [$weight, $delay];
     }
 
+    /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} */
     private function authenticate(): array
     {
         $key = $this->ledger->findKey(Http::bearer());

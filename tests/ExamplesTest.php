@@ -56,3 +56,14 @@ function testExampleClientKeepsTheKeyOffTheCommandLine(): void
     same(2, $rc, 'a key option is not accepted');
     check(str_contains($err, 'unknown option: --key'), $err);
 }
+
+function testExamplesSendTheKeyOnlyOverHttpsOrToThisMachine(): void
+{
+    foreach (['http://proxy.example', 'ftp://proxy.example', 'http://127.0.0.1.example'] as $url) {
+        [$rc, $out, $err] = runExample('hello-world.php', ['hi'], 'some-key', ['VIRSILIPAS_URL' => $url]);
+        same([2, ''], [$rc, $out], "hello-world refuses $url");
+        [$rc, , $err] = runExample('client.php', ['balance'], 'some-key', ['VIRSILIPAS_URL' => $url]);
+        same(2, $rc, "client refuses $url");
+        check(str_contains($err, 'must be https'), $err);
+    }
+}
