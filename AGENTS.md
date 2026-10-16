@@ -13,6 +13,31 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 - **Fail closed.** Any doubt about the key, the balance or the database means the request is refused. The one exception is the throttle (`src/Throttle.php`): it only slows requests down and never authorizes anything, so when it cannot decide, the request goes ahead without a wait (logged `throttle_error`) and the hard limits still decide.
 - **Keep it small.** Each feature has to earn its lines. If something can be done by the firewall, the web server or the billing system, leave it there.
 
+## Governing law and ADRs
+
+- This file and the accepted ADRs in `docs/adr/` govern the project ([0001](docs/adr/0001-adrs-and-docs-are-governing-law.md)). One ADR decides one subject; it cites the invariants below instead of copying them.
+- A significant change of behaviour, interface, security or workflow adds or amends an ADR in the same commit (template: `docs/adr/0000-template.md`). Code that contradicts an accepted ADR is a bug unless the same commit amends the ADR.
+- When code and documents disagree, the code is what runs: fix whichever is wrong, in the same commit.
+
+| ADR | Decision |
+|---|---|
+| [0002](docs/adr/0002-nothing-deployment-specific-in-the-repository.md) | Nothing deployment-specific in the repository |
+| [0003](docs/adr/0003-php-without-dependencies-and-small.md) | PHP without dependencies, kept small |
+| [0004](docs/adr/0004-sqlite-ledger-upgraded-in-place.md) | One SQLite ledger, upgraded in place |
+| [0005](docs/adr/0005-credits.md) | Credits |
+| [0006](docs/adr/0006-prepaid-balance-grants-pushed-by-billing.md) | Prepaid balance; billing pushes grants |
+| [0007](docs/adr/0007-reserve-then-settle.md) | Reserve, then settle |
+| [0008](docs/adr/0008-missing-usage-is-charged-an-upper-bound.md) | Missing usage is charged an upper bound |
+| [0009](docs/adr/0009-append-only-credit-log.md) | The append-only credit log is the audit trail |
+| [0010](docs/adr/0010-fail-closed-and-strict-config.md) | Fail closed; strict configuration |
+| [0011](docs/adr/0011-no-retry-after-possible-output.md) | No retry or failover after possible output |
+| [0012](docs/adr/0012-limits-and-caps-refuse-never-shorten.md) | Limits and caps refuse, never shorten |
+| [0013](docs/adr/0013-the-client-contract.md) | The client contract |
+| [0014](docs/adr/0014-privacy-no-bodies-minimal-logs.md) | Privacy: no bodies stored or logged |
+| [0015](docs/adr/0015-the-key-is-the-access.md) | The key is the access |
+| [0016](docs/adr/0016-throttle-slows-never-blocks.md) | The throttle slows, never blocks |
+| [0017](docs/adr/0017-releases-and-safe-deploys.md) | Releases are tags; safe deploys |
+
 ## Invariants the tests protect
 
 1. A key never spends more than its balance. Reservation clamps `max_tokens` and is atomic (`BEGIN IMMEDIATE`); the charge never exceeds the reservation.

@@ -20,6 +20,8 @@ mcxVirsilipas is open source under the Apache License 2.0. Anyone may run their 
 
 Nothing about a particular deployment is in this repository. Upstream providers, model names, prices, keys, hostnames and addresses live only in your `config.php` and key files, which are never committed (`.gitignore` covers them, and `tests/SecretGuardTest.php` fails if one is tracked). Keep it that way in your own fork.
 
+The design decisions behind the code, with the options that were turned down, are in [docs/adr/](docs/adr/); the full HTTP API is in [docs/API.md](docs/API.md).
+
 ## No warranty: use at your own risk
 
 The software is provided "as is", without warranties or conditions of any kind, and the authors are not liable for any damages arising from its use; sections 7 and 8 of the [License](LICENSE) are the binding text. Your mileage may vary. In particular:
