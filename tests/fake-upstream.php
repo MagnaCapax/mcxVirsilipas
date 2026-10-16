@@ -24,10 +24,11 @@ file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPE
 $model = (string) ($req['model'] ?? '');
 $chunks = 10;
 $prompt = 11;
-$usage = static fn (int $completion): array => [
+// scenario-no-cost is an upstream that reports no cost of its own.
+$usage = static fn (int $completion): array => array_diff_key([
     'prompt_tokens' => $prompt, 'completion_tokens' => $completion, 'total_tokens' => $prompt + $completion,
     'estimated_cost' => 0.0001, 'prompt_tokens_details' => ['cached_tokens' => 0, 'private_account' => 'PRIVATE-DETAIL'],
-];
+], $model === 'scenario-no-cost' ? ['estimated_cost' => 1] : []);
 $event = static function (array $data): void {
     echo 'data: ' . json_encode($data) . "\n\n";
     flush();

@@ -34,7 +34,10 @@ return [
     // messages, max_tokens, max_completion_tokens, stream, stream_options, n) cannot be set this way.
     'models' => [
         'default' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'description' => 'fast, everyday tasks',
-            'route' => [['upstream' => 'main', 'model' => 'example-org/example-model'], ['upstream' => 'spare', 'model' => 'example-org/example-model']]],
+            'route' => [['upstream' => 'main', 'model' => 'example-org/example-model'],
+                // 'cost': this upstream's own prices in millionths of its currency unit per million tokens (0.30 = 300000),
+                // recorded as the usage row's upstream cost when the upstream reports none itself. Never shown to clients.
+                ['upstream' => 'spare', 'model' => 'example-org/example-model', 'cost' => ['input' => 300000, 'cached_input' => 30000, 'output' => 1200000]]]],
         // 'default-think' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'params' => ['reasoning_effort' => 'high'],
         //     'route' => [['upstream' => 'main', 'model' => 'example-org/example-model']]],
     ],

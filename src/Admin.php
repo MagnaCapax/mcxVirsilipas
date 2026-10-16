@@ -53,7 +53,7 @@ final class Admin
     }
 
     /**
-     * POST /admin/keys/limits {"ref", "max_concurrent"?, "requests_per_minute"?, "credits_per_minute"?, "bonus_pct"?}:
+     * POST /admin/keys/limits {"ref", "max_concurrent"?, "requests_per_minute"?, "credits_per_minute"?, "bonus_pct"?, "key_group"?}:
      * a given limit is set to a positive integer, or to null to follow the configured default again;
      * limits not given are left as they are. Returns the key's own settings and the limits in force.
      */
@@ -72,13 +72,26 @@ final class Admin
             }
             unset($b['bonus_pct']);
         }
+        // The key's group (for usage statistics) rides along the same way.
+        $newGroup = null;
+        if (array_key_exists('key_group', $b)) {
+            $newGroup = $b['key_group'];
+            if (!Ledger::validGroup($newGroup)) {
+                throw new HttpError(400, 'key_group must be at most 64 of a-z, 0-9, dot, dash and underscore');
+            }
+            unset($b['key_group']);
+        }
         $overrides = $this->ledger->setLimits($ref, $b);
         if ($newBonus !== null) {
             $this->ledger->setBonus($ref, $newBonus);
         }
-        $bonus = $this->ledger->status($ref, $this->config->limitDefaults())['bonus_pct'];
-        Log::write('info', 'key_limits', ['ref' => $ref, 'bonus_pct' => $bonus] + $overrides);
-        Http::json(200, ['ref' => $ref, 'overrides' => $overrides, 'limits' => Ledger::effectiveLimits($overrides, $this->config->limitDefaults()), 'bonus_pct' => $bonus]);
+        if ($newGroup !== null) {
+            $this->ledger->setGroup($ref, $newGroup);
+        }
+        $s = $this->ledger->status($ref, $this->config->limitDefaults());
+        Log::write('info', 'key_limits', ['ref' => $ref, 'bonus_pct' => $s['bonus_pct'], 'key_group' => $s['key_group']] + $overrides);
+        Http::json(200, ['ref' => $ref, 'overrides' => $overrides, 'limits' => Ledger::effectiveLimits($overrides, $this->config->limitDefaults()),
+            'bonus_pct' => $s['bonus_pct'], 'key_group' => $s['key_group']]);
     }
 
     /** @return array<string, mixed> */

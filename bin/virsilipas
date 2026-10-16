@@ -19,14 +19,15 @@ Usage: virsilipas <command> [args]
   limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
                                     credits_per_minute; 'default' follows the config again
   bonus <ref> <0..300>              set a key's bonus percent, which raises its priority weight
+  group <ref> <name|->              set a key's group for stats (- for none): a-z, 0-9, . _ -
   status <ref>                      show balance, holds, limits and the last minute's use
   history <ref> [N]                 show the last N credit changes (default 100), newest first
   verify                            check every balance against its credit log; exit 1 on a mismatch
-  stats <hour|day|month|all> [by] [since] [until]
+  stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
                                     usage over time, one JSON line per UTC bucket and group: requests,
                                     tokens, credits, upstream-reported cost, hang-ups, failures,
                                     requests slowed down and the mean delay;
-                                    by = comma list of model,upstream,key,status (or -); since/until =
+                                    by = comma list of model,upstream,key,status,source,group (or -); since/until =
                                     YYYY-MM-DD (UTC, until exclusive)
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
@@ -46,6 +47,7 @@ try {
         'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
         'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
         'bonus' => json_encode(['ref' => arg($args, 0), 'bonus_pct' => $ledger->setBonus(arg($args, 0), intArg($args, 1))]),
+        'group' => json_encode(['ref' => arg($args, 0), 'key_group' => $ledger->setGroup(arg($args, 0), arg($args, 1) === '-' ? '' : arg($args, 1))]),
         'status' => json_encode($ledger->status(arg($args, 0), $config->limitDefaults())),
         'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
         'verify' => verifyOrExit($ledger),

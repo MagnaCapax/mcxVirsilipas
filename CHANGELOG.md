@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.6.0 (2026-10-16)
+
+Schema 5 to 6: `usage` gains `source` and `cost_computed`, `keys` gains `key_group`. `init` upgrades a schema-2 to 5 ledger in place; existing usage rows count as external with a reported (or no) cost, and keys have no group. An older release's `init` refuses a schema-6 ledger.
+
+- **More ways to cut usage.** `stats` buckets add `week`, `hour_of_day` (all days folded into 00 to 23 UTC) and `weekday`; grouping adds `source` (internal or external) and `group`.
+- **Key groups.** `bin/virsilipas group <ref> <name|->` and `key_group` in `POST /admin/keys/limits` put a key in an operator-chosen group, for example its plan; `status` shows it.
+- **Cost where the upstream reports none.** A route entry may set `cost` (that upstream's prices in millionths of its currency unit per million tokens). When the upstream that served a request reports no cost of its own, the usage row records the cost computed from those prices and flags it `cost_computed`; `stats` counts such rows as `computed_cost_requests`. An upstream's own reported cost always wins. Clients never see either.
 ## v0.5.0 (2026-10-16)
 
 Schema 4 to 5: `keys` gains `bonus_pct`, `leases` gains `source`, `usage` gains `delay_ms`, plus an index on open leases by source and a `spend_hourly` table (credits charged per UTC hour, kept by settling and filled from the existing usage rows on upgrade). `init` upgrades a schema-2, 3 or 4 ledger in place; existing rows get the defaults (no bonus, external, no wait). An older release's `init` refuses a schema-5 ledger. Configs without a `throttle` block load unchanged and behave as before.

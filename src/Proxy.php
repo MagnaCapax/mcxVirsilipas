@@ -90,7 +90,7 @@ final class Proxy
         );
 
         $result = self::attemptResult(0);
-        [$upstream, $started] = ['', hrtime(true)];
+        [$upstream, $servedHop, $started] = ['', 0, hrtime(true)];
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
             // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
@@ -115,7 +115,7 @@ final class Proxy
                     $result = self::attemptResult(0, 'next');
                     continue;
                 }
-                $upstream = (string) parse_url($route['url'], PHP_URL_HOST); // which upstream served it, for tracking per upstream
+                [$upstream, $servedHop] = [(string) parse_url($route['url'], PHP_URL_HOST), $hop]; // which upstream served it, for tracking per upstream
                 $body = self::rewrite($req, $route['model'], $lease['max_tokens'], $stream, $route['stream_options'], $route['params']);
                 for ($try = 0; $try <= $this->config->retries; $try++) {
                     if (connection_aborted()) {
@@ -150,6 +150,11 @@ final class Proxy
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs];
+            // An upstream that reports no cost of its own is costed from the route entry's configured prices, flagged as computed.
+            $price = $this->config->routes[$alias][$servedHop]['cost'];
+            if ($meta['cost'] === null && $price !== null && $result['usage'] !== null) {
+                $meta = array_replace($meta, ['cost' => self::usageCredits($result['usage'], $result['unmetered'], $price), 'cost_computed' => true]);
+            }
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
             self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
         }

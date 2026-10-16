@@ -25,7 +25,7 @@ final class Config
     /** @var array<string, array{description: string, context_length: ?int}> alias => what /v1/models shows about it besides its rates */
     public readonly array $info;
     /**
-     * @var array<string, list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}>>
+     * @var array<string, list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>>
      * alias => its upstreams in failover order: where each request goes, the model id it asks for and the request fields set there
      */
     public readonly array $routes;
@@ -179,13 +179,36 @@ final class Config
     }
 
     /**
+     * A route entry's optional `cost`: what the upstream charges, in millionths of its own currency unit per million
+     * tokens (fresh input, cached input, output). Used only to record a cost for requests whose upstream reports none.
+     * @param array<string, mixed> $h
+     * @return ?array{input: int, cached_input: int, output: int}
+     */
+    private static function cost(array $h, string $at): ?array
+    {
+        if (!array_key_exists('cost', $h)) {
+            return null;
+        }
+        $c = $h['cost'];
+        if (!is_array($c) || count($c) !== 3 || array_diff(['input', 'cached_input', 'output'], array_keys($c)) !== []) {
+            throw new \InvalidArgumentException("config: {$at}cost must set exactly input, cached_input and output");
+        }
+        foreach ($c as $k => $v) {
+            if (!is_int($v) || $v < 0 || $v > Credits::MAX_RATE) {
+                throw new \InvalidArgumentException("config: {$at}cost.$k must be an integer from 0 to " . Credits::MAX_RATE);
+            }
+        }
+        return ['input' => $c['input'], 'cached_input' => $c['cached_input'], 'output' => $c['output']];
+    }
+
+    /**
      * A model's upstreams in failover order. A model either lists them ('route': upstream name, model id and
      * optional params per entry), or names one model id served by its own url and key_file, or by the global upstream.
      * Params are merged per entry: the model's, then the entry's on top.
      * @param array<string, mixed> $m
      * @param array<string, array{url: string, key_file: string, stream_options: array<string, mixed>}> $upstreams
      * @param array<string, mixed> $params
-     * @return list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}>
+     * @return list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>
      */
     private function hops(string $alias, array $m, array $upstreams, array $params): array
     {
@@ -202,10 +225,10 @@ final class Config
                 if (!is_array($h) || !is_string($h['upstream'] ?? null) || !isset($upstreams[$h['upstream']])) {
                     throw new \InvalidArgumentException("config: {$at}upstream must name an entry of upstreams");
                 }
-                if (array_diff(array_keys($h), ['upstream', 'model', 'params']) !== []) {
-                    throw new \InvalidArgumentException("config: {$at} may only set upstream, model and params");
+                if (array_diff(array_keys($h), ['upstream', 'model', 'params', 'cost']) !== []) {
+                    throw new \InvalidArgumentException("config: {$at} may only set upstream, model, params and cost");
                 }
-                $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params];
+                $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params, 'cost' => self::cost($h, $at)];
             }
             return $hops;
         }
@@ -224,7 +247,7 @@ final class Config
             throw new \InvalidArgumentException("config: models.$alias has no upstream: give it a route, its own url and key_file, or set upstream_url");
         }
         $u['stream_options'] = isset($m['stream_options']) ? self::streamOptions($m, 'stream_options', "models.$alias.") : $this->streamOptions;
-        return [$u + ['model' => $m['model'], 'params' => $params]];
+        return [$u + ['model' => $m['model'], 'params' => $params, 'cost' => null]];
     }
 
     /**

@@ -537,7 +537,7 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     same(401, http('POST', '/admin/keys/limits', $set, $key)['status'], 'a client key is not the admin token');
     $r = json_decode(http('POST', '/admin/keys/limits', $set, 'admin-secret')['body'], true);
     same(['ref' => $ref, 'overrides' => ['max_concurrent' => null, 'requests_per_minute' => 1, 'credits_per_minute' => null],
-        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null], 'bonus_pct' => 0], $r);
+        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null], 'bonus_pct' => 0, 'key_group' => ''], $r);
     same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'burst' => 3], 'admin-secret')['status'], 'unknown limit');
     same(404, http('POST', '/admin/keys/limits', ['ref' => 'nobody-' . $ref, 'max_concurrent' => 2], 'admin-secret')['status']);
 
@@ -563,6 +563,11 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     }
     $s = Harness::get()['ledger']->status($ref, lim(5));
     same([300, null], [$s['bonus_pct'], $s['overrides']['requests_per_minute']], 'a refused request changes nothing, not even its valid fields');
+    same('pro', json_decode(http('POST', '/admin/keys/limits', ['ref' => $ref, 'key_group' => 'pro'], 'admin-secret')['body'], true)['key_group'], 'group set');
+    foreach (['Pro', 'a b', 7, null] as $bad) {
+        same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'bonus_pct' => 0, 'key_group' => $bad], 'admin-secret')['status'], 'key_group ' . var_export($bad, true) . ' refused');
+    }
+    same(['pro', 300], [Harness::get()['ledger']->status($ref, lim(5))['key_group'], Harness::get()['ledger']->status($ref, lim(5))['bonus_pct']], 'a refused group changes nothing');
     same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'back to the default: no limit');
 }
 function testIntegrationStreamStopsWhenTheCreditsPassTheReservation(): void

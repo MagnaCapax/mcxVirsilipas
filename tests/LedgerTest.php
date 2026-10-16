@@ -395,14 +395,14 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(5, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(6, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');
     $l->migrate(); // re-running init adds nothing
     same(1, (int) $db->query('SELECT COUNT(*) FROM usage')->fetchColumn());
     same([['bucket' => '1970-01-02', 'model' => 'm', 'requests' => 1, 'prompt_tokens' => 7, 'cached_tokens' => 2, 'completion_tokens' => 3, 'reasoning_tokens' => 0,
-        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0, 'delayed' => 0, 'mean_delay_ms' => 0]], $l->stats('day', ['model']));
+        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'computed_cost_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0, 'delayed' => 0, 'mean_delay_ms' => 0]], $l->stats('day', ['model']));
 }
 
 function testStatsGroupsUsageByTimeAndDimension(): void
@@ -431,7 +431,7 @@ function testStatsGroupsUsageByTimeAndDimension(): void
     $byHour = array_map(static fn (array $r): array => [$r['bucket'], $r['model'], $r['status'], $r['requests']], $l->stats('hour', ['model', 'status'], 3600 * 24 * 10, 3600 * 24 * 11));
     same([['1970-01-11T00', 'a', 200, 1], ['1970-01-11T02', 'a', 200, 1], ['1970-01-11T02', 'b', 502, 1]], $byHour, 'since inclusive, until exclusive');
     same(['a'], array_column($l->stats('month', ['key']), 'key'), 'grouped by the key ref');
-    check(refusesArgument(fn () => $l->stats('week')), 'unknown bucket refused');
+    check(refusesArgument(fn () => $l->stats('fortnight')), 'unknown bucket refused');
     check(refusesArgument(fn () => $l->stats('day', ['ts; DROP TABLE usage'])), 'only the fixed groupings reach SQL');
 }
 

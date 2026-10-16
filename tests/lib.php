@@ -88,6 +88,10 @@ function configArrayFor(string $dir, array $overrides = []): array
         $models[$alias] = ['route' => [$hop('primary', $first), $hop('backup', $second)]] + unitRates();
     }
     $models['flaky'] = ['model' => 'scenario-flaky'] + unitRates();
+    // Upstream prices (millionths of its unit per million tokens), used only when the upstream reports no cost itself.
+    $price = ['cost' => ['input' => 300_000, 'cached_input' => 30_000, 'output' => 1_200_000]];
+    $models['costed'] = ['route' => [$hop('primary', 'scenario-no-cost') + $price]] + unitRates();
+    $models['costed-reported'] = ['route' => [$hop('primary', 'scenario-ok') + $price]] + unitRates();
     $models['flaky-hint'] = ['model' => 'scenario-flaky-hint'] + unitRates();
     $models['no-key-first'] = ['route' => [$hop('nokey', 'scenario-ok'), $hop('backup', 'scenario-ok')]] + unitRates();
     // An upstream nothing listens on (the harness leaves its port-1 url as it is).
