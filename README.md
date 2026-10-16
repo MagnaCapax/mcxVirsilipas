@@ -296,6 +296,10 @@ The end-to-end tests start a fake upstream and seven proxy processes with the PH
 
 CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on PHP 8.2, 8.3 and 8.4, keeps the test output when a run fails, and runs PHPStan as an advisory check that reports but does not fail the build.
 
+## Reporting security issues
+
+Please report vulnerabilities privately to support@pulsedmedia.com, not in a public issue. Include the version (or commit), what you found and how to reproduce it.
+
 ## Attribution
 
 Author: Aleksi Ursin / MCX (with Väinämöinen) — [Pulsed Media](https://pulsedmedia.com)
