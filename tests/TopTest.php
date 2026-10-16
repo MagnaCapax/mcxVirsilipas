@@ -56,6 +56,8 @@ function testTopShowsRateLatencyCostAndRecentRequestsAsMetadataOnly(): void
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(10), 60); // one request still in flight
     $out = Top::render($l, ['spend' => [], 'requests_per_minute' => null], time());
     check(str_contains($out, 'in flight 1 (internal 0, external 1'), $out);
+    check((bool) preg_match('/^In flight, oldest first\n\s+ref\s+source\s+age s\s+reserved\n\s+a\s+external\s+\d+\s+\d+$/m', $out),
+        "the request in flight is listed by key, source, age and reservation:\n$out");
     check(str_contains($out, 'caps: none set'), 'no caps configured');
     check((bool) preg_match('/^requests\s+3\s+3\s+3$/m', $out), "three requests in every window:\n$out");
     check((bool) preg_match('/^failed\s+1 \(33%\)/m', $out), 'one failure of three');
@@ -67,11 +69,32 @@ function testTopShowsRateLatencyCostAndRecentRequestsAsMetadataOnly(): void
         "a failed request shows no first byte and its flags:\n$out");
 }
 
+function testTopStreamsABusyHourInSmallMemory(): void
+{
+    [$l, $id, $db] = ledgerWithHandle(10);
+    $now = time();
+    $db->beginTransaction();
+    $st = $db->prepare("INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, first_byte_ms, attempts, upstream_cost)
+        VALUES (?, ?, ?, 'chat-small', 100, 50, 0, 5, 5, 200, 0, 0, 0, 'llm.example.com', 1, 900, 300, 1, 20)");
+    for ($i = 0; $i < 30000; $i++) {
+        $st->execute([$now - $i % 3600, $id, $i + 1]);
+    }
+    $db->commit();
+    gc_collect_cycles();
+    memory_reset_peak_usage();
+    $before = memory_get_usage();
+    $out = Top::render($l, ['spend' => [], 'requests_per_minute' => null], $now);
+    $grew = memory_get_peak_usage() - $before;
+    check((bool) preg_match('/^requests\s+\d+\s+\d+\s+30000$/m', $out), "every row of the hour is counted:\n$out");
+    check($grew < 16 * 1024 * 1024, "30,000 rows rendered within 16 MB of extra memory (grew $grew bytes)");
+}
+
 function testTopWithNoTrafficSaysSo(): void
 {
     [$l] = ledgerWithHandle(10);
     $out = Top::render($l, ['spend' => [], 'requests_per_minute' => null], time());
     check(str_contains($out, '(no requests in the last hour)') && str_contains($out, '(no requests)'), $out);
+    check(str_contains($out, "In flight, oldest first\n  (none)"), 'nothing in flight');
     check((bool) preg_match('/^duration p50 ms\s+-\s+-\s+-$/m', $out), 'no latency without requests');
 }
 

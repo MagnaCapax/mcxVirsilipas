@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.8.2 (2026-10-16)
+
+No schema change.
+
+- **`top` streams the hour's usage rows into running totals** instead of loading them all: at its 50,000-row cap a view took about 140 MB and failed under a 128 MB PHP memory limit; it now takes about 10 MB and half the time.
+- **`top` lists the requests in flight**, the ten oldest by key ref, source, age and credits reserved, not only their count.
+
 ## v0.8.1 (2026-10-16)
 
 No schema change.

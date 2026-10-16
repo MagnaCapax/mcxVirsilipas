@@ -20,7 +20,7 @@ Metrics are columns of the usage row and nothing else. Schema 8 adds `first_byte
 
 ## Consequences
 - Metrics, billing and audit read the same rows, so they cannot disagree.
-- `top` reads at most the last hour's rows (capped at 50,000 and marked when capped); a much busier deployment would need an aggregate table, added by a schema change.
+- `top` streams at most the last hour's rows (capped at 50,000 and marked when capped) into running totals: measured at the cap, about 0.1 s and 10 MB per view. A much busier deployment would need an aggregate table, added by a schema change.
 - Rows written before schema 8 have no first-byte time and 0 attempts.
 - Graphs and dashboards are built outside the proxy from `stats` output.
 

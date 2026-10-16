@@ -367,21 +367,20 @@ final class Ledger
 
     /**
      * The usage rows of requests settled at or after $since, newest first, at most $limit: the per-request performance and
-     * cost metadata, never any content (none is stored).
-     * @return list<array{ts: int, ref: string, model: string, upstream: string, status: int, stream: bool, source: string,
+     * cost metadata, never any content (none is stored). Rows are read one at a time, so a busy hour does not sit in memory.
+     * @return \Generator<int, array{ts: int, ref: string, model: string, upstream: string, status: int, stream: bool, source: string,
      *     duration_ms: int, first_byte_ms: ?int, delay_ms: int, attempts: int, prompt_tokens: int, completion_tokens: int,
      *     cached_tokens: int, reasoning_tokens: int, charged: int, upstream_cost: ?int, aborted: bool, estimated: bool}>
      */
-    public function recentUsage(int $since, int $limit): array
+    public function recentUsage(int $since, int $limit): \Generator
     {
         $st = $this->db->prepare('SELECT u.ts, k.ref, u.model, u.upstream, u.http_status, u.stream, u.source, u.duration_ms, u.first_byte_ms,
                 u.delay_ms, u.attempts, u.prompt_tokens, u.completion_tokens, u.cached_tokens, u.reasoning_tokens, u.charged, u.upstream_cost,
                 u.aborted, u.estimated
             FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? ORDER BY u.id DESC LIMIT ?');
         $st->execute([$since, max(1, min($limit, 100000))]);
-        $rows = [];
-        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
-            $rows[] = ['ts' => (int) $r['ts'], 'ref' => (string) $r['ref'], 'model' => (string) $r['model'], 'upstream' => (string) $r['upstream'],
+        while (($r = $st->fetch(\PDO::FETCH_ASSOC)) !== false) {
+            yield ['ts' => (int) $r['ts'], 'ref' => (string) $r['ref'], 'model' => (string) $r['model'], 'upstream' => (string) $r['upstream'],
                 'status' => (int) $r['http_status'], 'stream' => (bool) $r['stream'], 'source' => (int) $r['source'] === 1 ? 'internal' : 'external',
                 'duration_ms' => (int) $r['duration_ms'], 'first_byte_ms' => $r['first_byte_ms'] === null ? null : (int) $r['first_byte_ms'],
                 'delay_ms' => (int) $r['delay_ms'], 'attempts' => (int) $r['attempts'], 'prompt_tokens' => (int) $r['prompt_tokens'],
@@ -389,6 +388,24 @@ final class Ledger
                 'reasoning_tokens' => (int) $r['reasoning_tokens'], 'charged' => (int) $r['charged'],
                 'upstream_cost' => $r['upstream_cost'] === null ? null : (int) $r['upstream_cost'], 'aborted' => (bool) $r['aborted'],
                 'estimated' => (bool) $r['estimated']];
+        }
+        $st->closeCursor();
+    }
+
+    /**
+     * The requests in flight now (unsettled, unexpired leases), oldest first, at most $limit: the key's ref, the source,
+     * the age in seconds and the credits reserved. A lease records no model, so none is shown.
+     * @return list<array{ref: string, source: string, age_s: int, reserved: int}>
+     */
+    public function inFlightRequests(int $now, int $limit): array
+    {
+        $st = $this->db->prepare('SELECT k.ref, l.source, l.created_at, l.reserved FROM leases l JOIN keys k ON k.id = l.key_id
+            WHERE l.settled = 0 AND l.expires_at > ? ORDER BY l.id LIMIT ?');
+        $st->execute([$now, max(1, min($limit, 1000))]);
+        $rows = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $rows[] = ['ref' => (string) $r['ref'], 'source' => (int) $r['source'] === 1 ? 'internal' : 'external',
+                'age_s' => max(0, $now - (int) $r['created_at']), 'reserved' => (int) $r['reserved']];
         }
         return $rows;
     }
