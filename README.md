@@ -127,6 +127,8 @@ The database holds every balance, so back it up. Do not copy the file while the 
 sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).sqlite'"
 ```
 
+If you back up with `.dump` (SQL text) instead, carry the schema version with it: `sqlite3 DB .dump "SELECT 'PRAGMA user_version = ' || user_version || ';' FROM pragma_user_version;"`. A plain `.dump` omits `user_version`, and the proxy refuses a database whose version it cannot read.
+
 To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
 
 ## Releasing and upgrading
