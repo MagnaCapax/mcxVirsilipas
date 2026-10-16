@@ -2,6 +2,17 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.7.1 (2026-10-16)
+
+No schema change.
+
+- **A misspelt setting is refused.** Config now refuses a key it does not know at every level (top level, `models` entries, `upstreams` entries, route entries), naming the key; before, a typo such as `cap` for `caps` was ignored and the limit it meant to set silently did not exist. `params` and `stream_options` stay free maps (they are sent upstream). A config that uses only documented settings loads unchanged.
+- **Key rotation for a leaked key:** `bin/virsilipas key-rotate <ref>` and `POST /admin/keys/rotate` replace a ref's key with a new one, returned once. The old key answers 401 at once; balance, limits, credit log and usage stay with the ref. Before, a leaked key could only be disabled, which locked its user out with the balance on it.
+- **`deploy.php` checks the config with the new release before stopping anything.** A config the new release refuses now stops the deploy while the old release keeps serving, instead of failing at `init` after php-fpm stopped and rolling back. A failed `systemctl stop` is now inside the rollback too, so php-fpm is always started again.
+- **`tools/bench.php` refuses plain http off this machine**, like the example clients: the key travels with every request.
+- **Repository:** SECURITY.md (private vulnerability reports), CI runs with a read-only token. The test suite removes its temporary directories and starts its servers again on new ports when one could not bind (another process took the port), instead of testing against whatever answered there.
+- **README:** the install steps run the CLI as the PHP user (run as root, they created a database php-fpm could not open), a health check, what failing closed means, that a settled cost above its bound can end a window above its cap, the SQLite 3.25 minimum, the `cap_log_error` log event, and one corrected pacing figure (63 ms, not 62).
+
 ## v0.7.0 (2026-10-16)
 
 Schema 6 to 7: `leases` gains `cost_reserved` (the upper bound of a running request's upstream cost) and an index on `created_at`; `spend_hourly` gains `cost` (upstream cost settled per UTC hour, filled from the existing usage rows on upgrade). `init` upgrades a schema-2 to 6 ledger in place. An older release's `init` refuses a schema-7 ledger. Configs without a `caps` block load unchanged and behave as before.
@@ -10,6 +21,7 @@ Schema 6 to 7: `leases` gains `cost_reserved` (the upper bound of a running requ
 - **Cost for answers delivered without a usage report.** When the upstream reports neither usage nor cost, the cost is computed from the estimated counts charged and flagged `cost_computed`.
 - **`bin/virsilipas caps`** shows each cap, what is settled, what running requests hold, what remains and when the window resets. Refusals are logged as `capped` (info); a cost that carries a window past 80% or 100% of its cap logs `spend_cap_crossed` (warn).
 - **README:** running your own copy, a no-warranty section, and one table of every cost and rate control (per key, whole server, web server, provider).
+
 ## v0.6.1 (2026-10-16)
 
 No schema change.

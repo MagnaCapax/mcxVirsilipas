@@ -37,7 +37,8 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 
 ```
 public/index.php   front controller and routes
-src/Config.php     config loading and validation
+src/bootstrap.php  autoloader, private umask, config path (VIRSILIPAS_CONFIG)
+src/Config.php     config loading and validation; every level refuses a setting it does not have
 src/Ledger.php     SQLite: keys, grants, leases, usage, per-key limits, credit log
 src/Credits.php    credit arithmetic
 src/Throttle.php   priority weight, spend pacing and busy shedding (soft); the hard caps live in Config and Ledger::reserve

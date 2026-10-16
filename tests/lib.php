@@ -34,6 +34,18 @@ function tempDir(): string
 {
     $d = sys_get_temp_dir() . '/virsilipas-test-' . bin2hex(random_bytes(4));
     mkdir($d, 0700);
+    // Removed when the run ends (after Harness::stop), so repeated runs leave nothing behind; kept when a test failed, for its logs.
+    register_shutdown_function(static function () use ($d): void {
+        if (defined('VIRSILIPAS_TESTS_FAILED')) {
+            fwrite(STDERR, "kept for inspection: $d\n");
+            return;
+        }
+        $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($d, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
+        foreach ($it as $f) {
+            $f->isDir() && !$f->isLink() ? @rmdir($f->getPathname()) : @unlink($f->getPathname());
+        }
+        @rmdir($d);
+    });
     return $d;
 }
 
@@ -141,23 +153,32 @@ final class Harness
         $dir = tempDir();
         file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
         file_put_contents("$dir/second.key", "second-upstream-key\n");
-        $up = self::freePort();
-        $ports = array_map(static fn () => self::freePort(), range(1, 7));
         mkdir("$dir/logs", 0700);
-        $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
-        $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
-        $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
-        $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
-        file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
-        $root = dirname(__DIR__);
-        $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
-        self::spawn([PHP_BINARY, '-S', "127.0.0.1:$up", "$root/tests/fake-upstream.php"], $env, "$dir/upstream.log");
-        // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
-        foreach ($ports as $px) {
-            self::spawn([PHP_BINARY, '-S', "127.0.0.1:$px", "$root/public/index.php"], $env, "$dir/proxy-$px.log");
+        // A free port can be taken by another process before php -S binds it; that server then exits and the
+        // port answers for someone else. Every server must still be running after the wait, or all start again on new ports.
+        for ($attempt = 1; ; $attempt++) {
+            $up = self::freePort();
+            $ports = array_map(static fn () => self::freePort(), range(1, 7));
+            $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
+            $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+            $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
+            $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+            file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
+            $root = dirname(__DIR__);
+            $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+            self::spawn([PHP_BINARY, '-S', "127.0.0.1:$up", "$root/tests/fake-upstream.php"], $env, "$dir/upstream.log");
+            // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
+            foreach ($ports as $px) {
+                self::spawn([PHP_BINARY, '-S', "127.0.0.1:$px", "$root/public/index.php"], $env, "$dir/proxy-$px.log");
+            }
+            self::waitPort($up);
+            array_map([self::class, 'waitPort'], $ports);
+            if (array_filter(self::$procs, static fn ($p): bool => !proc_get_status($p)['running']) === []) {
+                break;
+            }
+            self::stop();
+            check($attempt < 3, 'test servers could not bind their ports three times');
         }
-        self::waitPort($up);
-        array_map([self::class, 'waitPort'], $ports);
         $ledger = new Ledger(Config::load("$dir/config.php")->dbPath);
         $ledger->migrate();
         $urls = array_map(static fn (int $p): string => "http://127.0.0.1:$p", $ports);

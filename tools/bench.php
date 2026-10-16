@@ -46,6 +46,11 @@ function options(array $argv): array
         fwrite(STDERR, "--url and a key (--key-file or VIRSILIPAS_BENCH_KEY) are required\n");
         exit(2);
     }
+    // The key travels with every request: https, or plain http only to this machine (as the example clients require).
+    if (!preg_match('#^(https://|http://(127\.0\.0\.1|localhost)[:/])#', $o['url'] . '/')) {
+        fwrite(STDERR, "--url must be https (plain http only to 127.0.0.1 or localhost)\n");
+        exit(2);
+    }
     $o['url'] = rtrim($o['url'], '/');
     return $o;
 }

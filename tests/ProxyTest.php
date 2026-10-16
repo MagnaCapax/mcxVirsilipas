@@ -162,6 +162,8 @@ function testConfigValidation(): void
 {
     $dir = tempDir();
     new Config(configArrayFor($dir));
+    // The example a self-hoster copies must load as it is: a setting it names that Config does not know would stop every first run.
+    new Config(require dirname(__DIR__) . '/config.example.php');
     $bad = [
         ['lease_seconds' => 30],                       // not longer than upstream_timeout
         ['models' => []],
@@ -177,6 +179,21 @@ function testConfigValidation(): void
     $bad[] = ['models' => ['a' => $model + ['url' => 'http://other.example.com/v1/chat/completions', 'key_file' => '/k']]];
     $bad[] = ['models' => ['a' => $model + ['key_file' => '']]];
     $bad[] = ['models' => ['a' => $model + ['stream_options' => ['include_usage' => false]]]];
+    // A misspelt setting is refused at every level, so a typo never silently drops a limit.
+    $bad[] = ['cap' => ['day' => 1]];
+    $bad[] = ['models' => ['a' => $model + ['max_tokens' => 10]]];
+    $rates = ['input' => 1, 'cached_input' => 1, 'output' => 1];
+    $u = ['url' => 'https://llm.example.com/v1/chat/completions', 'key_file' => '/k'];
+    $routed = ['a' => ['route' => [['upstream' => 'u', 'model' => 'm']]] + $rates];
+    new Config(configArrayFor($dir, ['upstreams' => ['u' => $u], 'models' => $routed]));   // the base of the next two is valid
+    $bad[] = ['upstreams' => ['u' => $u + ['keyfile' => '/k']], 'models' => $routed];
+    $bad[] = ['upstreams' => ['u' => $u], 'models' => ['a' => ['route' => [['upstream' => 'u', 'model' => 'm', 'costs' => []]]] + $rates]];
+    try {
+        new Config(configArrayFor($dir, ['cap' => ['day' => 1]]));
+        throw new \RuntimeException('accepted a misspelt top-level key');
+    } catch (\InvalidArgumentException $e) {
+        same(true, str_contains($e->getMessage(), 'config: cap is not a setting here'), 'the refusal names the unknown key');
+    }
     foreach ($bad as $override) {
         try {
             new Config(configArrayFor($dir, $override));

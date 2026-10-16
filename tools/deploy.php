@@ -7,7 +7,7 @@ declare(strict_types=1);
 //   php tools/deploy.php --url https://proxy.example.com v0.2.0
 //
 // 1. fetch the mirror and resolve the tag; unpack it into RELEASES/<tag> (git archive, no .git)
-// 2. lint it, wait for in-flight requests to finish, stop php-fpm
+// 2. lint it, check that it accepts the config, wait for in-flight requests to finish, stop php-fpm
 // 3. back up the ledger (SQLite online backup + integrity check)
 // 4. run `init` as the PHP user (schema migrations), point the CURRENT symlink at the release,
 //    run `verify` (every balance equals its credit log), start php-fpm
@@ -94,6 +94,10 @@ if (is_dir($release)) {
 foreach (array_merge(glob("$release/{src,public,tools}/*.php", GLOB_BRACE) ?: [], ["$release/bin/virsilipas"]) as $f) {
     run(['php', '-l', $f]);
 }
+// The new release must accept the config before anything stops: a setting it refuses fails here, with the old release still serving.
+run(['runuser', '-u', $opt['user'], '--', 'php', '-r', 'require $argv[1]; try { MagnaCapax\Virsilipas\Config::load($argv[2]); }'
+    . ' catch (Throwable $e) { fwrite(STDERR, $e->getMessage() . "\n"); exit(1); }', "$release/src/bootstrap.php", $opt['config']]);
+say('the new release accepts the config');
 $cfg = require $opt['config'];
 $db = is_array($cfg) && is_string($cfg['db_path'] ?? null) ? $cfg['db_path'] : fail('config has no db_path');
 $previous = is_link($opt['current']) ? (string) readlink($opt['current']) : (is_dir($opt['current']) ? $opt['current'] : '');
@@ -104,13 +108,14 @@ for ($t = 0, $flight = inFlight($db); $flight > 0 && $t < (int) $opt['drain']; $
     sleep(2);
 }
 say($flight > 0 ? "stopping with $flight request(s) still in flight; their reservations stay held until settled" : 'no requests in flight');
-run(['systemctl', 'stop', $opt['service']]);
-say("{$opt['service']} stopped; deploying $revision over " . revisionOf($previous));
-
-// 3. Back up the ledger. From here on, any failure rolls back.
 $backup = $opt['snapshots'] . "/pre-$tag-" . gmdate('Ymd\THis\Z') . '.sqlite';
 $restoreNeeded = false;
+// From the stop on, any failure rolls back, and the rollback always starts php-fpm again (a failed stop included).
 try {
+    run(['systemctl', 'stop', $opt['service']]);
+    say("{$opt['service']} stopped; deploying $revision over " . revisionOf($previous));
+
+    // 3. Back up the ledger.
     @mkdir($opt['snapshots'], 0700, true);
     run(['sqlite3', '-readonly', '-nofollow', $db, ".backup '$backup'"]);
     chmod($backup, 0600);

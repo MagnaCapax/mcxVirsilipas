@@ -223,6 +223,21 @@ final class Ledger
         return $key;
     }
 
+    /**
+     * Replaces a ref's key with a new one (a leaked key): the old key stops working at once; the balance,
+     * limits, credit log and usage stay with the ref. Returns the new plaintext key, shown once.
+     */
+    public function rotateKey(string $ref): string
+    {
+        $key = 'vsk-' . bin2hex(random_bytes(24));
+        $st = $this->db->prepare('UPDATE keys SET key_hash = ? WHERE ref = ?');
+        $st->execute([hash('sha256', $key), $ref]);
+        if ($st->rowCount() !== 1) {
+            throw new HttpError(404, 'unknown ref');
+        }
+        return $key;
+    }
+
     public function setActive(string $ref, bool $active): void
     {
         $st = $this->db->prepare('UPDATE keys SET active = ? WHERE ref = ?');

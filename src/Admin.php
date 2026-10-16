@@ -24,6 +24,15 @@ final class Admin
         Http::json(201, ['ref' => $ref, 'key' => $key]);
     }
 
+    /** POST /admin/keys/rotate {"ref": "..."} — a new key for the ref (the old one stops working); balance and history stay. */
+    public function rotateKey(): void
+    {
+        $ref = self::ref($this->body());
+        $key = $this->ledger->rotateKey($ref);
+        Log::write('info', 'key_rotate', ['ref' => $ref]);
+        Http::json(200, ['ref' => $ref, 'key' => $key]);
+    }
+
     /** POST /admin/keys/active {"ref": "...", "active": true|false} — suspend or unsuspend. */
     public function setActive(): void
     {

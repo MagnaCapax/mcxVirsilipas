@@ -14,6 +14,13 @@ final class Config
     public const PARAMS_RESERVED = ['model', 'messages', 'max_tokens', 'max_completion_tokens', 'stream', 'stream_options', 'n'];
     /** Extra attempts on the same upstream after a failure that cost nothing upstream. */
     public const MAX_RETRIES = 2;
+    /** Every setting each level of the config may have: anything else is refused, so a misspelt key never silently drops a limit. */
+    private const KEYS = ['db_path', 'upstream_url', 'upstream_key_file', 'upstream_timeout', 'max_tokens_cap', 'max_concurrent_per_key', 'lease_seconds',
+        'requests_per_minute', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
+        'upstreams', 'models', 'caps'];
+    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'key_file', 'stream_options', 'params', 'description', 'context_length'];
+    private const UPSTREAM_KEYS = ['url', 'key_file', 'stream_options'];
+    private const ROUTE_KEYS = ['upstream', 'model', 'params', 'cost'];
 
     public readonly string $dbPath;
     public readonly ?string $upstreamUrl;
@@ -63,6 +70,7 @@ final class Config
     /** @param array<string, mixed> $c */
     public function __construct(array $c)
     {
+        self::known($c, self::KEYS, '');
         $this->dbPath = self::str($c, 'db_path');
         // The global upstream is optional once every model names its upstreams; when given it needs both parts.
         $hasGlobal = isset($c['upstream_url']) || isset($c['upstream_key_file']);
@@ -102,6 +110,7 @@ final class Config
             if (!is_string($alias) || $alias === '' || !is_array($m)) {
                 throw new \InvalidArgumentException('config: each models entry needs a non-empty alias and a settings array');
             }
+            self::known($m, self::MODEL_KEYS, "models.$alias.");
             $rate = static fn (string $k, int $min): int => is_int($m[$k] ?? null) && $m[$k] >= $min && $m[$k] <= Credits::MAX_RATE ? $m[$k]
                 : throw new \InvalidArgumentException("config: models.$alias.$k must be an integer from $min to " . Credits::MAX_RATE);
             $hops = $this->hops($alias, $m, $upstreams, self::params($m, "models.$alias."));
@@ -205,6 +214,7 @@ final class Config
             if (!is_string($name) || $name === '' || !is_array($u)) {
                 throw new \InvalidArgumentException('config: each upstreams entry needs a non-empty name and a settings array');
             }
+            self::known($u, self::UPSTREAM_KEYS, "upstreams.$name.");
             $out[$name] = ['url' => self::url($u, 'url', "upstreams.$name."), 'key_file' => self::str($u, 'key_file', "upstreams.$name."),
                 'stream_options' => isset($u['stream_options']) ? self::streamOptions($u, 'stream_options', "upstreams.$name.") : $this->streamOptions];
         }
@@ -258,9 +268,7 @@ final class Config
                 if (!is_array($h) || !is_string($h['upstream'] ?? null) || !isset($upstreams[$h['upstream']])) {
                     throw new \InvalidArgumentException("config: {$at}upstream must name an entry of upstreams");
                 }
-                if (array_diff(array_keys($h), ['upstream', 'model', 'params', 'cost']) !== []) {
-                    throw new \InvalidArgumentException("config: {$at} may only set upstream, model, params and cost");
-                }
+                self::known($h, self::ROUTE_KEYS, $at);
                 $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params, 'cost' => self::cost($h, $at)];
             }
             return $hops;
@@ -301,6 +309,20 @@ final class Config
             }
         }
         return $p;
+    }
+
+    /**
+     * Refuses a setting this level does not have, naming it and the settings it may have.
+     * @param array<mixed> $c
+     * @param list<string> $allowed
+     */
+    private static function known(array $c, array $allowed, string $prefix): void
+    {
+        foreach (array_keys($c) as $k) {
+            if (!in_array($k, $allowed, true)) {
+                throw new \InvalidArgumentException("config: {$prefix}$k is not a setting here (a typo?); " . ($prefix === '' ? 'top level' : rtrim($prefix, '.')) . ' may set ' . implode(', ', $allowed));
+            }
+        }
     }
 
     /** @param array<string, mixed> $c */

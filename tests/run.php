@@ -26,5 +26,8 @@ foreach ($tests as $test) {
     }
 }
 Harness::stop();
+if ($failed > 0) {
+    define('VIRSILIPAS_TESTS_FAILED', true);
+}
 printf("%d tests, %d failed\n", count($tests), $failed);
 exit($failed === 0 ? 0 : 1);

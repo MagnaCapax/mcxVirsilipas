@@ -73,6 +73,19 @@ function testKeyIsStoredHashedAndFound(): void
     same(null, $l->findKey($key . 'x'));
 }
 
+function testRotatedKeyReplacesTheOldOneAndKeepsTheBalance(): void
+{
+    [$l, $id] = fundedLedger(100);
+    $old = $l->createKey('b');
+    $new = $l->rotateKey('b');
+    check($new !== $old && str_starts_with($new, 'vsk-') && strlen($new) === 52, 'a new key in the same format');
+    same(null, $l->findKey($old), 'the old key stops working at once');
+    same('b', $l->findKey($new)['ref'] ?? null);
+    $a = $l->findKey($l->rotateKey('a'));
+    same([$id, 100], [$a['id'] ?? null, $a['balance'] ?? null], 'the same key row: balance and history stay with the ref');
+    same(404, throwsHttp(fn () => $l->rotateKey('nobody'))[0]);
+}
+
 function testReserveClampsMaxTokensToBalance(): void
 {
     [$l, $id] = fundedLedger(150);

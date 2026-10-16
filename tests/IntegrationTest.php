@@ -307,6 +307,15 @@ function testIntegrationAdminFlow(): void
     same(200, http('POST', '/admin/keys/active', ['ref' => $ref, 'active' => true], 'admin-secret')['status']);
     same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status']);
     same(5000 - 18, settled($ref)['balance']);
+
+    same(401, http('POST', '/admin/keys/rotate', ['ref' => $ref], 'wrong-token')['status'], 'rotation needs the admin token');
+    $r = http('POST', '/admin/keys/rotate', ['ref' => $ref], 'admin-secret');
+    same(200, $r['status']);
+    $newKey = json_decode($r['body'], true)['key'] ?? '';
+    same(401, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'the leaked key is refused');
+    same(200, http('POST', '/v1/chat/completions', msg('ok', false), $newKey)['status'], 'the new key spends the same balance');
+    same(5000 - 36, settled($ref)['balance']);
+    same(404, http('POST', '/admin/keys/rotate', ['ref' => 'nobody'], 'admin-secret')['status']);
 }
 
 function testIntegrationUnknownResponseFieldsNeverReachTheClient(): void
@@ -432,6 +441,18 @@ function testIntegrationBenchRefusesMoreProcessesThanRequests(): void
     stream_get_contents($pipes[2]);
     same(2, proc_close($p), 'an option error');
     same('', $out, 'no result line');
+}
+
+function testIntegrationBenchRefusesPlainHttpOffThisMachine(): void
+{
+    $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+    foreach (['http://proxy.example.com', 'http://127.0.0.1.example.com', 'ftp://127.0.0.1'] as $url) {
+        $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', "--url=$url", '--requests=1'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+        stream_get_contents($pipes[1]);
+        $err = (string) stream_get_contents($pipes[2]);
+        same(2, proc_close($p), "refused: $url");
+        same(true, str_contains($err, '--url must be https'), "the reason is given: $url");
+    }
 }
 
 /** The ledger check was requested but /v1/balance fails: the run must fail, not skip the check. */

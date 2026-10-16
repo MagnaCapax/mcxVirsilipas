@@ -13,6 +13,7 @@ $usage = <<<'TXT'
 Usage: virsilipas <command> [args]
   init                              create the database tables (safe to re-run)
   key-create <ref>                  create a key for <ref>; prints the key once
+  key-rotate <ref>                  replace <ref>'s key (a leaked key); prints the new key once
   key-disable <ref>                 refuse all requests for <ref>
   key-enable <ref>                  allow requests for <ref> again
   grant <ref> <credits> <grant_id>  add (or, if negative, remove) credits, once per grant_id
@@ -46,6 +47,7 @@ try {
     $out = match ($cmd) {
         'init' => (function () use ($ledger) { $ledger->migrate(); return 'ok'; })(),
         'key-create' => $ledger->createKey(arg($args, 0)),
+        'key-rotate' => $ledger->rotateKey(arg($args, 0)),
         'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
         'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),

@@ -10,7 +10,7 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 - Optional hard caps for the whole server: upstream spend per hour, day and month, and requests per minute across all keys. Set a spend cap to 0 to stop everything at once.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
 - Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
-- No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions. Storage is one SQLite file.
+- No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions, built against SQLite 3.25 or newer. Storage is one SQLite file.
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
@@ -86,7 +86,7 @@ The weight changes no price and no limit. It only orders who slows down first, i
   | Spent in 24 h | Pressure | Wait, weight 25 | Wait, weight 100 | Wait, weight 400 |
   |---|---|---|---|---|
   | 800 or less | 0 | 0 | 0 | 0 |
-  | 850 | 0.25 | 1000 ms | 250 ms | 62 ms |
+  | 850 | 0.25 | 1000 ms | 250 ms | 63 ms |
   | 900 | 0.5 | 2000 ms | 500 ms | 125 ms |
   | 1000 | 1 | 3000 ms | 1000 ms | 250 ms |
   | 1200 | 2 | 3000 ms | 2000 ms | 500 ms |
@@ -112,7 +112,7 @@ Every setting is optional. A spend cap of `0` stops every request at once, which
 
 - **What counts.** A spend window holds the upstream cost settled in it plus, for every request still running that started in it, an upper bound of its cost: its prompt bound and `max_tokens` priced at the highest `cost` of its route's upstreams. A new request is admitted only if its own bound still fits, checked in the same transaction as its reservation, so parallel requests cannot overshoot together. A request that does not fit is refused, never shortened: no one pays for an answer cut short by the server's budget.
 - **Prices are required.** With any spend cap set, every route entry needs a `cost` (that upstream's prices in millionths of its currency unit per million tokens), or the config is refused: a request the proxy cannot price would escape the cap. A model without a route cannot carry prices, so give it a route. Keep every route's prices in one currency.
-- **Settled cost.** When the upstream reports its own cost, that figure is recorded; otherwise the cost is computed from the configured prices and the counts charged (`cost_computed` in the usage row). If your configured prices are below what the upstream actually bills, the bounds and computed costs are low by the same factor, so keep them current.
+- **Settled cost.** When the upstream reports its own cost, that figure is recorded; otherwise the cost is computed from the configured prices and the counts charged (`cost_computed` in the usage row). If your configured prices are below what the upstream actually bills, the bounds and computed costs are low by the same factor, so keep them current. A settled cost is recorded as the upstream bills it even when it exceeds the request's bound (an upstream that ignores `max_tokens`, for example), so a window can end above its cap by that excess; the requests after it are refused.
 - **Refusals.** A spend cap answers 503 `spend_cap_reached` with `Retry-After` until the window ends; `requests_per_minute` answers 429 `server_rate_limit` with `Retry-After` until the oldest request in the window is a minute old. Both are logged as `capped` (info). When a request's cost carries a window past 80% or 100% of its cap, a `spend_cap_crossed` line is logged at `warn`, once per crossing.
 - **What runs across a boundary.** A request that started before a window began counts in that window only once it settles.
 - `bin/virsilipas caps` shows each cap in force with what is settled, what running requests hold, what remains and when it resets.
@@ -126,6 +126,7 @@ Every setting is optional. A spend cap of `0` stops every request at once, which
 | `max_concurrent_per_key` | one key | config default; `bin/virsilipas limit` per key | 429 |
 | `requests_per_minute`, `credits_per_minute` | one key | config defaults; `bin/virsilipas limit` per key | 429 with `Retry-After` |
 | Disabled key | one key | `bin/virsilipas key-disable`, `POST /admin/keys/active` | 403 |
+| Leaked key | one key | `bin/virsilipas key-rotate`, `POST /admin/keys/rotate` (the old key answers 401 at once) | 401 |
 | `caps.requests_per_minute` | whole server | config `caps` | 429 `server_rate_limit` |
 | `caps.hour`, `caps.day`, `caps.month` | whole server, upstream cost | config `caps` | 503 `spend_cap_reached` |
 | `throttle.daily_budget` | whole server, credits | config `throttle` | requests wait, lower weights longer; nothing refused |
@@ -150,18 +151,22 @@ Check, with that model at its upstream (a model served by a second upstream is c
 
 ```sh
 cp config.example.php config.php      # edit: upstream, models, admin token hash, paths
-bin/virsilipas init                    # creates the SQLite database
-bin/virsilipas key-create customer-42  # prints the key once
-bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
+install -d -m 700 -o www-data -g www-data /var/lib/virsilipas     # the db_path directory, owned by the PHP user
+runuser -u www-data -- bin/virsilipas init                    # creates the SQLite database
+runuser -u www-data -- bin/virsilipas key-create customer-42  # prints the key once
+runuser -u www-data -- bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
 ```
 
-Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`.
+Run the CLI as the user php-fpm runs as (`www-data` here), and make `config.php` readable by it: the database files belong to whoever creates them, and the proxy cannot open a database another user owns. To try it on a test machine without root, point `db_path` at a directory you own and run `bin/virsilipas` and `php -S` as yourself.
+
+Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`. `config.example.php` lists every setting; the proxy refuses a setting it does not know, so a misspelt key stops it with a message naming the key instead of silently dropping a limit.
 
 ### php-fpm and nginx
 
 - **One worker per open stream.** A streaming request holds a php-fpm worker for its whole duration. Size `pm.max_children` for your peak number of concurrent streams, and set `request_terminate_timeout` above `upstream_timeout`.
 - **Turn buffering off**, or streams arrive all at once at the end. The proxy sends `X-Accel-Buffering: no`; also set `fastcgi_buffering off;` (or `proxy_buffering off;`) and a `fastcgi_read_timeout` above `upstream_timeout`. Keep `zlib.output_compression` off for this pool.
 - **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database). The proxy creates its files private to its user, and refuses a database, WAL or shared-memory file that group or others can read, and a directory that group or others can write.
+- **Health check:** `GET /v1/models` without a key answers 401 only when php-fpm runs, the config loads and the ledger opens and answers a query; any 5xx means one of them failed (the log says which). The proxy fails closed: while the config is invalid or the database cannot be read or written (a full or read-only disk), a request that cannot load the config or reserve in the ledger answers 500 and is not charged. At `log_level` `info` each probe logs a `refused` line. `bin/virsilipas verify` checks the balances themselves.
 - **Before launch, test a client hang-up under your real php-fpm and nginx.** Abort detection depends on the server telling PHP that the connection closed; it is covered by the tests under the PHP built-in server, not under every stack.
 
 ### Access control
@@ -245,7 +250,7 @@ runuser -u www-data -- env VIRSILIPAS_CONFIG=/etc/virsilipas/config.php \
     php /opt/virsilipas/tools/smoke.php --url https://proxy.example.com --model default
 ```
 
-`deploy.php` fetches the mirror, unpacks the tag into its own directory (no `.git`, a `REVISION` file naming the tag and commit), lints it, waits up to `--drain` seconds for requests in flight to finish, and stops php-fpm. It then backs up the ledger to `/var/lib/virsilipas-snapshots/pre-<tag>-<time>.sqlite`, checks the backup's integrity, runs `init` as the PHP user, switches the symlink, runs `verify`, checks `REVISION` through the symlink, and starts php-fpm. Its last check is that `GET /v1/models` without a key answers 401. `deploy.php --help` lists the paths and the service name it assumes.
+`deploy.php` fetches the mirror, unpacks the tag into its own directory (no `.git`, a `REVISION` file naming the tag and commit), lints it, checks that the new release accepts the config (if not, it stops there with the old release still serving), waits up to `--drain` seconds for requests in flight to finish, and stops php-fpm. It then backs up the ledger to `/var/lib/virsilipas-snapshots/pre-<tag>-<time>.sqlite`, checks the backup's integrity, runs `init` as the PHP user, switches the symlink, runs `verify`, checks `REVISION` through the symlink, and starts php-fpm. Its last check is that `GET /v1/models` without a key answers 401. `deploy.php --help` lists the paths and the service name it assumes.
 
 If any step after php-fpm stopped fails, `deploy.php` points the symlink back at the previous release, puts the backup in place, starts php-fpm and exits 1. It restores the backup only if nothing but the migration has written to the ledger since the backup was taken. The CLI works while php-fpm is stopped, and a started release serves requests, so `deploy.php` compares every table except `credit_log` with the backup first. If they differ, or cannot be compared, it keeps the ledger as it is; once the new schema is in place it also keeps the new release live, and it says so. php-fpm is stopped before that comparison, so the only write that can slip in between the check and the restore is a CLI command run in that moment.
 
@@ -290,6 +295,7 @@ Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long
 |---|---|---|
 | `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for a user. `ref` must be your billing system's stable id for the user (not a per-service id), so all of the user's purchases add to one balance. Returns the key once (201). |
 | `POST /admin/keys/active` | `{"ref": "...", "active": false}` | Disables or re-enables a key (for suspend and unsuspend). |
+| `POST /admin/keys/rotate` | `{"ref": "..."}` | Replaces the ref's key with a new one, returned once: for a leaked key. The old key stops working at once; balance, limits, credit log and usage stay with the ref. |
 | `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "credits": 1000000}` | Adds credits once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative credits remove credits (refunds). At most 10^15 per grant. |
 | `POST /admin/keys/limits` | `{"ref": "...", "requests_per_minute": 60}` | Sets any of `max_concurrent`, `requests_per_minute` and `credits_per_minute` for a key: an integer from 1 to 10^15, or `null` to follow the config default again. Also sets `bonus_pct`, an integer from 0 to 300 (the bonus in the key's weight), and `key_group`, a name of up to 64 of a-z, 0-9, `.`, `_` and `-` (empty for none) that groups keys in `stats`, such as a plan or a customer group. Fields left out are unchanged; any other field is refused (400), and nothing changes when any field is invalid. Returns the key's own settings (`overrides`), the limits in force (`limits`), `bonus_pct` and `key_group`. |
 
@@ -306,8 +312,8 @@ Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMM
 | `log_level` | Adds | Events |
 |---|---|---|
 | `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
-| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `spend_cap_crossed` (a request's cost carried a spend window past 80% or 100% of its cap); `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `capped` (refused by a server-wide cap: the code and `Retry-After`), `key_create`, `key_active`, `key_limits`, `grant` |
+| `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `spend_cap_crossed` (a request's cost carried a spend window past 80% or 100% of its cap); `cap_log_error` (the crossing check itself failed; the request is unaffected); `admin_auth_failed` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `capped` (refused by a server-wide cap: the code and `Retry-After`), `key_create`, `key_rotate`, `key_active`, `key_limits`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
 The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
@@ -328,7 +334,7 @@ Runs the requests with `--concurrency` in flight per process across `--processes
 ## CLI
 
 ```
-virsilipas init | key-create <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
+virsilipas init | key-create <ref> | key-rotate <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
            | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
            | bonus <ref> <0..300> | group <ref> <name|-> | history <ref> [N] | verify | caps
            | stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
@@ -360,7 +366,7 @@ CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on 
 
 ## Reporting security issues
 
-Please report vulnerabilities privately to support@pulsedmedia.com, not in a public issue. Include the version (or commit), what you found and how to reproduce it.
+See [SECURITY.md](SECURITY.md): report vulnerabilities privately, not in a public issue.
 
 ## Attribution
 
