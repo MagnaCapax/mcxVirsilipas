@@ -296,14 +296,14 @@ Admin side, authenticated with `Authorization: Bearer <admin token>`. Use a long
 | `POST /admin/keys` | `{"ref": "customer-42"}` | Creates a key for a user. `ref` must be your billing system's stable id for the user (not a per-service id), so all of the user's purchases add to one balance. Returns the key once (201). |
 | `POST /admin/keys/active` | `{"ref": "...", "active": false}` | Disables or re-enables a key (for suspend and unsuspend). |
 | `POST /admin/keys/rotate` | `{"ref": "..."}` | Replaces the ref's key with a new one, returned once: for a leaked key. The old key stops working at once; balance, limits, credit log and usage stay with the ref. |
-| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "credits": 1000000}` | Adds credits once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative credits remove credits (refunds). At most 10^15 per grant. |
+| `POST /admin/grants` | `{"ref": "...", "grant_id": "invoice-1001", "credits": 1000000}` | Adds credits once per `grant_id`; a retry returns `applied: false`, a `grant_id` reused for another ref or amount returns 409. Negative credits remove credits (refunds); a balance can go below zero this way, and the key's requests then answer 402 until a grant brings it back up. At most 10^15 per grant. |
 | `POST /admin/keys/limits` | `{"ref": "...", "requests_per_minute": 60}` | Sets any of `max_concurrent`, `requests_per_minute` and `credits_per_minute` for a key: an integer from 1 to 10^15, or `null` to follow the config default again. Also sets `bonus_pct`, an integer from 0 to 300 (the bonus in the key's weight), and `key_group`, a name of up to 64 of a-z, 0-9, `.`, `_` and `-` (empty for none) that groups keys in `stats`, such as a plan or a customer group. Fields left out are unchanged; any other field is refused (400), and nothing changes when any field is invalid. Returns the key's own settings (`overrides`), the limits in force (`limits`), `bonus_pct` and `key_group`. |
 
 Use a `grant_id` that is unique per payment, for example the invoice number or the subscription id plus its billing period, so that a retried push never credits twice and a renewal is never dropped.
 
 ## Privacy
 
-Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts.
+Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address if you do not need it.
 
 ## Logging
 
