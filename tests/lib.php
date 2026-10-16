@@ -154,30 +154,18 @@ final class Harness
         file_put_contents("$dir/upstream.key", "fake-upstream-key\n");
         file_put_contents("$dir/second.key", "second-upstream-key\n");
         mkdir("$dir/logs", 0700);
-        // A free port can be taken by another process before php -S binds it; that server then exits and the
-        // port answers for someone else. Every server must still be running after the wait, or all start again on new ports.
-        for ($attempt = 1; ; $attempt++) {
-            $up = self::freePort();
-            $ports = array_map(static fn () => self::freePort(), range(1, 7));
-            $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
-            $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
-            $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
-            $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
-            file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
-            $root = dirname(__DIR__);
-            $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
-            self::spawn([PHP_BINARY, '-S', "127.0.0.1:$up", "$root/tests/fake-upstream.php"], $env, "$dir/upstream.log");
-            // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
-            foreach ($ports as $px) {
-                self::spawn([PHP_BINARY, '-S', "127.0.0.1:$px", "$root/public/index.php"], $env, "$dir/proxy-$px.log");
-            }
-            self::waitPort($up);
-            array_map([self::class, 'waitPort'], $ports);
-            if (array_filter(self::$procs, static fn ($p): bool => !proc_get_status($p)['running']) === []) {
-                break;
-            }
-            self::stop();
-            check($attempt < 3, 'test servers could not bind their ports three times');
+        $root = dirname(__DIR__);
+        $env = ['PHP_CLI_SERVER_WORKERS' => '10', 'FAKE_UPSTREAM_DIR' => $dir, 'VIRSILIPAS_CONFIG' => "$dir/config.php", 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
+        [self::$procs[], $up] = startPhpServer(["$root/tests/fake-upstream.php"], $env, "$dir/upstream.log");
+        $cfg = configArrayFor($dir, ['upstream_url' => "http://127.0.0.1:$up/v1/chat/completions", 'log_dir' => "$dir/logs", 'log_level' => 'debug']);
+        $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+        $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
+        $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+        file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
+        // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
+        $ports = [];
+        for ($i = 1; $i <= 7; $i++) {
+            [self::$procs[], $ports[]] = startPhpServer(["$root/public/index.php"], $env, "$dir/proxy-$i.log");
         }
         $ledger = new Ledger(Config::load("$dir/config.php")->dbPath);
         $ledger->migrate();
@@ -192,33 +180,36 @@ final class Harness
         }
         self::$procs = [];
     }
+}
 
-    private static function spawn(array $cmd, array $env, string $log): void
-    {
-        $p = proc_open($cmd, [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, null, $env);
-        check(is_resource($p), 'could not start ' . implode(' ', $cmd));
-        self::$procs[] = $p;
-    }
-
-    private static function freePort(): int
-    {
+/**
+ * Starts php -S on a free loopback port and waits until it answers. A port found free can be taken by another process
+ * before the server binds it; the server then exits and the port answers for someone else. So a server that is not
+ * still running a moment after its port answers is started again on a new port, up to three times.
+ * @param list<string> $args what follows -S host:port (the router script)
+ * @param array<string, string> $env
+ * @return array{0: resource, 1: int} the server process and its port
+ */
+function startPhpServer(array $args, array $env, string $log): array
+{
+    for ($attempt = 1; ; $attempt++) {
         $s = stream_socket_server('tcp://127.0.0.1:0');
         $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
         fclose($s);
-        return $port;
-    }
-
-    private static function waitPort(int $port): void
-    {
-        for ($i = 0; $i < 100; $i++) {
-            $c = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1);
-            if ($c) {
-                fclose($c);
-                return;
-            }
+        $p = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", ...$args], [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, null, $env);
+        check(is_resource($p), 'could not start php -S');
+        for ($i = 0; $i < 100 && !($c = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1)); $i++) {
             usleep(50000);
         }
-        throw new \RuntimeException("server on port $port did not start");
+        if ($c) {
+            fclose($c);
+            usleep(200000); // time for a server that lost the port to exit
+        }
+        if ($c && proc_get_status($p)['running']) {
+            return [$p, $port];
+        }
+        proc_terminate($p);
+        check($attempt < 3, "php -S could not bind a port three times (see $log)");
     }
 }
 

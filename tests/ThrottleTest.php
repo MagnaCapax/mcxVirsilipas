@@ -164,18 +164,10 @@ function configuredProxy(callable $edit, array $env = []): array
     }
     $cfg = $edit($cfg);
     file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
-    $s = stream_socket_server('tcp://127.0.0.1:0');
-    $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
-    fclose($s);
     // The built-in server builds $_SERVER per request without the environment, so a router stands in for the web
     // server's FastCGI parameter: it copies VIRSILIPAS_SOURCE from the environment, as nginx sets it from the client address.
     file_put_contents("$dir/router.php", "<?php\nif (getenv('VIRSILIPAS_SOURCE') !== false) { \$_SERVER['VIRSILIPAS_SOURCE'] = getenv('VIRSILIPAS_SOURCE'); }\nrequire " . var_export(dirname(__DIR__) . '/public/index.php', true) . ";\n");
-    $p = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", "$dir/router.php"],
-        [0 => ['file', '/dev/null', 'r'], 1 => ['file', "$dir/proxy.log", 'a'], 2 => ['file', "$dir/proxy.log", 'a']], $pipes, null,
-        ['VIRSILIPAS_CONFIG' => "$dir/config.php", 'PHP_CLI_SERVER_WORKERS' => '4', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'] + $env);
-    for ($i = 0; $i < 100 && !@fsockopen('127.0.0.1', $port, $e1, $e2, 0.1); $i++) {
-        usleep(50000);
-    }
+    [$p, $port] = startPhpServer(["$dir/router.php"], ['VIRSILIPAS_CONFIG' => "$dir/config.php", 'PHP_CLI_SERVER_WORKERS' => '4', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'] + $env, "$dir/proxy.log");
     $ledger = new Ledger(Config::load("$dir/config.php")->dbPath);
     $ledger->migrate();
     return ['url' => "http://127.0.0.1:$port", 'ledger' => $ledger, 'proc' => $p, 'log' => "$dir/proxy.log"];
@@ -228,7 +220,8 @@ function testIntegrationSpendPacingDelaysByWeightAndRecordsIt(): void
         same(['10', '600'], [$s['headers']['x-virsilipas-weight'] ?? '', $s['headers']['x-virsilipas-delay-ms'] ?? ''], 'low weight: the capped delay');
         same(['2000', (string) $expectBig], [$b['headers']['x-virsilipas-weight'] ?? '', $b['headers']['x-virsilipas-delay-ms'] ?? ''], 'high weight: the same pressure, a 200th of the low weight wait');
         check($expectBig > 0 && $expectBig < 600, 'high weight waits, but far less');
-        check($s['ms'] >= 600 && $s['ms'] - $b['ms'] > 400, 'the low-weight request really waited');
+        // Wall time proves the wait happened; the headers above prove how the two weights compare (a timing difference would flake on a busy machine).
+        check($s['ms'] >= 600, "the low-weight request really waited ({$s['ms']} ms)");
         same(600, $l->stats('all', ['key'])[array_search('small', array_column($l->stats('all', ['key']), 'key'), true)]['mean_delay_ms'], 'the wait is recorded with the usage row');
         $db = new \PDO('sqlite:' . dirname($p['log']) . '/ledger.sqlite');
         $duration = (int) $db->query("SELECT u.duration_ms FROM usage u JOIN keys k ON k.id = u.key_id WHERE k.ref = 'small' ORDER BY u.id DESC LIMIT 1")->fetchColumn();

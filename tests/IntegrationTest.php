@@ -463,14 +463,8 @@ function testIntegrationBenchFailsWhenTheStartingBalanceIsUnreadable(): void
         . 'if (parse_url($_SERVER["REQUEST_URI"], PHP_URL_PATH) === "/v1/balance") { http_response_code(503); echo "{}"; return; }'
         . 'echo json_encode(["choices" => [["index" => 0, "message" => ["role" => "assistant", "content" => "ok"], "finish_reason" => "stop"]],'
         . '"usage" => ["prompt_tokens" => 1, "completion_tokens" => 1, "total_tokens" => 2]]);');
-    $s = stream_socket_server('tcp://127.0.0.1:0');
-    $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
-    fclose($s);
-    $srv = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", "$dir/router.php"], [0 => ['file', '/dev/null', 'r'], 1 => ['file', '/dev/null', 'a'], 2 => ['file', '/dev/null', 'a']], $pipes);
+    [$srv, $port] = startPhpServer(["$dir/router.php"], ['PATH' => getenv('PATH') ?: '/usr/bin:/bin'], '/dev/null');
     try {
-        for ($i = 0; $i < 100 && !($c = @fsockopen('127.0.0.1', $port)); $i++) {
-            usleep(50000);
-        }
         $env = ['VIRSILIPAS_BENCH_KEY' => 'unused', 'PATH' => getenv('PATH') ?: '/usr/bin:/bin'];
         $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/tools/bench.php', "--url=http://127.0.0.1:$port", '--requests=3', '--concurrency=1'],
             [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $bp, null, $env);
