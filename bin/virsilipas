@@ -6,6 +6,7 @@ declare(strict_types=1);
 use MagnaCapax\Virsilipas\Config;
 use MagnaCapax\Virsilipas\HttpError;
 use MagnaCapax\Virsilipas\Ledger;
+use MagnaCapax\Virsilipas\Top;
 
 require dirname(__DIR__) . '/src/bootstrap.php';
 
@@ -31,9 +32,17 @@ Usage: virsilipas <command> [args]
   stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
                                     usage over time, one JSON line per UTC bucket and group: requests,
                                     tokens, credits, upstream-reported cost, hang-ups, failures,
-                                    requests slowed down and the mean delay;
+                                    requests slowed down, the mean delay, the mean time to first byte
+                                    and requests that were retried or failed over;
                                     by = comma list of model,upstream,key,status,source,group (or -); since/until =
                                     YYYY-MM-DD (UTC, until exclusive)
+  keys                              list every key: ref, active, balance, group, bonus, created and
+                                    last used (unix time), one JSON line each
+  top [--once] [--interval N]       live view of requests: rate, latency, time to first byte, tokens,
+                                    credits, upstream cost, failures, retries, requests in flight and
+                                    the caps, refreshed every N seconds (default 2; Ctrl-C quits);
+                                    --once prints one view and exits. Metadata only: no prompt or
+                                    answer is stored, so none is shown
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
 TXT;
@@ -58,6 +67,8 @@ try {
         'history' => implode("\n", array_map('json_encode', $ledger->history(arg($args, 0), isset($args[1]) ? intArg($args, 1) : 100))),
         'verify' => verifyOrExit($ledger),
         'caps' => json_encode($ledger->capStatus($config->caps), JSON_FORCE_OBJECT),
+        'keys' => implode("\n", array_map('json_encode', $ledger->keys())),
+        'top' => top($ledger, $config, $args),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
             ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
         default => null,
@@ -70,6 +81,30 @@ try {
 } catch (HttpError | \InvalidArgumentException | \RuntimeException $e) {
     fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
     exit(1);
+}
+
+/**
+ * The live view: one render with --once, else a full-screen refresh every --interval seconds until Ctrl-C.
+ * @param list<string> $args
+ */
+function top(Ledger $ledger, Config $config, array $args): string
+{
+    $interval = 2;
+    $i = array_search('--interval', $args, true);
+    if ($i !== false) {
+        $v = $args[$i + 1] ?? '';
+        if (!ctype_digit($v) || (int) $v < 1 || (int) $v > 60) {
+            throw new \InvalidArgumentException('--interval must be 1 to 60 seconds');
+        }
+        $interval = (int) $v;
+    }
+    if (in_array('--once', $args, true)) {
+        return rtrim(Top::render($ledger, $config->caps, time()), "\n");
+    }
+    while (true) { // @phpstan-ignore while.alwaysTrue
+        echo "\033[H\033[2J", Top::render($ledger, $config->caps, time());
+        sleep($interval);
+    }
 }
 
 /** @param list<string> $a */

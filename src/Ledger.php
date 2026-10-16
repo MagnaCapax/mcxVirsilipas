@@ -28,9 +28,9 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 7;
-    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 6 gain the columns below. */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6];
+    private const SCHEMA_VERSION = 8;
+    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 7 gain the columns below. */
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -40,13 +40,16 @@ final class Ledger
      * cost tracking: the source of each usage row, whether its cost was computed from configured prices because the
      * upstream reported none, and a key's group (an operator-chosen name such as a plan or customer group). Schema 7, for
      * the spend caps: the upper bound of a lease's upstream cost, held against the caps while the request runs
-     * (spend_hourly gains the settled upstream cost per hour as well).
+     * (spend_hourly gains the settled upstream cost per hour as well). Schema 8, for performance metrics: the
+     * milliseconds until the first byte reached the client (NULL when nothing did) and how many upstream attempts the
+     * request made, retries and failover included (0 on rows written before schema 8).
      */
     private const ADDED_COLUMNS = [
         'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
             'duration_ms' => 'INTEGER NOT NULL DEFAULT 0', 'reasoning_tokens' => 'INTEGER NOT NULL DEFAULT 0', 'upstream_cost' => 'INTEGER',
             'delay_ms' => 'INTEGER NOT NULL DEFAULT 0', 'source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))',
-            'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))'],
+            'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))', 'first_byte_ms' => 'INTEGER',
+            'attempts' => 'INTEGER NOT NULL DEFAULT 0'],
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''"],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
@@ -122,6 +125,7 @@ final class Ledger
             }
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_source_open ON leases(source, settled, expires_at)');
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_created ON leases(created_at)');
+            $this->db->exec('CREATE INDEX IF NOT EXISTS usage_key ON usage(key_id, ts)'); // keys(): a key's last use
             // Credits charged and upstream cost per UTC hour, kept by settle, so spend pacing and the spend caps read at
             // most one row per hour of their window however busy it was. Both are rebuilt from the usage rows when added.
             $newHourly = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'spend_hourly'")->fetchColumn() === 0;
@@ -348,6 +352,65 @@ final class Ledger
     }
 
     /**
+     * Requests in flight now (unsettled, unexpired leases) by source, and the age in seconds of the oldest one.
+     * @return array{internal: int, external: int, oldest_s: int}
+     */
+    public function inFlight(int $now): array
+    {
+        $st = $this->db->prepare('SELECT COALESCE(SUM(source = 1), 0), COALESCE(SUM(source = 0), 0), COALESCE(MIN(created_at), ?)
+            FROM leases WHERE settled = 0 AND expires_at > ?');
+        $st->execute([$now, $now]);
+        [$internal, $external, $oldest] = array_map('intval', $st->fetch(\PDO::FETCH_NUM));
+        $st->closeCursor();
+        return ['internal' => $internal, 'external' => $external, 'oldest_s' => max(0, $now - $oldest)];
+    }
+
+    /**
+     * The usage rows of requests settled at or after $since, newest first, at most $limit: the per-request performance and
+     * cost metadata, never any content (none is stored).
+     * @return list<array{ts: int, ref: string, model: string, upstream: string, status: int, stream: bool, source: string,
+     *     duration_ms: int, first_byte_ms: ?int, delay_ms: int, attempts: int, prompt_tokens: int, completion_tokens: int,
+     *     cached_tokens: int, reasoning_tokens: int, charged: int, upstream_cost: ?int, aborted: bool, estimated: bool}>
+     */
+    public function recentUsage(int $since, int $limit): array
+    {
+        $st = $this->db->prepare('SELECT u.ts, k.ref, u.model, u.upstream, u.http_status, u.stream, u.source, u.duration_ms, u.first_byte_ms,
+                u.delay_ms, u.attempts, u.prompt_tokens, u.completion_tokens, u.cached_tokens, u.reasoning_tokens, u.charged, u.upstream_cost,
+                u.aborted, u.estimated
+            FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? ORDER BY u.id DESC LIMIT ?');
+        $st->execute([$since, max(1, min($limit, 100000))]);
+        $rows = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $rows[] = ['ts' => (int) $r['ts'], 'ref' => (string) $r['ref'], 'model' => (string) $r['model'], 'upstream' => (string) $r['upstream'],
+                'status' => (int) $r['http_status'], 'stream' => (bool) $r['stream'], 'source' => (int) $r['source'] === 1 ? 'internal' : 'external',
+                'duration_ms' => (int) $r['duration_ms'], 'first_byte_ms' => $r['first_byte_ms'] === null ? null : (int) $r['first_byte_ms'],
+                'delay_ms' => (int) $r['delay_ms'], 'attempts' => (int) $r['attempts'], 'prompt_tokens' => (int) $r['prompt_tokens'],
+                'completion_tokens' => (int) $r['completion_tokens'], 'cached_tokens' => (int) $r['cached_tokens'],
+                'reasoning_tokens' => (int) $r['reasoning_tokens'], 'charged' => (int) $r['charged'],
+                'upstream_cost' => $r['upstream_cost'] === null ? null : (int) $r['upstream_cost'], 'aborted' => (bool) $r['aborted'],
+                'estimated' => (bool) $r['estimated']];
+        }
+        return $rows;
+    }
+
+    /**
+     * Every key: its ref, whether it is active, its balance, group and bonus, when it was created and when it last
+     * settled a request (null if never), ordered by ref.
+     * @return list<array{ref: string, active: bool, balance: int, key_group: string, bonus_pct: int, created_at: int, last_used: ?int}>
+     */
+    public function keys(): array
+    {
+        $rows = [];
+        foreach ($this->db->query('SELECT k.ref, k.active, k.balance, k.key_group, k.bonus_pct, k.created_at,
+                (SELECT MAX(u.ts) FROM usage u WHERE u.key_id = k.id) AS last_used FROM keys k ORDER BY k.ref')->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $rows[] = ['ref' => (string) $r['ref'], 'active' => (bool) $r['active'], 'balance' => (int) $r['balance'],
+                'key_group' => (string) $r['key_group'], 'bonus_pct' => (int) $r['bonus_pct'], 'created_at' => (int) $r['created_at'],
+                'last_used' => $r['last_used'] === null ? null : (int) $r['last_used']];
+        }
+        return $rows;
+    }
+
+    /**
      * Balance, holds, limits and recent use. `reserved` = credits held by unsettled leases (already
      * taken from the balance); `held` = expired leases never settled (their worker died), whose
      * reservations stay charged so the operator can see and reconcile them. `window` = requests and
@@ -519,8 +582,8 @@ final class Ledger
      * Settles a request exactly once: charges the credits the request used, never more than the
      * reservation, returns the rest, and writes the usage row in the same transaction.
      * Settling an already settled lease does nothing and returns false.
-     * The tracking fields (upstream, stream, duration_ms, reasoning, cost) are optional and default to empty.
-     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, reasoning?: int, cost?: ?int, delay_ms?: int, cost_computed?: bool} $meta
+     * The tracking fields (upstream, stream, duration_ms, first_byte_ms, attempts, reasoning, cost) are optional and default to empty.
+     * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, first_byte_ms?: ?int, attempts?: int, reasoning?: int, cost?: ?int, delay_ms?: int, cost_computed?: bool} $meta
      */
     public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
@@ -540,9 +603,10 @@ final class Ledger
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
             $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
             $now = time();
-            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms, source, cost_computed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+            $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms, source, cost_computed, first_byte_ms, attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
                 ->execute([$now, $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
-                    $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0), $source, (int) ($meta['cost_computed'] ?? false)]);
+                    $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0), $source, (int) ($meta['cost_computed'] ?? false),
+                    isset($meta['first_byte_ms']) ? max(0, $meta['first_byte_ms']) : null, max(0, $meta['attempts'] ?? 0)]);
             $this->db->prepare('INSERT INTO spend_hourly (hour, charged, cost) VALUES (?, ?, ?) ON CONFLICT(hour) DO UPDATE SET charged = charged + excluded.charged, cost = cost + excluded.cost')
                 ->execute([intdiv($now, 3600), $charged, max(0, $meta['cost'] ?? 0)]);
             return true;
@@ -637,7 +701,8 @@ final class Ledger
                 SUM(u.reasoning_tokens) AS reasoning_tokens, SUM(u.charged) AS credits, SUM(u.upstream_cost) AS upstream_cost,
                 COUNT(u.upstream_cost) AS costed_requests, SUM(u.cost_computed) AS computed_cost_requests, SUM(u.aborted) AS aborted, SUM(u.estimated) AS estimated,
                 SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms,
-                SUM(u.delay_ms > 0) AS delayed, CAST(AVG(u.delay_ms) AS INTEGER) AS mean_delay_ms
+                SUM(u.delay_ms > 0) AS delayed, CAST(AVG(u.delay_ms) AS INTEGER) AS mean_delay_ms,
+                CAST(AVG(u.first_byte_ms) AS INTEGER) AS mean_first_byte_ms, SUM(u.attempts > 1) AS retried
             FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ? GROUP BY $group ORDER BY $group");
         $st->execute([$since ?? 0, $until ?? PHP_INT_MAX]);
         $rows = [];

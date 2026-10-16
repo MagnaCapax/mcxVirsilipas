@@ -52,6 +52,9 @@ function testRetryOnTheSameUpstreamThenSuccess(): void
     same(200, $r['status']);
     same([['primary', 'fake-upstream-key'], ['primary', 'fake-upstream-key']], hops($req), 'one failure, one retry');
     settled($ref);
+    $u = lastUsage($ref);
+    same(2, $u['attempts'], 'both attempts are counted');
+    check($u['first_byte_ms'] !== null && $u['first_byte_ms'] <= $u['duration_ms'], 'first byte measured within the request');
 }
 
 function testNoRetryOrFailoverOnceTheUpstreamAnswered2xx(): void
@@ -62,6 +65,7 @@ function testNoRetryOrFailoverOnceTheUpstreamAnswered2xx(): void
     same(1, count($req), 'the second upstream is never asked');
     same('upstream_error', errorOf($r)['code']);
     same(10000, settled($ref)['balance'], 'nothing charged');
+    same([null, 1], [lastUsage($ref)['first_byte_ms'], lastUsage($ref)['attempts']], 'no answer reached the client; one attempt');
 }
 
 function testAnUnreachableUpstreamIsRetriedThenSkipped(): void

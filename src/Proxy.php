@@ -99,7 +99,7 @@ final class Proxy
         }
 
         $result = self::attemptResult(0);
-        [$upstream, $servedHop, $started] = ['', 0, hrtime(true)];
+        [$upstream, $servedHop, $started, $attempts] = ['', 0, hrtime(true), 0];
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
             // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
@@ -135,6 +135,7 @@ final class Proxy
                         $result = array_replace(self::attemptResult(0), ['timed_out' => true]);
                         break 2;
                     }
+                    $attempts++;
                     $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved'], $left);
                     if ($result['delivered'] || $result['kind'] === 'final') {
                         break 2;
@@ -158,7 +159,8 @@ final class Proxy
             }
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
-            $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs];
+            $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs,
+                'first_byte_ms' => $result['first_byte_ns'] === null ? null : intdiv($result['first_byte_ns'] - $started, 1_000_000), 'attempts' => $attempts];
             // An upstream that reports no cost of its own is costed from the route entry's configured prices, flagged as
             // computed: from its usage report, or, for an answer delivered without one, from the counts charged for it.
             $price = $this->config->routes[$alias][$servedHop]['cost'];
@@ -203,12 +205,12 @@ final class Proxy
     /**
      * A forward() result before (or without) a usable answer. $kind says what the failure allows:
      * retry (the same upstream again: nothing was generated), next (the next upstream), final (stop).
-     * @return array{status: int, usage: null, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool}
+     * @return array{status: int, usage: null, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool, first_byte_ns: ?int}
      */
     private static function attemptResult(int $status, string $kind = 'final'): array
     {
         return ['status' => $status, 'usage' => null, 'aborted' => false, 'delivered' => false, 'completion_bound' => 0, 'unmetered' => 0,
-            'kind' => $kind, 'retry_after' => null, 'code' => null, 'timed_out' => false, 'too_big' => false];
+            'kind' => $kind, 'retry_after' => null, 'code' => null, 'timed_out' => false, 'too_big' => false, 'first_byte_ns' => null];
     }
 
     /**
@@ -773,13 +775,13 @@ final class Proxy
      * @param array{url: string, key: string, stream_options: array<string, mixed>} $route
      * @param array<string, mixed> $body
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
-     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool}
+     * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool, first_byte_ns: ?int}
      */
     private function forward(array $route, array $body, bool $stream, string $alias, array $rates, int $reserved, int $timeout): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
-        /** @var array{status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int} $s */
-        $s = ['status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
+        /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int} $s */
+        $s = ['first_byte' => null, 'status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
             'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
@@ -903,6 +905,7 @@ final class Proxy
                     header('X-Accel-Buffering: no');
                 }
                 if ($out !== '' && !$s['aborted']) {
+                    $s['first_byte'] ??= hrtime(true); // performance metric: when the client got its first byte
                     echo $out;
                     flush();
                 }
@@ -928,6 +931,7 @@ final class Proxy
         $status = $s['status'];
         $result = ['status' => $status, 'aborted' => $s['aborted'], 'kind' => 'final', 'retry_after' => $s['retry_after'], 'code' => null,
             'timed_out' => false, 'too_big' => $s['too_big']] + self::attemptResult($status);
+        $result['first_byte_ns'] = $s['first_byte'];
 
         if ($stream && $s['started']) {
             $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']); // after a hang-up too: it may hold the final report
@@ -946,6 +950,7 @@ final class Proxy
             http_response_code(200);
             header('Content-Type: application/json');
             $view = self::publicView($json, $alias, $rates, $reserved);
+            $result['first_byte_ns'] = hrtime(true);
             echo json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             $bound = self::viewBytes($view); // what the client received, never discarded upstream fields
             return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;

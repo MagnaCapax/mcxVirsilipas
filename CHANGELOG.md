@@ -2,6 +2,16 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.8.0 (2026-10-16)
+
+Schema 7 to 8: `usage` gains `first_byte_ms` and `attempts`, plus an index on `(key_id, ts)`. `init` upgrades a schema-2 to 7 ledger in place; existing usage rows get no first-byte time and 0 attempts. An older release's `init` refuses a schema-8 ledger.
+
+- **Time to first byte and upstream attempts per request.** Each usage row records when the client got its first byte (`first_byte_ms`, from the start of the upstream request; `NULL` when nothing reached the client) and how many upstream requests it took (`attempts`, retries and failover included). `stats` adds `mean_first_byte_ms` and `retried`. Neither changes a charge.
+- **`bin/virsilipas top`:** a live terminal view of the traffic (in flight, caps, and for the last minute, 5 minutes and hour: rate, failures, duration and first-byte percentiles, output tokens per second, tokens, credits, upstream cost, retries, hang-ups; per model and upstream; the most recent requests). `--once` prints one view, `--interval N` sets the redraw. Metadata only: the ledger holds no prompt or answer.
+- **`bin/virsilipas keys`:** one JSON line per key (ref, active, balance, group, bonus, created, last used).
+- **README:** how to keep request bodies off disk under the proxy (nginx body buffer, PHP's temporary directory, swap and core dumps, upstream retention).
+- **docs/adr/0018:** performance and cost metrics live in the ledger.
+
 ## v0.7.2 (2026-10-16)
 
 No schema change.

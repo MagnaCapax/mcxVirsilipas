@@ -30,6 +30,8 @@ function testIntegrationNonStreamDebitsReportedUsage(): void
     same(10000 - 18, settled($ref)['balance']);
     $u = lastUsage($ref);
     same([18, 18, 0, 0, 0], [$u['reported'], $u['charged'], $u['estimated'], $u['aborted'], $u['over_reservation']]);
+    same(1, $u['attempts']);
+    check($u['first_byte_ms'] !== null && $u['first_byte_ms'] <= $u['duration_ms'], 'non-stream: first byte when the answer was sent');
 }
 
 function testIntegrationStreamDebitsExactly(): void
@@ -42,6 +44,8 @@ function testIntegrationStreamDebitsExactly(): void
     check(str_contains($r['body'], '"total_tokens":21'), 'standard usage still reaches the client');
     checkNoUpstreamDetails($r['body']);
     same(10000 - 21, settled($ref)['balance']);
+    $u = lastUsage($ref);
+    check($u['first_byte_ms'] !== null && $u['first_byte_ms'] <= $u['duration_ms'] && $u['attempts'] === 1, 'stream: time to the first relayed byte, one attempt');
     $up = json_decode((string) file_get_contents(Harness::get()['dir'] . '/last-request.json'), true);
     same('scenario-ok', $up['model'], 'alias mapped to the upstream model');
     foreach (['n', 'best_of', 'store', 'modalities'] as $k) {
