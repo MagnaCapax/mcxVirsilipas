@@ -8,8 +8,8 @@ namespace MagnaCapax\Virsilipas;
  * The credit ledger: keys with one never-resetting balance each, idempotent grants,
  * per-request leases (reserve -> settle), per-key limits and a metadata-only usage log.
  *
- * Every balance change is a short BEGIN IMMEDIATE transaction; creating, rotating and enabling
- * a key are single statements. Nothing is held open while a
+ * Every balance change is a short BEGIN IMMEDIATE transaction; creating a key is a single statement,
+ * and rotating, enabling and removing one are short transactions too. Nothing is held open while a
  * request streams, so a slow client never blocks other keys.
  *
  * A lease's reservation is taken from the balance when the request starts and stays
@@ -28,9 +28,11 @@ final class Ledger
     /** Largest grant accepted in one call, and the largest balance magnitude kept. Far inside int64. */
     public const MAX_GRANT = 1_000_000_000_000_000;
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
-    private const SCHEMA_VERSION = 8;
-    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 7 gain the columns below. */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7];
+    /** The latest expires_at accepted: 9999-12-31T23:59:59Z. */
+    private const MAX_TIME = 253_402_300_799;
+    private const SCHEMA_VERSION = 9;
+    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 8 gain the columns below. */
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -42,7 +44,9 @@ final class Ledger
      * the spend caps: the upper bound of a lease's upstream cost, held against the caps while the request runs
      * (spend_hourly gains the settled upstream cost per hour as well). Schema 8, for performance metrics: the
      * milliseconds until the first byte reached the client (NULL when nothing did) and how many upstream attempts the
-     * request made, retries and failover included (0 on rows written before schema 8).
+     * request made, retries and failover included (0 on rows written before schema 8). Schema 9, for the key lifecycle:
+     * when a key was removed for good (NULL while it lives), and a grant's expiry time, stored for a future expiry
+     * policy and not enforced (NULL: never expires; every grant written before schema 9).
      */
     private const ADDED_COLUMNS = [
         'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
@@ -50,7 +54,9 @@ final class Ledger
             'delay_ms' => 'INTEGER NOT NULL DEFAULT 0', 'source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))',
             'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))', 'first_byte_ms' => 'INTEGER',
             'attempts' => 'INTEGER NOT NULL DEFAULT 0'],
-        'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''"],
+        'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''",
+            'removed_at' => 'INTEGER'],
+        'grants' => ['expires_at' => 'INTEGER'],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
     /** The largest bonus percent a key can carry (also the CHECK in ADDED_COLUMNS). */
@@ -223,6 +229,7 @@ final class Ledger
             if ($e->getCode() !== '23000') {
                 throw $e; // only a constraint violation means "already exists"
             }
+            $this->liveKeyId($ref); // a removed ref is refused as removed
             throw new HttpError(409, 'a key already exists for this ref');
         }
         return $key;
@@ -235,56 +242,104 @@ final class Ledger
     public function rotateKey(string $ref): string
     {
         $key = 'vsk-' . bin2hex(random_bytes(24));
-        $st = $this->db->prepare('UPDATE keys SET key_hash = ? WHERE ref = ?');
-        $st->execute([hash('sha256', $key), $ref]);
-        if ($st->rowCount() !== 1) {
-            throw new HttpError(404, 'unknown ref');
-        }
-        return $key;
+        return $this->tx(function () use ($ref, $key): string {
+            $this->db->prepare('UPDATE keys SET key_hash = ? WHERE id = ?')->execute([hash('sha256', $key), $this->liveKeyId($ref)]);
+            return $key;
+        });
     }
 
     public function setActive(string $ref, bool $active): void
     {
-        $st = $this->db->prepare('UPDATE keys SET active = ? WHERE ref = ?');
-        $st->execute([$active ? 1 : 0, $ref]);
-        if ($st->rowCount() !== 1) {
-            throw new HttpError(404, 'unknown ref');
-        }
+        $this->tx(function () use ($ref, $active): void {
+            $this->db->prepare('UPDATE keys SET active = ? WHERE id = ?')->execute([$active ? 1 : 0, $this->liveKeyId($ref)]);
+        });
+    }
+
+    /**
+     * Removes a ref's key for good: no key can authenticate as it again (its hash is replaced by a value no
+     * sha256 hex digest equals), it is disabled, and the ref can never be rotated, re-enabled, granted to or
+     * created again. The balance, the grants, the credit log and the usage rows stay, under the same key id.
+     * Removing a removed key changes nothing (applied false).
+     * @return array{applied: bool, removed_at: int, balance: int}
+     */
+    public function removeKey(string $ref): array
+    {
+        return $this->tx(function () use ($ref): array {
+            $st = $this->db->prepare('SELECT id, balance, removed_at FROM keys WHERE ref = ?');
+            $st->execute([$ref]);
+            $k = $st->fetch(\PDO::FETCH_ASSOC);
+            $st->closeCursor();
+            if ($k === false) {
+                throw new HttpError(404, 'unknown ref');
+            }
+            if ($k['removed_at'] !== null) {
+                return ['applied' => false, 'removed_at' => (int) $k['removed_at'], 'balance' => (int) $k['balance']];
+            }
+            $now = time();
+            $this->db->prepare("UPDATE keys SET key_hash = 'removed:' || id, active = 0, removed_at = ? WHERE id = ?")->execute([$now, (int) $k['id']]);
+            return ['applied' => true, 'removed_at' => $now, 'balance' => (int) $k['balance']];
+        });
     }
 
     /**
      * Applies a billing grant once per grant id. Credits may be negative (refund or chargeback).
-     * Retrying with the same grant id and the same ref and amount is a no-op; reusing a grant id
-     * for anything else is a conflict.
-     * @return array{applied: bool, balance: int}
+     * Retrying with the same grant id and the same ref, amount and expires_at is a no-op; reusing a grant id
+     * for anything else is a conflict. A removed key takes no new grant.
+     * expires_at (unix seconds, or null for never) is stored for a future expiry policy and NOT enforced:
+     * nothing changes the balance when it passes. created_at records when the grant was added.
+     * @return array{applied: bool, balance: int, expires_at: ?int}
      */
-    public function grant(string $ref, string $grantId, int $credits): array
+    public function grant(string $ref, string $grantId, int $credits, ?int $expiresAt = null): array
     {
         if ($credits === 0 || abs($credits) > self::MAX_GRANT || $grantId === '') {
             throw new HttpError(400, 'grant needs a grant_id and nonzero credits of at most ' . self::MAX_GRANT);
         }
-        return $this->tx(function () use ($ref, $grantId, $credits): array {
+        return $this->tx(function () use ($ref, $grantId, $credits, $expiresAt): array {
             $keyId = $this->keyIdByRef($ref);
-            $st = $this->db->prepare('SELECT key_id, credits FROM grants WHERE grant_id = ?');
+            $st = $this->db->prepare('SELECT key_id, credits, expires_at FROM grants WHERE grant_id = ?');
             $st->execute([$grantId]);
             $prior = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($prior !== false) {
-                if ((int) $prior['key_id'] !== $keyId || (int) $prior['credits'] !== $credits) {
-                    throw new HttpError(409, 'grant_id was already used for a different ref or amount');
+                if ((int) $prior['key_id'] !== $keyId || (int) $prior['credits'] !== $credits
+                    || ($prior['expires_at'] === null ? null : (int) $prior['expires_at']) !== $expiresAt) {
+                    throw new HttpError(409, 'grant_id was already used for a different ref, amount or expires_at');
                 }
-                return ['applied' => false, 'balance' => $this->balanceOf($keyId)];
+                return ['applied' => false, 'balance' => $this->balanceOf($keyId), 'expires_at' => $expiresAt];
+            }
+            $this->liveKeyId($ref);
+            $now = time();
+            if ($expiresAt !== null && ($expiresAt <= $now || $expiresAt > self::MAX_TIME)) {
+                throw new HttpError(400, 'expires_at must be null or a future unix time in seconds', param: 'expires_at');
             }
             $new = $this->balanceOf($keyId) + $credits;
             if (abs($new) > self::MAX_BALANCE) {
                 throw new HttpError(400, 'grant would take the balance out of range');
             }
-            $this->db->prepare('INSERT INTO grants (grant_id, key_id, credits, created_at) VALUES (?, ?, ?, ?)')
-                ->execute([$grantId, $keyId, $credits, time()]);
+            $this->db->prepare('INSERT INTO grants (grant_id, key_id, credits, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+                ->execute([$grantId, $keyId, $credits, $now, $expiresAt]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$credits, $keyId]);
             $this->logCredit($keyId, 'grant', $credits, $grantId);
-            return ['applied' => true, 'balance' => $new];
+            return ['applied' => true, 'balance' => $new, 'expires_at' => $expiresAt];
         });
+    }
+
+    /**
+     * A key's grants, newest first, at most $limit: what was added, when, and the stored (not enforced) expiry.
+     * @return list<array{grant_id: string, credits: int, created_at: int, expires_at: ?int}>
+     */
+    public function grants(int $keyId, int $limit): array
+    {
+        $st = $this->db->prepare('SELECT grant_id, credits, created_at, expires_at FROM grants WHERE key_id = ? ORDER BY rowid DESC LIMIT ?');
+        $st->bindValue(1, $keyId, \PDO::PARAM_INT);
+        $st->bindValue(2, max(1, min($limit, 1000)), \PDO::PARAM_INT);
+        $st->execute();
+        $rows = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $rows[] = ['grant_id' => (string) $r['grant_id'], 'credits' => (int) $r['credits'], 'created_at' => (int) $r['created_at'],
+                'expires_at' => $r['expires_at'] === null ? null : (int) $r['expires_at']];
+        }
+        return $rows;
     }
 
     /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}|null */
@@ -308,7 +363,7 @@ final class Ledger
             throw new HttpError(400, 'bonus_pct must be an integer from 0 to ' . self::MAX_BONUS_PCT);
         }
         return $this->tx(function () use ($ref, $pct): int {
-            $this->db->prepare('UPDATE keys SET bonus_pct = ? WHERE id = ?')->execute([$pct, $this->keyIdByRef($ref)]);
+            $this->db->prepare('UPDATE keys SET bonus_pct = ? WHERE id = ?')->execute([$pct, $this->liveKeyId($ref)]);
             return $pct;
         });
     }
@@ -326,7 +381,7 @@ final class Ledger
             throw new HttpError(400, 'key_group must be at most 64 of a-z, 0-9, dot, dash and underscore');
         }
         return $this->tx(function () use ($ref, $group): string {
-            $this->db->prepare('UPDATE keys SET key_group = ? WHERE id = ?')->execute([$group, $this->keyIdByRef($ref)]);
+            $this->db->prepare('UPDATE keys SET key_group = ? WHERE id = ?')->execute([$group, $this->liveKeyId($ref)]);
             return $group;
         });
     }
@@ -412,17 +467,17 @@ final class Ledger
 
     /**
      * Every key: its ref, whether it is active, its balance, group and bonus, when it was created and when it last
-     * settled a request (null if never), ordered by ref.
-     * @return list<array{ref: string, active: bool, balance: int, key_group: string, bonus_pct: int, created_at: int, last_used: ?int}>
+     * settled a request (null if never) and when it was removed (null while it lives), ordered by ref.
+     * @return list<array{ref: string, active: bool, balance: int, key_group: string, bonus_pct: int, created_at: int, last_used: ?int, removed_at: ?int}>
      */
     public function keys(): array
     {
         $rows = [];
-        foreach ($this->db->query('SELECT k.ref, k.active, k.balance, k.key_group, k.bonus_pct, k.created_at,
+        foreach ($this->db->query('SELECT k.ref, k.active, k.balance, k.key_group, k.bonus_pct, k.created_at, k.removed_at,
                 (SELECT MAX(u.ts) FROM usage u WHERE u.key_id = k.id) AS last_used FROM keys k ORDER BY k.ref')->fetchAll(\PDO::FETCH_ASSOC) as $r) {
             $rows[] = ['ref' => (string) $r['ref'], 'active' => (bool) $r['active'], 'balance' => (int) $r['balance'],
                 'key_group' => (string) $r['key_group'], 'bonus_pct' => (int) $r['bonus_pct'], 'created_at' => (int) $r['created_at'],
-                'last_used' => $r['last_used'] === null ? null : (int) $r['last_used']];
+                'last_used' => $r['last_used'] === null ? null : (int) $r['last_used'], 'removed_at' => $r['removed_at'] === null ? null : (int) $r['removed_at']];
         }
         return $rows;
     }
@@ -480,7 +535,7 @@ final class Ledger
             $values[] = $value;
         }
         return $this->tx(function () use ($ref, $sets, $values): array {
-            $keyId = $this->keyIdByRef($ref);
+            $keyId = $this->liveKeyId($ref);
             if ($sets !== []) {
                 $this->db->prepare('UPDATE keys SET ' . implode(', ', $sets) . ' WHERE id = ?')->execute([...$values, $keyId]);
             }
@@ -693,10 +748,11 @@ final class Ledger
      * per value of each grouping asked for (model alias, upstream, key ref, upstream HTTP status), oldest
      * first, with request counts, token sums, credits charged, the upstream's reported cost (and how many
      * requests carried one), hang-ups, estimated charges, failed requests and the mean duration.
+     * With $keyId, only that key's rows are counted (a customer's own usage).
      * @param list<string> $groups any of model, upstream, key, status
      * @return list<array<string, int|string|null>>
      */
-    public function stats(string $bucket, array $groups = [], ?int $since = null, ?int $until = null): array
+    public function stats(string $bucket, array $groups = [], ?int $since = null, ?int $until = null, ?int $keyId = null): array
     {
         if (!isset(self::STATS_BUCKETS[$bucket])) {
             throw new \InvalidArgumentException('bucket must be one of ' . implode(', ', array_keys(self::STATS_BUCKETS)));
@@ -720,8 +776,8 @@ final class Ledger
                 SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms,
                 SUM(u.delay_ms > 0) AS delayed, CAST(AVG(u.delay_ms) AS INTEGER) AS mean_delay_ms,
                 CAST(AVG(u.first_byte_ms) AS INTEGER) AS mean_first_byte_ms, SUM(u.attempts > 1) AS retried
-            FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ? GROUP BY $group ORDER BY $group");
-        $st->execute([$since ?? 0, $until ?? PHP_INT_MAX]);
+            FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ?" . ($keyId === null ? '' : ' AND u.key_id = ?') . " GROUP BY $group ORDER BY $group");
+        $st->execute($keyId === null ? [$since ?? 0, $until ?? PHP_INT_MAX] : [$since ?? 0, $until ?? PHP_INT_MAX, $keyId]);
         $rows = [];
         foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
             foreach ($r as $name => $v) {
@@ -828,6 +884,22 @@ final class Ledger
             throw new HttpError(404, 'unknown ref');
         }
         return (int) $id;
+    }
+
+    /** A ref's key id, refused with 409 when the key was removed (removal is final). */
+    private function liveKeyId(string $ref): int
+    {
+        $st = $this->db->prepare('SELECT id, removed_at FROM keys WHERE ref = ?');
+        $st->execute([$ref]);
+        $k = $st->fetch(\PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        if ($k === false) {
+            throw new HttpError(404, 'unknown ref');
+        }
+        if ($k['removed_at'] !== null) {
+            throw new HttpError(409, 'the key for this ref was removed; a removed ref cannot be changed or used again', code: 'key_removed');
+        }
+        return (int) $k['id'];
     }
 
     private function balanceOf(int $keyId): int

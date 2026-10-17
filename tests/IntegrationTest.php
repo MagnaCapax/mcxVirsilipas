@@ -301,8 +301,8 @@ function testIntegrationAdminFlow(): void
     same(409, http('POST', '/admin/keys', ['ref' => $ref], 'admin-secret')['status']);
 
     $g = ['ref' => $ref, 'grant_id' => "inv-$ref", 'credits' => 5000];
-    same(['applied' => true, 'balance' => 5000], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true));
-    same(['applied' => false, 'balance' => 5000], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true), 'retried push');
+    same(['applied' => true, 'balance' => 5000, 'expires_at' => null], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true));
+    same(['applied' => false, 'balance' => 5000, 'expires_at' => null], json_decode(http('POST', '/admin/grants', $g, 'admin-secret')['body'], true), 'retried push');
     same(409, http('POST', '/admin/grants', ['credits' => 6000] + $g, 'admin-secret')['status'], 'same grant_id, different amount');
     same(400, http('POST', '/admin/grants', ['ref' => $ref, 'grant_id' => 'old-field', 'tokens' => 10], 'admin-secret')['status'], 'the field is credits');
 

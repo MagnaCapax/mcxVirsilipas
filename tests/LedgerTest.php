@@ -24,10 +24,10 @@ function testGrantIsAppliedOncePerGrantId(): void
 {
     $l = freshLedger();
     $l->createKey('a');
-    same(['applied' => true, 'balance' => 500], $l->grant('a', 'inv-1', 500));
-    same(['applied' => false, 'balance' => 500], $l->grant('a', 'inv-1', 500), 'retry of the same grant');
-    same(['applied' => true, 'balance' => 800], $l->grant('a', 'sub-2026-10', 300), 'subscription adds to the same balance');
-    same(['applied' => true, 'balance' => 700], $l->grant('a', 'refund-1', -100), 'negative grant');
+    same(['applied' => true, 'balance' => 500, 'expires_at' => null], $l->grant('a', 'inv-1', 500));
+    same(['applied' => false, 'balance' => 500, 'expires_at' => null], $l->grant('a', 'inv-1', 500), 'retry of the same grant');
+    same(['applied' => true, 'balance' => 800, 'expires_at' => null], $l->grant('a', 'sub-2026-10', 300), 'subscription adds to the same balance');
+    same(['applied' => true, 'balance' => 700, 'expires_at' => null], $l->grant('a', 'refund-1', -100), 'negative grant');
 }
 
 function testGrantIdReusedForSomethingElseIsAConflict(): void
@@ -408,7 +408,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(8, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(9, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');

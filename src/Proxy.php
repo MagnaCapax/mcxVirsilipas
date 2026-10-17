@@ -31,6 +31,9 @@ final class Proxy
     private const NEXT_STATUSES = [401, 402, 403, 404];
     /** Upstream error codes passed on to the client, because the client can act on them. */
     private const PASSED_CODES = ['context_length_exceeded'];
+    /** GET /v1/usage: the longest window in days, and how many of the newest grants it lists. */
+    private const USAGE_MAX_DAYS = 400;
+    private const USAGE_MAX_GRANTS = 200;
 
     public function __construct(private readonly Config $config, private readonly Ledger $ledger)
     {
@@ -59,6 +62,29 @@ final class Proxy
         Http::json(200, ['balance' => $s['balance'], 'reserved' => $s['reserved'], 'in_flight' => $s['in_flight'],
             'limits' => $s['limits'], 'window' => $s['window'], 'bonus_pct' => $s['bonus_pct'],
             'weight' => $this->config->throttle->weight($s['balance'], $s['bonus_pct'], self::internalCaller())]);
+    }
+
+    /**
+     * GET /v1/usage?days=N: the caller's own balance, its usage over the last N UTC days (today included; default 30,
+     * 1 to 400) per day and per model alias, and its newest grants. Only the authenticated key's rows are read; no other
+     * key, no ref and no upstream cost appear.
+     */
+    public function usage(): void
+    {
+        $key = $this->authenticate();
+        $days = $_GET['days'] ?? '30';
+        if (!is_string($days) || preg_match('/^[0-9]{1,3}$/', $days) !== 1 || (int) $days < 1 || (int) $days > self::USAGE_MAX_DAYS) {
+            throw new HttpError(400, 'days must be an integer from 1 to ' . self::USAGE_MAX_DAYS, code: 'invalid_value', param: 'days');
+        }
+        $days = (int) $days;
+        $since = intdiv(time(), 86400) * 86400 - ($days - 1) * 86400;
+        $view = static fn (array $r): array => ['requests' => $r['requests'], 'prompt_tokens' => $r['prompt_tokens'],
+            'cached_tokens' => $r['cached_tokens'], 'completion_tokens' => $r['completion_tokens'], 'reasoning_tokens' => $r['reasoning_tokens'],
+            'credits' => $r['credits']];
+        $daily = array_map(static fn (array $r): array => ['day' => $r['bucket']] + $view($r), $this->ledger->stats('day', [], $since, null, $key['id']));
+        $models = array_map(static fn (array $r): array => ['model' => $r['model']] + $view($r), $this->ledger->stats('all', ['model'], $since, null, $key['id']));
+        Http::json(200, ['balance' => $key['balance'], 'days' => $days, 'since' => $since, 'daily' => $daily, 'models' => $models,
+            'grants' => $this->ledger->grants($key['id'], self::USAGE_MAX_GRANTS)]);
     }
 
     public function chat(): void

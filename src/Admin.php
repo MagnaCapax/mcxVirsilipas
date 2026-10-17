@@ -46,18 +46,38 @@ final class Admin
         Http::json(200, ['ref' => $ref, 'active' => $b['active']]);
     }
 
-    /** POST /admin/grants {"ref", "grant_id", "credits"} — applied once per grant_id; credits may be negative. */
+    /**
+     * POST /admin/keys/remove {"ref": "..."} — removes the ref's key for good: it never authenticates again and the
+     * ref cannot be rotated, re-enabled, granted to or created again. Balance, grants, credit log and usage stay. Idempotent.
+     */
+    public function removeKey(): void
+    {
+        $ref = self::ref($this->body());
+        $r = $this->ledger->removeKey($ref);
+        Log::write('info', 'key_remove', ['ref' => $ref, 'applied' => $r['applied']]);
+        Http::json(200, ['ref' => $ref] + $r);
+    }
+
+    /**
+     * POST /admin/grants {"ref", "grant_id", "credits", "expires_at"?} — applied once per grant_id; credits may be negative.
+     * expires_at (unix seconds, or null/absent for never) is stored for a future expiry policy and not enforced.
+     */
     public function grant(): void
     {
         $b = $this->body();
         $ref = self::ref($b);
         $grantId = $b['grant_id'] ?? null;
         $credits = $b['credits'] ?? null;
+        $expiresAt = $b['expires_at'] ?? null;
         if (!is_string($grantId) || $grantId === '' || strlen($grantId) > 200 || !is_int($credits)) {
             throw new HttpError(400, 'grant needs a string grant_id and an integer credits');
         }
-        $r = $this->ledger->grant($ref, $grantId, $credits);
-        Log::write('info', 'grant', ['ref' => $ref, 'grant_id' => $grantId, 'credits' => $credits, 'applied' => $r['applied'], 'balance' => $r['balance']]);
+        if ($expiresAt !== null && !is_int($expiresAt)) {
+            throw new HttpError(400, 'expires_at must be null or a future unix time in seconds', param: 'expires_at');
+        }
+        $r = $this->ledger->grant($ref, $grantId, $credits, $expiresAt);
+        Log::write('info', 'grant', ['ref' => $ref, 'grant_id' => $grantId, 'credits' => $credits, 'expires_at' => $r['expires_at'],
+            'applied' => $r['applied'], 'balance' => $r['balance']]);
         Http::json(200, $r);
     }
 

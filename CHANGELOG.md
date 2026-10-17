@@ -2,6 +2,16 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.9.0 (2026-10-17)
+
+Schema 8 to 9: `keys` gains `removed_at` and `grants` gains `expires_at` (both `NULL` by default). `init` upgrades a schema-2 to 8 ledger in place; existing keys are not removed and existing grants never expire. An older release's `init` refuses a schema-9 ledger. Backups by `.backup` carry the schema version as before; a `.dump` must still add `PRAGMA user_version` (README "Backups").
+
+- **`POST /admin/keys/remove {"ref"}`** removes a key for good: it never authenticates again, it is disabled and its removal time is kept. The balance, grants, credit log and usage rows stay. Removing again answers `applied: false`. The removal is final: rotating, re-enabling, setting limits, a new grant and creating a key for the ref again answer 409 `key_removed`; a retried grant applied before the removal still answers as before. `bin/virsilipas keys` shows `removed_at`.
+- **Grants can carry `expires_at`** (unix seconds, in the future; absent or `null` for never), stored with the grant and returned by `POST /admin/grants`. It is stored for a future expiry policy and **not enforced**: the balance does not change when it passes. A retry must repeat it: the same `grant_id` with another `expires_at` is a conflict (409), like another ref or amount. `created_at` already records when each grant was added.
+- **`GET /v1/usage?days=N`** (customer key; `days` 1 to 400, default 30): the caller's own balance, its usage over the last N UTC days (today included) per day and per model alias (requests, prompt, cached, completion and reasoning tokens, credits), and its newest 200 grants with their dates and expiries. Only the caller's own rows; no ref, no other key, no upstream cost.
+- **README: a getting-started path at the top:** a five-minute local quick start against the test suite's stand-in upstream, a *Call the API* section (curl, JavaScript, the PHP example clients, OpenAI-compatible tools), troubleshooting for clients and operators, and the minimum configuration; the endpoint list and the example clients (now *PHP: the example clients*) moved up; every other section keeps its name and anchor.
+- **docs/adr/0019:** a key reads its own usage, and nothing else. ADR 0006 (grant expiry stored, not enforced), 0013 (the usage endpoint) and 0015 (key removal) amended.
+
 ## v0.8.2 (2026-10-16)
 
 No schema change.

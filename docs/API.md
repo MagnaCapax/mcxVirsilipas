@@ -2,15 +2,17 @@
 
 This is the complete HTTP API of the proxy as the code in this repository implements it: every route, what each accepts and returns, every header it sets and every error it can answer. How credits, metering, limits and throttling work is explained in the [README](../README.md); this file links there instead of repeating it. `tests/DocsTest.php` fails when a route, error code, error message or response header in the code is missing here, so the two change together.
 
-There are eight routes: three for clients and five for your billing system.
+There are ten routes: four for clients and six for your billing system.
 
 | Method and path | Auth | What it does |
 |---|---|---|
 | [`POST /v1/chat/completions`](#post-v1chatcompletions) | key | OpenAI-compatible chat completions, streaming or not |
 | [`GET /v1/models`](#get-v1models) | key | the model aliases and their rates |
 | [`GET /v1/balance`](#get-v1balance) | key | the calling key's balance, limits and priority |
+| [`GET /v1/usage`](#get-v1usage) | key | the calling key's own usage per day and per model, and its grants |
 | [`POST /admin/keys`](#post-adminkeys) | admin token | create a key for a user |
 | [`POST /admin/keys/rotate`](#post-adminkeysrotate) | admin token | replace a user's key |
+| [`POST /admin/keys/remove`](#post-adminkeysremove) | admin token | remove a user's key for good |
 | [`POST /admin/keys/active`](#post-adminkeysactive) | admin token | disable or re-enable a key |
 | [`POST /admin/keys/limits`](#post-adminkeyslimits) | admin token | set a key's limits, bonus and group |
 | [`POST /admin/grants`](#post-admingrants) | admin token | add or remove credits, once per grant id |
@@ -28,7 +30,7 @@ Any other method or path answers 404 `not found`.
   {"error": {"message": "credit balance too low for this request", "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}
   ```
 
-  `code` is a stable machine-readable reason, or `null` for the admin routes and the two catch-all errors, where the message identifies the error. `param` names the request field when there is one. Nothing an upstream said is ever passed on, except the code `context_length_exceeded`. The full list is under [Errors](#errors).
+  `code` is a stable machine-readable reason, or `null` for the admin routes (except 409 `key_removed`) and the two catch-all errors, where the message identifies the error. `param` names the request field when there is one. Nothing an upstream said is ever passed on, except the code `context_length_exceeded`. The full list is under [Errors](#errors).
 - **Retry-After** (seconds) comes with every 429 and 503 (see [Headers](#headers)).
 
 ## Client API
@@ -163,6 +165,30 @@ Without a key this route answers 401, which is the health check: it needs php-fp
 | `bonus_pct` | the key's loyalty bonus, 0 to 300 |
 | `weight` | the key's priority (1 to 10,000) for this caller's source; see [Priority and throttling](../README.md#priority-and-throttling) |
 
+### GET /v1/usage
+
+`GET /v1/usage?days=7` → 200
+
+```json
+{"balance": 49999946, "days": 7, "since": 1791676800,
+ "daily": [{"day": "2026-10-17", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 54}],
+ "models": [{"model": "default", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 54}],
+ "grants": [{"grant_id": "invoice-1001", "credits": 50000000, "created_at": 1792224000, "expires_at": null}]}
+```
+
+The calling key's own data, and nothing about any other key: every number comes from that key's rows only, and the response has no ref, no upstream and no upstream cost.
+
+| Field | Meaning |
+|---|---|
+| `balance` | as in `GET /v1/balance` |
+| `days` | the window asked for: `days`, an integer from 1 to 400, default 30; anything else answers 400 `invalid_value` `days must be an integer from 1 to 400` |
+| `since` | the window's start (unix seconds): midnight UTC `days - 1` days ago, so `days=1` is today so far |
+| `daily` | one row per UTC day with requests in the window, oldest first; days without requests are left out |
+| `models` | one row per model alias over the whole window, by alias |
+| `requests`, `prompt_tokens`, `cached_tokens`, `completion_tokens`, `reasoning_tokens` | the requests settled and their token counts as charged (`cached_tokens` is part of `prompt_tokens`, `reasoning_tokens` part of `completion_tokens`); failed requests count as requests |
+| `credits` | credits charged |
+| `grants` | the key's newest 200 grants, newest first: `grant_id`, `credits` (negative for a refund), `created_at` (when it was added) and `expires_at` (`null`: never; stored, not enforced, see [POST /admin/grants](#post-admingrants)) |
+
 ## Admin API
 
 For your billing system. Use a long random admin token (32 bytes or more) and keep these routes off the public internet (see [Access control](../README.md#access-control)). Every admin route can answer:
@@ -171,7 +197,7 @@ For your billing system. Use a long random admin token (32 bytes or more) and ke
 - 400 `invalid_json`;
 - 400 `ref must be a non-empty string (max 200 bytes)`.
 
-Every route except `POST /admin/keys` also answers 404 `unknown ref`. Each call is logged with its ref (`key_create`, `key_rotate`, `key_active`, `key_limits`, `grant`).
+Every route except `POST /admin/keys` also answers 404 `unknown ref`. Every route except `POST /admin/keys/remove` answers 409 `key_removed` `the key for this ref was removed; a removed ref cannot be changed or used again` when the ref's key was removed (a retried grant applied before the removal still answers as before). Each call is logged with its ref (`key_create`, `key_rotate`, `key_remove`, `key_active`, `key_limits`, `grant`).
 
 `ref` is your billing system's stable id for the user (not a per-service id), so all of a user's purchases add to one balance.
 
@@ -186,6 +212,12 @@ Creates the user's key. The key is returned only this once; the proxy keeps only
 `{"ref": "customer-42"}` → 200 `{"ref": "customer-42", "key": "vsk-..."}`
 
 Replaces the ref's key with a new one, returned once: for a leaked key. The old key answers 401 at once. The balance, limits, credit log and usage stay with the ref.
+
+### POST /admin/keys/remove
+
+`{"ref": "customer-42"}` → 200 `{"ref": "customer-42", "applied": true, "removed_at": 1792224000, "balance": 1234}`
+
+Removes the ref's key for good, for a closed account: the key answers 401 on every client route from then on, and the key is disabled. Removal is final: the ref cannot be rotated, re-enabled, given limits, granted to or created again (409 `key_removed`). The balance (returned for your records), grants, credit log and usage stay in the ledger. Removing a removed key changes nothing and answers `"applied": false` with the original `removed_at`.
 
 ### POST /admin/keys/active
 
@@ -226,17 +258,19 @@ The 400s:
 
 ### POST /admin/grants
 
-`{"ref": "customer-42", "grant_id": "invoice-1001", "credits": 1000000}` → 200 `{"applied": true, "balance": 1000000}`
+`{"ref": "customer-42", "grant_id": "invoice-1001", "credits": 1000000}` → 200 `{"applied": true, "balance": 1000000, "expires_at": null}`
 
 Adds credits once per `grant_id`.
-- **Retries:** sending the same `grant_id` for the same ref and amount again changes nothing and answers `{"applied": false, "balance": ...}`.
+- **Retries:** sending the same `grant_id` for the same ref, amount and `expires_at` again changes nothing and answers `{"applied": false, "balance": ..., "expires_at": ...}`.
+- **`expires_at`** (optional): a unix time in seconds, in the future (at most 9999-12-31), or absent or `null` for never. It is stored with the grant for a future expiry policy and is **not enforced**: nothing happens to the balance when it passes. `created_at`, shown in `GET /v1/usage`, records when the grant was added.
 - **Refunds:** negative credits remove credits. A balance can go below zero this way, and the key's requests then answer 402 until a grant brings it back up.
 - **grant_id choice:** use one that is unique per payment, such as the invoice number, or the subscription id plus its billing period. Then a retried push never credits twice and a renewal is never dropped.
 
 Errors:
 - 400 `grant needs a string grant_id and an integer credits`, when `grant_id` is not a string of 1 to 200 bytes or `credits` is not an integer;
 - 400 `grant needs a grant_id and nonzero credits of at most 1000000000000000` (10^15 either way);
-- 409 `grant_id was already used for a different ref or amount`;
+- 400 `expires_at must be null or a future unix time in seconds`;
+- 409 `grant_id was already used for a different ref, amount or expires_at`;
 - 400 `grant would take the balance out of range`, past ±10^18.
 
 ## Errors
@@ -248,7 +282,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 400 | `invalid_request_error` | `invalid_json` | request body must be a JSON object | | all POST routes |
 | 400 | `invalid_request_error` | `invalid_messages` | messages must be a non-empty array · each message needs a role · message name must be a string · message tool_call_id must be a string · tool_calls must be a non-empty list · each tool call needs string id, type, function name and arguments (a JSON string) | | chat |
 | 400 | `invalid_request_error` | `unsupported_content` | only text content is supported · message content must be text | | chat |
-| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer | | chat |
+| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 | | chat · usage |
 | 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat, from the upstream |
 | 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat, from the upstream |
 | 401 | `authentication_error` | `invalid_api_key` | missing bearer key · invalid key | | client routes |
@@ -264,10 +298,11 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 503 | `server_error` | `spend_cap_reached` | the server has reached its spending limit for this hour (or day, or month) | until that window ends | chat |
 | 503 | `api_error` | `upstream_unavailable` | upstream unavailable, retry shortly | 1 | chat, from the upstream |
 | 504 | `api_error` | `upstream_timeout` | upstream timed out | | chat, from the upstream |
-| 400 | `invalid_request_error` | `null` | ref must be a non-empty string (max 200 bytes) · active must be true or false · grant needs a string grant_id and an integer credits · grant needs a grant_id and nonzero credits of at most 1000000000000000 · grant would take the balance out of range · unknown limit; use max_concurrent, requests_per_minute, credits_per_minute · \<limit\> must be null (the default) or an integer from 1 to 1000000000000000 · bonus_pct must be an integer from 0 to 300 · key_group must be at most 64 of a-z, 0-9, dot, dash and underscore | | admin |
+| 400 | `invalid_request_error` | `null` | ref must be a non-empty string (max 200 bytes) · active must be true or false · grant needs a string grant_id and an integer credits · grant needs a grant_id and nonzero credits of at most 1000000000000000 · grant would take the balance out of range · unknown limit; use max_concurrent, requests_per_minute, credits_per_minute · \<limit\> must be null (the default) or an integer from 1 to 1000000000000000 · bonus_pct must be an integer from 0 to 300 · key_group must be at most 64 of a-z, 0-9, dot, dash and underscore · expires_at must be null or a future unix time in seconds | | admin |
 | 401 | `authentication_error` | `null` | invalid admin token | | admin |
 | 404 | `invalid_request_error` | `null` | unknown ref | | admin |
-| 409 | `invalid_request_error` | `null` | a key already exists for this ref · grant_id was already used for a different ref or amount | | admin |
+| 409 | `invalid_request_error` | `null` | a key already exists for this ref · grant_id was already used for a different ref, amount or expires_at | | admin |
+| 409 | `invalid_request_error` | `key_removed` | the key for this ref was removed; a removed ref cannot be changed or used again | | admin, after `POST /admin/keys/remove` |
 | 404 | `invalid_request_error` | `null` | not found | | any other method or path |
 | 500 | `api_error` | `null` | internal error | | any route: an unexpected failure, such as a config that cannot be loaded or a ledger that cannot be read or written |
 

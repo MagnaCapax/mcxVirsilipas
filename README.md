@@ -4,7 +4,7 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 
 - One key per user, one balance per key. The balance never expires and never resets.
 - Your billing system adds credits through an admin endpoint ("grants"). Each grant applies once, however often it is retried.
-- Clients can read their remaining credits, their limits and their last minute's use; you set per-key limits on concurrency, requests per minute and credits per minute.
+- Clients can read their remaining credits, their limits and their last minute's use, and their own usage per day and per model with the grants that added to the balance; you set per-key limits on concurrency, requests per minute and credits per minute.
 - Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests. Two example clients are in `examples/`.
 - Optional soft throttling: when the day's spend nears a budget, or the server is busy, requests slow down or are asked to retry, by a per-key priority weight (more credit and a larger bonus mean higher priority), instead of being refused.
 - Optional hard caps for the whole server: upstream spend per hour, day and month, and requests per minute across all keys. Set a spend cap to 0 to stop everything at once.
@@ -157,7 +157,7 @@ php examples/client.php chat "one word, please" --key-file /path/to/key   # the 
 
 A tool or library that lets you set an OpenAI-compatible base URL and API key can use the proxy: set the base URL to `https://proxy.example/v1`, the key to your `vsk-` key and the model to an alias from `GET /v1/models`. What it can expect:
 
-- Under `/v1` the proxy serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /v1/balance`, and nothing else. Any other path answers 404 `not found`.
+- Under `/v1` the proxy serves `POST /v1/chat/completions`, `GET /v1/models`, `GET /v1/balance` and `GET /v1/usage`, and nothing else. Any other path answers 404 `not found`.
 - Message content must be text. An image, audio or file part answers 400 `unsupported_content`.
 - Function tools (`tools`, `tool_choice`, `parallel_tool_calls`) are forwarded, and tool calls come back in the answer.
 - Fields the proxy does not forward, such as `n` or `store`, are dropped without an error. The [request fields](docs/API.md#post-v1chatcompletions) table lists what is kept.
@@ -177,11 +177,13 @@ The full reference, with every request field, response shape, header and error, 
 | `POST /v1/chat/completions` | key | OpenAI-compatible chat completions, streaming or not; `model` is one of your aliases |
 | `GET /v1/models` | key | the aliases with their rates, `context_length` and `max_completion_tokens`; upstream model ids and URLs are never shown |
 | `GET /v1/balance` | key | the calling key's balance, reservations, limits, last minute's use and priority weight |
+| `GET /v1/usage` | key | the calling key's own balance, usage per day and per model over the last `days` (default 30), and its grants |
 | `POST /admin/keys` | admin token | creates a user's key, returned once |
 | `POST /admin/keys/rotate` | admin token | replaces a leaked key; the old one answers 401 at once |
+| `POST /admin/keys/remove` | admin token | removes a key for good; its balance and history stay, the ref cannot be used again |
 | `POST /admin/keys/active` | admin token | disables or re-enables a key |
 | `POST /admin/keys/limits` | admin token | sets a key's limits, `bonus_pct` and `key_group` |
-| `POST /admin/grants` | admin token | adds or removes credits, once per `grant_id` |
+| `POST /admin/grants` | admin token | adds or removes credits, once per `grant_id`; an optional `expires_at` is stored, not enforced |
 
 Client routes take `Authorization: Bearer <key>`; admin routes take `Authorization: Bearer <admin token>`. Use a long random admin token (32 bytes or more); only its sha256 is stored in the config.
 
@@ -406,6 +408,7 @@ Every setting is optional. A spend cap of `0` stops every request at once, which
 | `requests_per_minute`, `credits_per_minute` | one key | config defaults; `bin/virsilipas limit` per key | 429 with `Retry-After` |
 | Disabled key | one key | `bin/virsilipas key-disable`, `POST /admin/keys/active` | 403 |
 | Leaked key | one key | `bin/virsilipas key-rotate`, `POST /admin/keys/rotate` (the old key answers 401 at once) | 401 |
+| Removed key | one key | `POST /admin/keys/remove` (final; balance and history stay) | 401 |
 | `caps.requests_per_minute` | whole server | config `caps` | 429 `server_rate_limit` |
 | `caps.hour`, `caps.day`, `caps.month` | whole server, upstream cost | config `caps` | 503 `spend_cap_reached` |
 | `throttle.daily_budget` | whole server, credits | config `throttle` | requests wait, lower weights longer; nothing refused |
@@ -533,7 +536,7 @@ virsilipas init | key-create <ref> | key-rotate <ref> | key-disable <ref> | key-
            | keys | top [--once] [--interval N]
 ```
 
-`keys` prints one JSON line per key: ref, active, balance, group, bonus, when it was created and when it was last used. `top` is a live view of the traffic, redrawn every `--interval` seconds (default 2, 1 to 60) until interrupted; `--once` prints one view without terminal control codes. It shows the requests in flight (internal and external, the oldest one's age, and the ten oldest by key ref, source, age and credits reserved), the caps against their limits, and for the last minute, 5 minutes and hour: requests and requests per second, failures, duration and time to first byte (p50 and p95, over successful requests), output tokens per second, tokens, credits charged, the upstream cost, retried requests and client hang-ups; then the last 5 minutes by model and upstream, and the most recent requests with their key ref, status and timings. It reads the ledger only, so it shows metadata and never a prompt or an answer. Run it as the php-fpm user (or root) with the same config.
+`keys` prints one JSON line per key: ref, active, balance, group, bonus, when it was created, when it was last used and when it was removed (`null` while it lives). `top` is a live view of the traffic, redrawn every `--interval` seconds (default 2, 1 to 60) until interrupted; `--once` prints one view without terminal control codes. It shows the requests in flight (internal and external, the oldest one's age, and the ten oldest by key ref, source, age and credits reserved), the caps against their limits, and for the last minute, 5 minutes and hour: requests and requests per second, failures, duration and time to first byte (p50 and p95, over successful requests), output tokens per second, tokens, credits charged, the upstream cost, retried requests and client hang-ups; then the last 5 minutes by model and upstream, and the most recent requests with their key ref, status and timings. It reads the ledger only, so it shows metadata and never a prompt or an answer. Run it as the php-fpm user (or root) with the same config.
 
 ## Tests
 

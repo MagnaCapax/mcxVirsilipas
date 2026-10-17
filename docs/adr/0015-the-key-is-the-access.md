@@ -1,7 +1,7 @@
 # ADR 0015: The key is the access
 
 Date: 2026-10-16
-In force since: v0.1.0 (the internal-source signal since v0.5.0)
+In force since: v0.1.0 (the internal-source signal since v0.5.0, key removal since v0.9.0)
 
 ## Status
 Accepted
@@ -19,9 +19,12 @@ The proxy authorizes every client request by its key and never by the client's a
 
 Because the key is the whole credential, the proxy never stores it: only its sha256 hash is kept, a new key is shown once when it is created or rotated, and rotation replaces the hash while the ref keeps its balance, limits and history. The admin endpoints are authenticated the same way, by comparing the sha256 of the bearer token with `admin_token_sha256` in the configuration. Billing works by ref and is never given a customer key after creation.
 
+A key can be removed for good (`POST /admin/keys/remove`): its hash is replaced by `removed:<id>`, a value no sha256 hex digest equals, so no key can authenticate as it again; it is disabled and its removal time recorded. The ref stays taken and the removal is final: rotating, re-enabling, changing limits, a new grant and creating a key for the ref again all answer 409 `key_removed` (a retried grant applied before the removal still answers as before). The balance, grants, credit log and usage rows stay under the same key id, so the audit trail (ADR 0009) is unchanged.
+
 ## Consequences
 - A leaked key is handled by rotating it (`POST /admin/keys/rotate`), not by address rules.
+- A closed account is removed rather than deleted: nothing in the ledger is lost, and a removed ref cannot be brought back by mistake.
 - Running the proxy only for one network is a firewall setting, not a code change.
 
 ## References
-src/Proxy.php (`authenticate`, `internalCaller`); src/Ledger.php (`createKey`, `rotateKey`, `findKey`); src/Admin.php (admin token check); invariants 16 and 17; README "Access control".
+src/Proxy.php (`authenticate`, `internalCaller`); src/Ledger.php (`createKey`, `rotateKey`, `removeKey`, `findKey`); src/Admin.php (admin token check); invariants 16 and 17; README "Access control".

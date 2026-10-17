@@ -38,6 +38,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 | [0016](docs/adr/0016-throttle-slows-never-blocks.md) | The throttle slows, never blocks |
 | [0017](docs/adr/0017-releases-and-safe-deploys.md) | Releases are tags; safe deploys |
 | [0018](docs/adr/0018-metrics-live-in-the-ledger.md) | Performance and cost metrics live in the ledger |
+| [0019](docs/adr/0019-a-key-reads-its-own-usage.md) | A key reads its own usage, and nothing else |
 
 ## Invariants the tests protect
 
