@@ -20,8 +20,8 @@ namespace MagnaCapax\Virsilipas;
  * Every change to a balance writes one credit_log row in the same transaction: the change, the
  * balance after it, its kind (grant, reserve, refund, or the opening balance carried over by a
  * schema upgrade) and what caused it (the grant id or the lease). The table is append-only:
- * triggers refuse UPDATE and DELETE. For every key, the deltas sum to the balance, and each row's
- * balance_after is the running sum up to it; verify() checks both.
+ * triggers refuse UPDATE, DELETE and an INSERT that would replace an existing row. For every key,
+ * the deltas sum to the balance, and each row's balance_after is the running sum up to it; verify() checks both.
  */
 final class Ledger
 {
@@ -30,9 +30,12 @@ final class Ledger
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
     /** The latest expires_at accepted: 9999-12-31T23:59:59Z. */
     private const MAX_TIME = 253_402_300_799;
-    private const SCHEMA_VERSION = 9;
-    /** Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 8 gain the columns below. */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8];
+    private const SCHEMA_VERSION = 10;
+    /**
+     * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 8 gain the columns below, and every older
+     * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
+     */
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -78,7 +81,10 @@ final class Ledger
     public function __construct(string $path)
     {
         $dir = dirname($path);
-        if (is_dir($dir) && (fileperms($dir) & 0022) !== 0) {
+        if (!is_dir($dir)) {
+            throw new \RuntimeException("ledger directory $dir does not exist (db_path $path); create it, owned by the PHP user, mode 700");
+        }
+        if ((fileperms($dir) & 0022) !== 0) {
             throw new \RuntimeException("ledger directory $dir is writable by group or others");
         }
         foreach ([$path, "$path-wal", "$path-shm"] as $f) {
@@ -212,6 +218,11 @@ final class Ledger
                 BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS credit_log_no_delete BEFORE DELETE ON credit_log
                 BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
+            -- INSERT OR REPLACE deletes the old row without firing the delete trigger (unless recursive_triggers is on).
+            CREATE TRIGGER IF NOT EXISTS credit_log_no_replace BEFORE INSERT ON credit_log
+                WHEN EXISTS (SELECT 1 FROM credit_log WHERE id = NEW.id)
+                BEGIN SELECT RAISE(ABORT, 'credit_log is append-only'); END;
+            CREATE INDEX IF NOT EXISTS grants_key ON grants(key_id); -- grants(): a key's own grants
             SQL);
     }
 

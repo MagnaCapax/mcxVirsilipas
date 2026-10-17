@@ -408,7 +408,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(9, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');
@@ -481,4 +481,11 @@ function testMigrateUpgradesASchemaTwoLedgerWithOpeningBalances(): void
     same([], $l->verify()['problems']);
     $l->migrate(); // re-running init on the upgraded ledger adds nothing
     same(3, $l->verify()['rows']);
+}
+
+function testAMissingLedgerDirectoryIsNamed(): void
+{
+    $path = tempDir() . '/nowhere/ledger.sqlite';
+    $msg = throwsRuntime(fn () => new Ledger($path));
+    check(str_contains($msg, 'does not exist') && str_contains($msg, $path), $msg);
 }

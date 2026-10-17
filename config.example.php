@@ -32,6 +32,8 @@ return [
     // always sent for this model, overriding the client (for example a fixed reasoning level). A route entry may add
     // 'params' of its own on top, for upstreams that switch reasoning differently. The proxy's own fields (model,
     // messages, max_tokens, max_completion_tokens, stream, stream_options, n) cannot be set this way.
+    // 'params' are yours alone: they may hold any JSON value the upstream accepts, objects included, and a client can
+    // neither send nor override them (only the request fields listed in docs/API.md are forwarded, and 'params' win).
     'models' => [
         'default' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'description' => 'fast, everyday tasks',
             'route' => [['upstream' => 'main', 'model' => 'example-org/example-model'],

@@ -1,7 +1,7 @@
 # ADR 0019: A key reads its own usage, and nothing else
 
 Date: 2026-10-17
-In force since: v0.9.0
+In force since: v0.9.0 (the `grants` parameter since v0.9.1)
 
 ## Status
 Accepted
@@ -15,7 +15,7 @@ Customers want to see where their credits went: per day, per model, and which gr
 - A client endpoint authenticated by the customer's own key, scoped in SQL to that key's id.
 
 ## Decision
-`GET /v1/usage?days=N` (default 30, 1 to 400) authenticates exactly like `/v1/balance` and returns the caller's balance, its usage over the last N UTC days (today included) as one row per day and one per model alias (requests, prompt, cached, completion and reasoning tokens, credits charged), and its newest 200 grants (`grant_id`, `credits`, `created_at`, `expires_at`). Every query is filtered by the authenticated key's id (`Ledger::stats()` with a key id, `Ledger::grants()`); nothing in the request can name another key. The response carries no ref, no upstream, no upstream cost and no limit beyond what `/v1/balance` already shows.
+`GET /v1/usage?days=N` (default 30, 1 to 400) authenticates exactly like `/v1/balance` and returns the caller's balance, its usage over the last N UTC days (today included) as one row per day and one per model alias (requests, prompt, cached, completion and reasoning tokens, credits charged), and its newest grants (`grant_id`, `credits`, `created_at`, `expires_at`): 200 unless the `grants` parameter asks for 1 to 1000. An index on `grants(key_id)` keeps that a lookup, not a scan. Every query is filtered by the authenticated key's id (`Ledger::stats()` with a key id, `Ledger::grants()`); nothing in the request can name another key. The response carries no ref, no upstream, no upstream cost and no limit beyond what `/v1/balance` already shows.
 
 ## Consequences
 - Customers can check their own spending without the operator or billing.

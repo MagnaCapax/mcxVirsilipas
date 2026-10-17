@@ -628,14 +628,16 @@ function runSmoke(string $alias): array
     return [proc_close($p), $out];
 }
 
-function testIntegrationSmokeToolPassesAndDisablesItsKey(): void
+function testIntegrationSmokeToolPassesAndRemovesItsKey(): void
 {
     [$code, $out] = runSmoke('ok');
     same(0, $code, $out);
     check(str_contains($out, 'credit log: grant, reserve, refund'), $out);
+    check(str_contains($out, 'ok   GET /v1/balance answered 200') && str_contains($out, 'ok   GET /v1/usage answered 200'), $out);
     check(!str_contains($out, 'vsk-'), 'the key is never printed');
-    check(preg_match('/key (smoke-\S+) disabled/', $out, $m) === 1, $out);
+    check(preg_match('/key (smoke-\S+) removed/', $out, $m) === 1, $out);
     same(false, Harness::get()['ledger']->status($m[1], lim())['active'], 'smoke key disabled');
+    same(false, Harness::get()['ledger']->removeKey($m[1])['applied'], 'and removed for good');
 }
 
 function testIntegrationSmokeToolFailsWhenTheUpstreamFails(): void
@@ -643,7 +645,7 @@ function testIntegrationSmokeToolFailsWhenTheUpstreamFails(): void
     [$code, $out] = runSmoke('busy');
     same(1, $code, $out);
     check(str_contains($out, 'FAIL ') && str_contains($out, 'credit log: grant, reserve, refund'), 'the failed request was refunded in full: ' . $out);
-    check(str_contains($out, 'disabled'), $out);
+    check(str_contains($out, 'removed'), $out);
 }
 
 function testIntegrationModelWithItsOwnUpstreamUsesItsOwnUrlAndKey(): void
@@ -672,4 +674,82 @@ function testIntegrationRequestBodyMustBeAJsonObject(): void
     same(400, $r['status'], $r['body']);
     $e = json_decode($r['body'], true)['error'] ?? [];
     check(array_key_exists('code', $e) && $e['code'] === null, 'an empty object reaches the ref check: ' . $r['body']);
+}
+
+/** A POST with a raw body and the response headers: [status, headers (lowercase name => value), body]. */
+function rawPost(string $path, string $body, string $bearer): array
+{
+    $ch = curl_init(Harness::get()['proxy'] . $path);
+    $headers = [];
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 30,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', "Authorization: Bearer $bearer"],
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$headers): int {
+            if (str_contains($line, ':')) {
+                [$name, $value] = explode(':', $line, 2);
+                $headers[strtolower(trim($name))] = trim($value);
+            }
+            return strlen($line);
+        }]);
+    $out = (string) curl_exec($ch);
+    return [(int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE), $headers, $out];
+}
+
+function testIntegrationANumberJsonCannotCarryIsRefusedBeforeAnythingIsSentOrReserved(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $log = Harness::get()['dir'] . '/requests.jsonl';
+    $upstreamBefore = is_file($log) ? count(file($log)) : 0;
+    foreach (['"temperature": 1e999', '"temperature": -1e400', '"top_p": 1e309', '"tools": [{"type": "function", "x": 1e999}]'] as $field) {
+        [$status, , $body] = rawPost('/v1/chat/completions', '{"model": "ok", "messages": [{"role": "user", "content": "hi"}], ' . $field . '}', $key);
+        same(400, $status, "$field: $body");
+        $e = json_decode($body, true)['error'] ?? [];
+        same(['invalid_json', 'request body has a number out of range'], [$e['code'] ?? null, $e['message'] ?? null], $field);
+    }
+    [$status, , $body] = rawPost('/admin/grants', '{"ref": "' . $ref . '", "grant_id": "x", "credits": 1e999}', 'admin-secret');
+    same([400, 'invalid_json'], [$status, json_decode($body, true)['error']['code'] ?? null], 'the admin routes too');
+    same(10000, settled($ref)['balance'], 'nothing reserved or charged');
+    same($upstreamBefore, is_file($log) ? count(file($log)) : 0, 'nothing reached the upstream');
+    // A large but finite number is a number like any other.
+    [$status] = rawPost('/v1/chat/completions', '{"model": "ok", "messages": [{"role": "user", "content": "hi"}], "temperature": 1e300}', $key);
+    same(200, $status);
+}
+
+function testIntegrationNoPhpVersionHeader(): void
+{
+    // The test servers run with expose_php on, so this checks the proxy's own header_remove().
+    [, $key] = fundedKey(10000);
+    [$status, $headers] = rawPost('/v1/chat/completions', (string) json_encode(msg('ok', false)), $key);
+    same(200, $status);
+    check(!isset($headers['x-powered-by']), 'no X-Powered-By on a 200: ' . json_encode($headers));
+    [$status, $headers] = rawPost('/v1/nowhere', '{}', $key);
+    same(404, $status);
+    check(!isset($headers['x-powered-by']), 'nor on an error');
+}
+
+function testIntegrationReasoningUnderTheNameReasoningIsAnAnswerRelayedAndCounted(): void
+{
+    // Non-stream, max_tokens spent on reasoning: no content, only 'reasoning'. A real answer the upstream bills.
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('reasoning-field', false), $key);
+    same(200, $r['status'], $r['body']);
+    $j = json_decode($r['body'], true);
+    same(['role' => 'assistant', 'content' => '', 'reasoning' => 'thinking it over'], $j['choices'][0]['message']);
+    settled($ref);
+    same([18, 0], [lastUsage($ref)['charged'], lastUsage($ref)['estimated']], 'charged by the usage report');
+
+    // Stream: the reasoning deltas reach the client, and the charge is the final report.
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('reasoning-field', true), $key);
+    same(200, $r['status']);
+    check(str_contains($r['body'], '"delta":{"reasoning":"r1 "}') && str_contains($r['body'], '"delta":{"reasoning":"r10 "}'), $r['body']);
+    settled($ref);
+    same([21, 0], [lastUsage($ref)['charged'], lastUsage($ref)['estimated']]);
+
+    // A hang-up during reasoning: what was relayed is counted, so the proxy reads on to the upstream's report.
+    [$ref, $key] = fundedKey(10000);
+    $r = http('POST', '/v1/chat/completions', msg('reasoning-field', true), $key, 300);
+    check($r['body'] !== '' && !str_contains($r['body'], '"usage"'), 'the client hung up before any usage report');
+    settled($ref);
+    $u = lastUsage($ref);
+    same([1, 0, 21, 10], [$u['aborted'], $u['estimated'], $u['charged'], $u['completion_tokens']], 'aborted, exact, the final report');
 }

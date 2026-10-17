@@ -4,9 +4,10 @@
 declare(strict_types=1);
 
 // Minimal example client for a Virsilipas-compatible proxy. Zero dependencies beyond ext-curl and
-// ext-json. Base URL: --url or VIRSILIPAS_URL. Key: VIRSILIPAS_KEY or --key-file <path> (never on
-// the command line, so it never shows up in the process list). Exit codes: 0 ok, 1 request failed,
-// 2 usage error.
+// ext-json. Key: VIRSILIPAS_KEY or --key-file <path> (never on the command line, so it never shows up in
+// the process list). The key file holds either just the key, or a line key=<key> and optionally a line
+// endpoint=<base URL>. Base URL: --url, else the key file's endpoint, else VIRSILIPAS_URL.
+// Exit codes: 0 ok, 1 request failed, 2 usage error.
 //   php client.php models | balance | chat "prompt" [--model alias] [--no-stream] [--show-thinking]
 
 function usageError(string $msg): never
@@ -14,6 +15,26 @@ function usageError(string $msg): never
     fwrite(STDERR, "$msg\nUsage: client.php models|balance|chat \"prompt\" [--model alias] [--no-stream] "
         . "[--show-thinking] [--url url] [--key-file file]\n");
     exit(2);
+}
+
+/**
+ * A key file: just the key, or lines key=<key> and endpoint=<base URL> (with or without a trailing /v1).
+ * Without a key= line the whole file, trimmed, is the key.
+ * @return array{key: string, endpoint: string}
+ */
+function readKeyFile(string $path): array
+{
+    $text = (string) @file_get_contents($path);
+    if (preg_match('/^[ \t]*key[ \t]*=/m', $text) !== 1) {
+        return ['key' => trim($text), 'endpoint' => ''];
+    }
+    $file = ['key' => '', 'endpoint' => ''];
+    preg_match_all('/^[ \t]*(key|endpoint)[ \t]*=(.*)$/m', $text, $m, PREG_SET_ORDER);
+    foreach ($m as [, $name, $value]) {
+        $file[$name] = trim(trim($value), '"\'');
+    }
+    $file['endpoint'] = (string) preg_replace('#/v1/?$#', '', rtrim($file['endpoint'], '/'));
+    return $file;
 }
 
 /** One SSE frame (up to the blank line) decoded to its 'data:' payload. Null = [DONE] or noise. */
@@ -72,7 +93,6 @@ function httpAttempt(string $method, string $url, ?array $body, string $key, boo
         fwrite(STDERR, 'request failed: ' . curl_error($ch) . "\n");
         exit(1);
     }
-    curl_close($ch);
     return $s;
 }
 
@@ -117,7 +137,7 @@ $cmd = array_shift($args) ?? '';
 if (!in_array($cmd, ['models', 'balance', 'chat'], true)) {
     usageError('unknown or missing command');
 }
-$opt = ['model' => 'default', 'url' => (string) (getenv('VIRSILIPAS_URL') ?: ''), 'key-file' => '', 'no-stream' => false, 'show-thinking' => false];
+$opt = ['model' => 'default', 'url' => '', 'key-file' => '', 'no-stream' => false, 'show-thinking' => false];
 $prompt = null;
 for ($i = 0; $i < count($args); $i++) {
     $a = $args[$i];
@@ -130,14 +150,17 @@ for ($i = 0; $i < count($args); $i++) {
     }
     $opt[$m[1]] = is_bool($opt[$m[1]]) ? true : ($args[++$i] ?? usageError("--{$m[1]} needs a value"));
 }
-if (($cmd === 'chat' && $prompt === null) || $opt['url'] === '') {
-    usageError($cmd === 'chat' && $prompt === null ? 'chat needs a prompt' : 'missing base URL: pass --url or set VIRSILIPAS_URL');
+$file = $opt['key-file'] !== '' ? readKeyFile($opt['key-file']) : ['key' => (string) (getenv('VIRSILIPAS_KEY') ?: ''), 'endpoint' => ''];
+// The key file's endpoint belongs with its key, so it comes before the environment's address.
+$url = $opt['url'] !== '' ? $opt['url'] : ($file['endpoint'] !== '' ? $file['endpoint'] : (string) (getenv('VIRSILIPAS_URL') ?: ''));
+if (($cmd === 'chat' && $prompt === null) || $url === '') {
+    usageError($cmd === 'chat' && $prompt === null ? 'chat needs a prompt' : 'missing base URL: pass --url, set VIRSILIPAS_URL or put endpoint= in the key file');
 }
-$key = $opt['key-file'] !== '' ? trim((string) file_get_contents($opt['key-file'])) : (string) (getenv('VIRSILIPAS_KEY') ?: '');
+$key = $file['key'];
 if ($key === '') {
     usageError('missing API key: pass --key-file or set VIRSILIPAS_KEY');
 }
-$base = rtrim($opt['url'], '/');
+$base = rtrim($url, '/');
 if (!preg_match('#^(https://|http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$))#', $base . '/')) {
     usageError('the base URL must be https (plain http only to this machine): the key travels with every request');
 }

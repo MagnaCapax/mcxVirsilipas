@@ -17,7 +17,11 @@ Usage: virsilipas <command> [args]
   key-rotate <ref>                  replace <ref>'s key (a leaked key); prints the new key once
   key-disable <ref>                 refuse all requests for <ref>
   key-enable <ref>                  allow requests for <ref> again
-  grant <ref> <credits> <grant_id>  add (or, if negative, remove) credits, once per grant_id
+  key-remove <ref>                  remove <ref>'s key for good (balance and history stay; the ref
+                                    cannot be used again)
+  grant <ref> <credits> <grant_id> [expires_at]
+                                    add (or, if negative, remove) credits, once per grant_id;
+                                    expires_at (unix seconds) is stored, not enforced
   limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
                                     credits_per_minute; 'default' follows the config again
   bonus <ref> <0..300>              set a key's bonus percent, which raises its priority weight
@@ -43,12 +47,17 @@ Usage: virsilipas <command> [args]
                                     the caps, refreshed every N seconds (default 2; Ctrl-C quits);
                                     --once prints one view and exits. Metadata only: no prompt or
                                     answer is stored, so none is shown
+  --help                            this text
 Config: $VIRSILIPAS_CONFIG or ./config.php
 
 TXT;
 
 $args = array_slice($argv, 1);
 $cmd = array_shift($args) ?? '';
+if (in_array($cmd, ['--help', '-h', 'help'], true)) {
+    echo $usage; // before the config is loaded: the usage needs none
+    exit(0);
+}
 
 try {
     $config = Config::load(virsilipas_config_path());
@@ -59,7 +68,8 @@ try {
         'key-rotate' => $ledger->rotateKey(arg($args, 0)),
         'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
-        'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1))),
+        'key-remove' => json_encode(['ref' => arg($args, 0)] + $ledger->removeKey(arg($args, 0))),
+        'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1), isset($args[3]) ? intArg($args, 3) : null)),
         'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
         'bonus' => json_encode(['ref' => arg($args, 0), 'bonus_pct' => $ledger->setBonus(arg($args, 0), intArg($args, 1))]),
         'group' => json_encode(['ref' => arg($args, 0), 'key_group' => $ledger->setGroup(arg($args, 0), arg($args, 1) === '-' ? '' : arg($args, 1))]),

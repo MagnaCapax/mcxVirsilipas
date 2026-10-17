@@ -77,14 +77,14 @@ The request goes to the upstream with the alias replaced by the real model id, `
     "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18,
     "prompt_tokens_details": {"cached_tokens": 0},
     "completion_tokens_details": {"reasoning_tokens": 0},
-    "credits": 18
+    "credits": 39
   }
 }
 ```
 
 - `id`, `object` and `created` are passed on when the upstream sends them with the right type (strings, and an integer `created`).
 - `model` is always the alias.
-- Each choice keeps `index`, `finish_reason` and `message` (or `delta` in a stream) with `role`, `content`, `reasoning_content`, `refusal` and `tool_calls` (`index`, `id`, `type`, `function.name`, `function.arguments`). A value of the wrong type is dropped.
+- Each choice keeps `index`, `finish_reason` and `message` (or `delta` in a stream) with `role`, `content`, `reasoning_content` or `reasoning` (upstreams use either name for the reasoning text; it is passed on under the name the upstream used), `refusal` and `tool_calls` (`index`, `id`, `type`, `function.name`, `function.arguments`). A value of the wrong type is dropped.
 - `usage` has the three standard counts, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` (0 when the upstream reports none) and `credits`, which is what this report costs at the alias's rates, at most the reservation. It is `null` when the upstream sent a usage object that is not a valid report.
 - Anything else the upstream sends is dropped.
 
@@ -95,7 +95,7 @@ data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"default","cho
 
 data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"default","choices":[{"index":0,"delta":{"content":"lo!"}}]}
 
-data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"default","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0},"credits":13}}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"default","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":0},"credits":19}}
 
 data: [DONE]
 ```
@@ -149,9 +149,9 @@ Without a key this route answers 401, which is the health check: it needs php-fp
 ### GET /v1/balance
 
 ```json
-{"balance": 49999982, "reserved": 0, "in_flight": 0,
+{"balance": 49999961, "reserved": 0, "in_flight": 0,
  "limits": {"max_concurrent": 5, "requests_per_minute": null, "credits_per_minute": null},
- "window": {"requests": 1, "credits": 18},
+ "window": {"requests": 1, "credits": 39},
  "bonus_pct": 0, "weight": 707}
 ```
 
@@ -167,12 +167,12 @@ Without a key this route answers 401, which is the health check: it needs php-fp
 
 ### GET /v1/usage
 
-`GET /v1/usage?days=7` → 200
+`GET /v1/usage?days=7` → 200 (`days` and `grants` are optional query parameters)
 
 ```json
-{"balance": 49999946, "days": 7, "since": 1791676800,
- "daily": [{"day": "2026-10-17", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 54}],
- "models": [{"model": "default", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 54}],
+{"balance": 49999922, "days": 7, "since": 1791676800,
+ "daily": [{"day": "2026-10-17", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 78}],
+ "models": [{"model": "default", "requests": 3, "prompt_tokens": 30, "cached_tokens": 0, "completion_tokens": 12, "reasoning_tokens": 0, "credits": 78}],
  "grants": [{"grant_id": "invoice-1001", "credits": 50000000, "created_at": 1792224000, "expires_at": null}]}
 ```
 
@@ -187,7 +187,7 @@ The calling key's own data, and nothing about any other key: every number comes 
 | `models` | one row per model alias over the whole window, by alias |
 | `requests`, `prompt_tokens`, `cached_tokens`, `completion_tokens`, `reasoning_tokens` | the requests settled and their token counts as charged (`cached_tokens` is part of `prompt_tokens`, `reasoning_tokens` part of `completion_tokens`); failed requests count as requests |
 | `credits` | credits charged |
-| `grants` | the key's newest 200 grants, newest first: `grant_id`, `credits` (negative for a refund), `created_at` (when it was added) and `expires_at` (`null`: never; stored, not enforced, see [POST /admin/grants](#post-admingrants)) |
+| `grants` | the key's newest grants, newest first, as many as the `grants` parameter asks for: an integer from 1 to 1000, default 200; anything else answers 400 `invalid_value` `grants must be an integer from 1 to 1000`. Each has `grant_id`, `credits` (negative for a refund), `created_at` (when it was added) and `expires_at` (`null`: never; stored, not enforced, see [POST /admin/grants](#post-admingrants)) |
 
 ## Admin API
 
@@ -206,6 +206,8 @@ Every route except `POST /admin/keys` also answers 404 `unknown ref`. Every rout
 `{"ref": "customer-42"}` → 201 `{"ref": "customer-42", "key": "vsk-..."}`
 
 Creates the user's key. The key is returned only this once; the proxy keeps only its hash. A second key for the same ref: 409 `a key already exists for this ref`.
+
+The call is not idempotent, so treat it as done only once the key is stored or delivered to the user. If the response is lost (a timeout, a crash before the key was saved), a retry answers 409; call `POST /admin/keys/rotate` for the ref instead, which returns a new key and voids the lost one. There is one key per ref: create keys for a ref from one place at a time.
 
 ### POST /admin/keys/rotate
 
@@ -279,10 +281,10 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 
 | Status | `type` | `code` | Message | Retry-After | Where |
 |---|---|---|---|---|---|
-| 400 | `invalid_request_error` | `invalid_json` | request body must be a JSON object | | all POST routes |
+| 400 | `invalid_request_error` | `invalid_json` | request body must be a JSON object · request body has a number out of range (such as `1e999`, which no float holds) | | all POST routes |
 | 400 | `invalid_request_error` | `invalid_messages` | messages must be a non-empty array · each message needs a role · message name must be a string · message tool_call_id must be a string · tool_calls must be a non-empty list · each tool call needs string id, type, function name and arguments (a JSON string) | | chat |
 | 400 | `invalid_request_error` | `unsupported_content` | only text content is supported · message content must be text | | chat |
-| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 | | chat · usage |
+| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 · grants must be an integer from 1 to 1000 | | chat · usage |
 | 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat, from the upstream |
 | 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat, from the upstream |
 | 401 | `authentication_error` | `invalid_api_key` | missing bearer key · invalid key | | client routes |
@@ -331,5 +333,5 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 
 ## Not part of the HTTP API
 
-- The command line (`bin/virsilipas`), which does everything the admin routes do and more (status, history, usage statistics, verify): see [CLI](../README.md#cli).
+- The command line (`bin/virsilipas`), which does everything the admin routes do (`key-remove` and `grant ... [expires_at]` included) and more (status, history, usage statistics, verify): see [CLI](../README.md#cli).
 - The upstream side: which upstreams serve an alias, their URLs and keys live only in the deployment's config.

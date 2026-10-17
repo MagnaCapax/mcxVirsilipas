@@ -258,6 +258,23 @@ switch ($model) {
         echo "data: [DONE]\n\n";
         $event(['choices' => [['index' => 0, 'delta' => ['content' => 'AFTER-DONE']]], 'usage' => $usage(2)]);
         exit;
+    case 'scenario-reasoning-field':
+        // Reasoning text under the name 'reasoning' (not reasoning_content), and an answer that spent max_tokens on it:
+        // no content at all. Usage only at the end of a stream, after slow events, for the hang-up test.
+        if (empty($req['stream'])) {
+            header('Content-Type: application/json');
+            echo json_encode(['id' => 'r', 'object' => 'chat.completion', 'choices' => [['index' => 0, 'finish_reason' => 'length',
+                'message' => ['role' => 'assistant', 'content' => '', 'reasoning' => 'thinking it over']]], 'usage' => $usage(7)]);
+            exit;
+        }
+        header('Content-Type: text/event-stream');
+        for ($i = 1; $i <= $chunks; $i++) {
+            $event(['id' => 'r', 'object' => 'chat.completion.chunk', 'choices' => [['index' => 0, 'delta' => ['reasoning' => "r$i "]]]]);
+            usleep(200000);
+        }
+        $event(['id' => 'r', 'object' => 'chat.completion.chunk', 'choices' => [], 'usage' => $usage($chunks)]);
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-truncated':
         header('Content-Type: application/json');
         header('Content-Length: 100000');

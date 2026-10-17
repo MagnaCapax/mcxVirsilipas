@@ -67,3 +67,22 @@ function testExamplesSendTheKeyOnlyOverHttpsOrToThisMachine(): void
         check(str_contains($err, 'must be https'), $err);
     }
 }
+
+function testExampleClientReadsAPlainOrAnIniKeyFile(): void
+{
+    [, $key] = fundedKey(1_000_000);
+    $dir = tempDir();
+    $proxy = Harness::get()['proxy'];
+    $files = ['plain' => "$key\n", 'ini' => "endpoint=$proxy/v1\nkey=$key\n", 'ini-quoted' => "# a comment\nkey = \"$key\"\r\nendpoint = $proxy/\r\n"];
+    foreach ($files as $name => $text) {
+        file_put_contents("$dir/$name", $text);
+        // No key and, for the INI files, no address in the environment: the file supplies both.
+        $env = ['VIRSILIPAS_KEY' => ''] + ($name === 'plain' ? [] : ['VIRSILIPAS_URL' => '']);
+        [$rc, $out, $err] = runExample('client.php', ['balance', '--key-file', "$dir/$name"], '', $env);
+        same(0, $rc, "$name key file: $err");
+        check(str_contains($out, 'balance=1000000 '), "$name key file: $out");
+    }
+    [$rc, , $err] = runExample('client.php', ['balance', '--key-file', "$dir/ini", '--url', 'http://proxy.example'], '', ['VIRSILIPAS_KEY' => '']);
+    same(2, $rc, '--url wins over the file, and is still checked');
+    check(str_contains($err, 'must be https'), $err);
+}

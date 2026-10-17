@@ -61,7 +61,8 @@ const SCENARIOS = ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage'
             'blank-tool' => 'scenario-blank-tool', 'stream-message' => 'scenario-stream-message', 'invalid-prelude' => 'scenario-invalid-prelude',
             'done-hang' => 'scenario-done-hang', 'stream-message-bytes' => 'scenario-stream-message-bytes', 'private-bytes' => 'scenario-private-bytes',
             'over-batch' => 'scenario-over-batch', 'error-after-start' => 'scenario-error-after-start', 'error-batched' => 'scenario-error-batched',
-            'named-error' => 'scenario-named-error', 'slow-final' => 'scenario-slow-final', 'usage-only' => 'scenario-usage-only'];
+            'named-error' => 'scenario-named-error', 'slow-final' => 'scenario-slow-final', 'usage-only' => 'scenario-usage-only',
+            'reasoning-field' => 'scenario-reasoning-field'];
 
 /** One credit per token of every kind: the credit counts equal the token counts. */
 function unitRates(): array
@@ -186,17 +187,21 @@ final class Harness
  * Starts php -S on a free loopback port and waits until it answers. A port found free can be taken by another process
  * before the server binds it; the server then exits and the port answers for someone else. So a server that is not
  * still running a moment after its port answers is started again on a new port, up to three times.
+ * Every server reports every PHP error, notice and deprecation to its log, and sends X-Powered-By unless the code removes
+ * it; serverLogProblems() fails the run if a log has a Deprecated or Warning line.
  * @param list<string> $args what follows -S host:port (the router script)
  * @param array<string, string> $env
  * @return array{0: resource, 1: int} the server process and its port
  */
 function startPhpServer(array $args, array $env, string $log): array
 {
+    $GLOBALS['virsilipasServerLogs'][$log] = true;
+    $ini = ['-d', 'error_reporting=-1', '-d', 'log_errors=1', '-d', 'expose_php=1'];
     for ($attempt = 1; ; $attempt++) {
         $s = stream_socket_server('tcp://127.0.0.1:0');
         $port = (int) substr(strrchr(stream_socket_get_name($s, false), ':'), 1);
         fclose($s);
-        $p = proc_open([PHP_BINARY, '-S', "127.0.0.1:$port", ...$args], [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, null, $env);
+        $p = proc_open([PHP_BINARY, ...$ini, '-S', "127.0.0.1:$port", ...$args], [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']], $pipes, null, $env);
         check(is_resource($p), 'could not start php -S');
         for ($i = 0; $i < 100 && !($c = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1)); $i++) {
             usleep(50000);
@@ -211,6 +216,23 @@ function startPhpServer(array $args, array $env, string $log): array
         proc_terminate($p);
         check($attempt < 3, "php -S could not bind a port three times (see $log)");
     }
+}
+
+/**
+ * The Deprecated and Warning lines in the logs of every php -S server the run started (at most 20).
+ * @return list<string>
+ */
+function serverLogProblems(): array
+{
+    $found = [];
+    foreach (array_keys($GLOBALS['virsilipasServerLogs'] ?? []) as $log) {
+        foreach (is_file($log) ? (file($log, FILE_IGNORE_NEW_LINES) ?: []) : [] as $line) {
+            if (preg_match('/\b(Deprecated|Warning)\b/', $line) === 1 && count($found) < 20) {
+                $found[] = basename($log) . ': ' . $line;
+            }
+        }
+    }
+    return $found;
 }
 
 /**
@@ -249,7 +271,6 @@ function http(string $method, string $path, ?array $body = null, ?string $bearer
     }
     curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
     return ['status' => $status, 'body' => $out, 'retry_after' => $retryAfter, 'request_id' => $requestId];
 }
 

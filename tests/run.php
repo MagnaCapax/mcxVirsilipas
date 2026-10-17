@@ -26,6 +26,12 @@ foreach ($tests as $test) {
     }
 }
 Harness::stop();
+// A deprecation or warning in a server is a failure even when every response looked right (it can turn a
+// response into an HTML notice under display_errors, or break a later PHP version).
+foreach (serverLogProblems() as $line) {
+    $failed++;
+    echo "FAIL php -S log: $line\n";
+}
 if ($failed > 0) {
     define('VIRSILIPAS_TESTS_FAILED', true);
 }

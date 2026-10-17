@@ -2,6 +2,25 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.9.1 (2026-10-17)
+
+Schema 9 to 10: an index on `grants(key_id)` and a trigger `credit_log_no_replace`. `init` upgrades a schema-2 to 9 ledger in place; no row changes. An older release's `init` refuses a schema-10 ledger.
+
+- **Reasoning under the name `reasoning`.** Some upstreams send the reasoning text as `message.reasoning` and `delta.reasoning` instead of `reasoning_content`. Both names are now kept, passed on under the name the upstream used and counted in the byte bound. Before, an answer that spent `max_tokens` on reasoning looked empty and answered 502 (while the upstream billed it), a stream dropped the reasoning text, and a hang-up during reasoning ended without the upstream's usage report.
+- **A number JSON cannot carry is refused.** A request body with a number no float holds (`1e999`) decoded to infinity, could not be encoded again, and went upstream as an empty body. It now answers 400 `invalid_json` `request body has a number out of range` before anything is reserved, and the proxy refuses to bound or forward any body that fails to encode.
+- **The credit log refuses `INSERT OR REPLACE`** of an existing row, which the update and delete triggers did not catch (schema 10).
+- **`GET /v1/usage?grants=M`** lists the newest M grants, 1 to 1000 (default 200, as before); anything else answers 400 `invalid_value`. The new index keeps the grants lookup off a table scan.
+- **No `X-Powered-By` header**, whatever `expose_php` says.
+- **CLI:** `key-remove <ref>`, an optional `expires_at` on `grant`, and `--help` without a config (exit 0).
+- **`tools/smoke.php`** also checks `GET /v1/balance` and `GET /v1/usage`, and removes its key for good instead of disabling it.
+- **`tools/deploy.php`** compares every column the backup has, in every table except `credit_log`, before it restores a backup; it compared only the schema-3 columns, so a CLI change to a later column (a bonus or group) made during a failed deploy was lost on restore.
+- **`examples/client.php --key-file`** also reads a file of `key=` and `endpoint=` lines; the endpoint is the base URL unless `--url` is given.
+- **A missing ledger directory** is named in the error, with the `db_path`.
+- **PHP 8.5:** the `curl_close()` calls (no-ops since PHP 8.0, deprecated in 8.5) are gone; CI runs 8.2 to 8.5 with every error and deprecation reported, and the suite fails on a `Deprecated` or `Warning` line in a test server's log. CI passes on pull requests from forks (the forbidden-word list is required only where the secret exists), pins the third-party PHP setup action to a commit and checks the PHPStan download's checksum.
+- **Releases leave out `tests/` and `.github/`** (`.gitattributes`), so the test suite's stand-in upstream never lands on a host.
+- **composer.json** requires `ext-ctype` and suggests `ext-posix`.
+- **README:** a complete nginx site and php-fpm pool; memory sizing for large bodies; version headers; never serving a checkout; the Debian packages; log retention by age (logrotate does not fit daily names); the restore steps end with `init` and `verify`, and a plain `.dump` is refused by `init`, not by the proxy; a Contributing section. **docs/API.md:** the example credits match the example rates; `POST /admin/keys` is not idempotent (on a lost response, rotate). ADR 0009 and 0019 amended.
+
 ## v0.9.0 (2026-10-17)
 
 Schema 8 to 9: `keys` gains `removed_at` and `grants` gains `expires_at` (both `NULL` by default). `init` upgrades a schema-2 to 8 ledger in place; existing keys are not removed and existing grants never expire. An older release's `init` refuses a schema-9 ledger. Backups by `.backup` carry the schema version as before; a `.dump` must still add `PRAGMA user_version` (README "Backups").

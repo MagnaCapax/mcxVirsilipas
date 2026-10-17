@@ -29,11 +29,14 @@ final class Proxy
     private const RETRY_STATUSES = [408, 409, 429, 502, 503, 504];
     /** Upstream statuses that are this upstream's problem (its key, its account's credit, its model id): the next one may answer. */
     private const NEXT_STATUSES = [401, 402, 403, 404];
+    /** The text fields of a message or delta: what makes an answer usable, and what the byte bound counts. */
+    private const TEXT_FIELDS = ['content', 'reasoning_content', 'reasoning', 'refusal'];
     /** Upstream error codes passed on to the client, because the client can act on them. */
     private const PASSED_CODES = ['context_length_exceeded'];
-    /** GET /v1/usage: the longest window in days, and how many of the newest grants it lists. */
+    /** GET /v1/usage: the longest window in days, and how many of the newest grants it lists by default and at most. */
     private const USAGE_MAX_DAYS = 400;
-    private const USAGE_MAX_GRANTS = 200;
+    private const USAGE_GRANTS = 200;
+    private const USAGE_MAX_GRANTS = 1000;
 
     public function __construct(private readonly Config $config, private readonly Ledger $ledger)
     {
@@ -65,18 +68,15 @@ final class Proxy
     }
 
     /**
-     * GET /v1/usage?days=N: the caller's own balance, its usage over the last N UTC days (today included; default 30,
-     * 1 to 400) per day and per model alias, and its newest grants. Only the authenticated key's rows are read; no other
-     * key, no ref and no upstream cost appear.
+     * GET /v1/usage?days=N&grants=M: the caller's own balance, its usage over the last N UTC days (today included;
+     * default 30, 1 to 400) per day and per model alias, and its newest M grants (default 200, 1 to 1000). Only the
+     * authenticated key's rows are read; no other key, no ref and no upstream cost appear.
      */
     public function usage(): void
     {
         $key = $this->authenticate();
-        $days = $_GET['days'] ?? '30';
-        if (!is_string($days) || preg_match('/^[0-9]{1,3}$/', $days) !== 1 || (int) $days < 1 || (int) $days > self::USAGE_MAX_DAYS) {
-            throw new HttpError(400, 'days must be an integer from 1 to ' . self::USAGE_MAX_DAYS, code: 'invalid_value', param: 'days');
-        }
-        $days = (int) $days;
+        $days = self::queryInt('days', 30, self::USAGE_MAX_DAYS);
+        $grants = self::queryInt('grants', self::USAGE_GRANTS, self::USAGE_MAX_GRANTS);
         $since = intdiv(time(), 86400) * 86400 - ($days - 1) * 86400;
         $view = static fn (array $r): array => ['requests' => $r['requests'], 'prompt_tokens' => $r['prompt_tokens'],
             'cached_tokens' => $r['cached_tokens'], 'completion_tokens' => $r['completion_tokens'], 'reasoning_tokens' => $r['reasoning_tokens'],
@@ -84,7 +84,17 @@ final class Proxy
         $daily = array_map(static fn (array $r): array => ['day' => $r['bucket']] + $view($r), $this->ledger->stats('day', [], $since, null, $key['id']));
         $models = array_map(static fn (array $r): array => ['model' => $r['model']] + $view($r), $this->ledger->stats('all', ['model'], $since, null, $key['id']));
         Http::json(200, ['balance' => $key['balance'], 'days' => $days, 'since' => $since, 'daily' => $daily, 'models' => $models,
-            'grants' => $this->ledger->grants($key['id'], self::USAGE_MAX_GRANTS)]);
+            'grants' => $this->ledger->grants($key['id'], $grants)]);
+    }
+
+    /** A query parameter that must be an integer from 1 to $max (plain digits, no sign or spaces), else 400 invalid_value. */
+    private static function queryInt(string $name, int $default, int $max): int
+    {
+        $v = $_GET[$name] ?? (string) $default;
+        if (!is_string($v) || preg_match('/^[0-9]{1,' . strlen((string) $max) . '}$/', $v) !== 1 || (int) $v < 1 || (int) $v > $max) {
+            throw new HttpError(400, "$name must be an integer from 1 to $max", code: 'invalid_value', param: $name);
+        }
+        return (int) $v;
     }
 
     public function chat(): void
@@ -151,7 +161,7 @@ final class Proxy
                     continue;
                 }
                 [$upstream, $servedHop] = [(string) parse_url($route['url'], PHP_URL_HOST), $hop]; // which upstream served it, for tracking per upstream
-                $body = self::rewrite($req, $route['model'], $lease['max_tokens'], $stream, $route['stream_options'], $route['params']);
+                $body = self::encode(self::rewrite($req, $route['model'], $lease['max_tokens'], $stream, $route['stream_options'], $route['params']));
                 for ($try = 0; $try <= $this->config->retries; $try++) {
                     if (connection_aborted()) {
                         break 2; // the client is gone: no further attempt is made for it
@@ -383,7 +393,21 @@ final class Proxy
      */
     public static function promptBound(array $req, array $params = []): int
     {
-        return strlen(json_encode(array_replace(self::promptFields($req), $params), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '') + 16;
+        return strlen(self::encode(array_replace(self::promptFields($req), $params))) + 16;
+    }
+
+    /**
+     * JSON for the upstream, or a RuntimeException (a 500 before anything is sent) when the value cannot be encoded:
+     * a body that fails to encode must never be forwarded empty or bounded as if it were.
+     * @param array<string, mixed> $v
+     */
+    public static function encode(array $v): string
+    {
+        $json = json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($json === false) {
+            throw new \RuntimeException('a request field cannot be encoded as JSON');
+        }
+        return $json;
     }
 
     /**
@@ -552,7 +576,9 @@ final class Proxy
             $choice = self::typed($c, ['index' => 'int', 'finish_reason' => '?string']);
             foreach (['message', 'delta'] as $k) {
                 if (self::isObject($c[$k] ?? null)) {
-                    $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => '?string', 'reasoning_content' => '?string', 'refusal' => '?string']);
+                    // Upstreams name the reasoning text reasoning_content or reasoning; each is passed on under its own name.
+                    $choice[$k] = self::typed($c[$k], ['role' => 'string', 'content' => '?string', 'reasoning_content' => '?string', 'reasoning' => '?string',
+                        'refusal' => '?string']);
                     $calls = self::toolCalls($c[$k]['tool_calls'] ?? null, false);
                     if ($calls !== []) {
                         $choice[$k]['tool_calls'] = $calls; // no usable call: no tool_calls, so it cannot make a choice usable
@@ -627,7 +653,7 @@ final class Proxy
     /**
      * What a 200 must carry. A stream starts on a choice whose delta has at least one valid field
      * (a role-only first delta counts). A non-stream answer must be complete: a message with
-     * non-empty text, reasoning or refusal, or a tool call with id, type, function name and
+     * non-empty text, reasoning (reasoning_content or reasoning) or refusal, or a tool call with id, type, function name and
      * arguments. Reasoning counts because an answer whose max_tokens went to reasoning is real,
      * paid output.
      */
@@ -644,7 +670,7 @@ final class Proxy
                 continue;
             }
             $m = $c['message'] ?? [];
-            foreach (['content', 'reasoning_content', 'refusal'] as $k) {
+            foreach (self::TEXT_FIELDS as $k) {
                 if (($m[$k] ?? '') !== '') {
                     return true; // typed() already guarantees string or null
                 }
@@ -680,14 +706,14 @@ final class Proxy
         return $n;
     }
 
-    /** Bytes of text a message or delta carries: content, reasoning, refusal and tool-call names and arguments. */
+    /** Bytes of text a message or delta carries: content, reasoning (either name), refusal and tool-call names and arguments. */
     private static function textBytes(mixed $part): int
     {
         if (!is_array($part)) {
             return 0;
         }
         $n = 0;
-        foreach (['content', 'reasoning_content', 'refusal'] as $k) {
+        foreach (self::TEXT_FIELDS as $k) {
             $n += is_string($part[$k] ?? null) ? strlen($part[$k]) : 0;
         }
         foreach (is_array($part['tool_calls'] ?? null) ? $part['tool_calls'] : [] as $t) {
@@ -799,11 +825,11 @@ final class Proxy
      * A client that hangs up stops the upstream request, and so does a stream whose reported usage
      * passes the reservation; what was delivered is still charged.
      * @param array{url: string, key: string, stream_options: array<string, mixed>} $route
-     * @param array<string, mixed> $body
+     * @param string $body the request as JSON (encode())
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
      * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool, first_byte_ns: ?int}
      */
-    private function forward(array $route, array $body, bool $stream, string $alias, array $rates, int $reserved, int $timeout): array
+    private function forward(array $route, string $body, bool $stream, string $alias, array $rates, int $reserved, int $timeout): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
         /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int} $s */
@@ -871,7 +897,7 @@ final class Proxy
         $ch = curl_init($route['url']);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            CURLOPT_POSTFIELDS => $body,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_TIMEOUT => $timeout,
@@ -952,7 +978,6 @@ final class Proxy
         curl_exec($ch);
         $curlErr = curl_errno($ch);
         $sent = curl_getinfo($ch, CURLINFO_PRETRANSFER_TIME) > 0; // false: the request never left (no connection, or TLS failed)
-        curl_close($ch);
 
         $status = $s['status'];
         $result = ['status' => $status, 'aborted' => $s['aborted'], 'kind' => 'final', 'retry_after' => $s['retry_after'], 'code' => null,

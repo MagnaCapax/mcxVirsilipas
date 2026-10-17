@@ -221,3 +221,25 @@ function testConfigRoutesPerModel(): void
     } catch (\RuntimeException) {
     }
 }
+
+function testPromptBoundAndEncodeRefuseWhatJsonCannotCarry(): void
+{
+    $req = ['messages' => [['role' => 'user', 'content' => 'hi']]];
+    foreach ([INF, -INF, NAN] as $bad) {
+        $threw = false;
+        try {
+            Proxy::promptBound($req + ['temperature' => $bad]);
+        } catch (\RuntimeException) {
+            $threw = true;
+        }
+        check($threw, 'a bound is never computed from a body that cannot be encoded');
+        $threw = false;
+        try {
+            Proxy::encode(['temperature' => $bad]);
+        } catch (\RuntimeException) {
+            $threw = true;
+        }
+        check($threw, 'nothing is forwarded empty');
+    }
+    same('{"a":"/é"}', Proxy::encode(['a' => '/é']));
+}

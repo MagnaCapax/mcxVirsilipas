@@ -12,8 +12,12 @@
   ],
   "require": {
     "php": ">=8.2",
+    "ext-ctype": "*",
     "ext-curl": "*",
     "ext-pdo_sqlite": "*"
+  },
+  "suggest": {
+    "ext-posix": "tools/deploy.php checks that it runs as root and looks up the PHP user"
   },
   "autoload": {
     "psr-4": {

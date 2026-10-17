@@ -36,6 +36,11 @@ final class Http
         if (!is_array($body) || ($body !== [] && array_is_list($body))) {
             throw new HttpError(400, 'request body must be a JSON object', code: 'invalid_json');
         }
+        // A number too large for a float (1e999) decodes to INF, which JSON cannot carry: the body could not be
+        // forwarded as it was sent, so it is refused here, before anything is reserved.
+        if (json_encode($body) === false) {
+            throw new HttpError(400, 'request body has a number out of range', code: 'invalid_json');
+        }
         return $body;
     }
 }

@@ -120,7 +120,7 @@ function testMigrateUpgradesASchemaSixLedgerAndBackfillsHourlyCost(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v6.sqlite");
-    same(9, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['1', '5', '9'], array_map('strval', $db->query('SELECT hour, charged, cost FROM spend_hourly')->fetch(\PDO::FETCH_NUM)), 'cost backfilled from the usage rows');
     same(['0'], array_map('strval', $db->query('SELECT DISTINCT cost_reserved FROM leases')->fetchAll(\PDO::FETCH_COLUMN)), 'old leases hold no bound');
     same([], $l->verify()['problems']);

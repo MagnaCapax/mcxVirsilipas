@@ -10,7 +10,7 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 - Optional hard caps for the whole server: upstream spend per hour, day and month, and requests per minute across all keys. Set a spend cap to 0 to stop everything at once.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
 - Works with OpenAI-compatible upstreams that honour `max_tokens` and report usage. You choose which models customers may use; check each one against the launch list below before enabling it.
-- No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions, built against SQLite 3.25 or newer. Storage is one SQLite file.
+- No dependencies beyond PHP 8.2 with the `curl` and `pdo_sqlite` extensions (and `ctype`, which the CLI and tools use and almost every PHP build has), built against SQLite 3.25 or newer. Storage is one SQLite file.
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
@@ -61,7 +61,7 @@ php -S 127.0.0.1:8080 public/index.php > "$DEMO/proxy.log" 2>&1 & PROXY_PID=$!
 ```sh
 bin/virsilipas init                                      # ok
 export VIRSILIPAS_KEY=$(bin/virsilipas key-create alice)  # a key is shown only once; this keeps it in the shell
-bin/virsilipas grant alice 1000000 demo-1                # {"applied":true,"balance":1000000}
+bin/virsilipas grant alice 1000000 demo-1                # {"applied":true,"balance":1000000,"expires_at":null}
 ```
 
 **4. Send a request:**
@@ -151,7 +151,7 @@ php examples/client.php chat "one word, please" --model default
 php examples/client.php chat "one word, please" --key-file /path/to/key   # the key from a file instead of VIRSILIPAS_KEY
 ```
 
-`examples/hello-world.php` is the smallest client: one question to the `default` alias (or `VIRSILIPAS_MODEL`), the answer, and the credits it cost. `examples/client.php` is a fuller one with no dependencies beyond the `curl` and `json` extensions. The key comes from `--key-file` or `VIRSILIPAS_KEY`, never the command line, so it never shows in `ps` and is never printed. `chat` streams the answer as it arrives (`--no-stream` for one JSON answer) and hides reasoning unless `--show-thinking` is given; it ends with a `usage:` line (prompt, completion, cached and reasoning tokens, and the credits charged). `models` prints each alias's rates; `balance` prints the balance, reservations, requests in flight, weight, bonus, limits and the last minute's use. On a 429 or 503 with `Retry-After` it waits and retries once; any other refusal prints the proxy's error (`message`, `type`, `code`) to stderr. Exit codes: 0 ok, 1 request failed, 2 usage error.
+`examples/hello-world.php` is the smallest client: one question to the `default` alias (or `VIRSILIPAS_MODEL`), the answer, and the credits it cost. `examples/client.php` is a fuller one with no dependencies beyond the `curl` and `json` extensions. The key comes from `--key-file` or `VIRSILIPAS_KEY`, never the command line, so it never shows in `ps` and is never printed. A key file holds either the key alone or, in the form some deployments hand out, a `key=<key>` line and an `endpoint=<base URL>` line (with or without the trailing `/v1`); the base URL is then `--url` if given, else the file's `endpoint`, else `VIRSILIPAS_URL`. `chat` streams the answer as it arrives (`--no-stream` for one JSON answer) and hides reasoning unless `--show-thinking` is given; it ends with a `usage:` line (prompt, completion, cached and reasoning tokens, and the credits charged). `models` prints each alias's rates; `balance` prints the balance, reservations, requests in flight, weight, bonus, limits and the last minute's use. On a 429 or 503 with `Retry-After` it waits and retries once; any other refusal prints the proxy's error (`message`, `type`, `code`) to stderr. Exit codes: 0 ok, 1 request failed, 2 usage error.
 
 ### OpenAI-compatible tools and libraries
 
@@ -177,7 +177,7 @@ The full reference, with every request field, response shape, header and error, 
 | `POST /v1/chat/completions` | key | OpenAI-compatible chat completions, streaming or not; `model` is one of your aliases |
 | `GET /v1/models` | key | the aliases with their rates, `context_length` and `max_completion_tokens`; upstream model ids and URLs are never shown |
 | `GET /v1/balance` | key | the calling key's balance, reservations, limits, last minute's use and priority weight |
-| `GET /v1/usage` | key | the calling key's own balance, usage per day and per model over the last `days` (default 30), and its grants |
+| `GET /v1/usage` | key | the calling key's own balance, usage per day and per model over the last `days` (default 30), and its newest `grants` grants (default 200) |
 | `POST /admin/keys` | admin token | creates a user's key, returned once |
 | `POST /admin/keys/rotate` | admin token | replaces a leaked key; the old one answers 401 at once |
 | `POST /admin/keys/remove` | admin token | removes a key for good; its balance and history stay, the ref cannot be used again |
@@ -239,17 +239,19 @@ The software is provided "as is", without warranties or conditions of any kind, 
 
 ## Install
 
+The packages, on Debian 13: `apt install php8.4-fpm php8.4-cli php8.4-curl php8.4-sqlite3 sqlite3 nginx` (`pdo_sqlite` is in php8.4-sqlite3). Then:
+
 ```sh
 cp config.example.php config.php      # edit: upstream, models, admin token hash, paths
 install -d -m 700 -o www-data -g www-data /var/lib/virsilipas     # the db_path directory, owned by the PHP user
 runuser -u www-data -- bin/virsilipas init                    # creates the SQLite database
 runuser -u www-data -- bin/virsilipas key-create customer-42  # prints the key once
-runuser -u www-data -- bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
+runuser -u www-data -- bin/virsilipas grant customer-42 1000000 invoice-1001   # {"applied":true,"balance":1000000,"expires_at":null}
 ```
 
 Run the CLI as the user php-fpm runs as (`www-data` here), and make `config.php` readable by it: the database files belong to whoever creates them, and the proxy cannot open a database another user owns. To try it on a test machine without root, point `db_path` at a directory you own and run `bin/virsilipas` and `php -S` as yourself.
 
-Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`. `config.example.php` lists every setting; the proxy refuses a setting it does not know, so a misspelt key stops it with a message naming the key instead of silently dropping a limit.
+Point your web server at `public/index.php` for every path; [php-fpm and nginx](#php-fpm-and-nginx) has a complete nginx site and php-fpm pool. The config path can be set with `VIRSILIPAS_CONFIG`. `config.example.php` lists every setting; the proxy refuses a setting it does not know, so a misspelt key stops it with a message naming the key instead of silently dropping a limit.
 
 ### Configuration: the minimum, then what to add
 
@@ -279,6 +281,62 @@ Everything else has a default: `upstream_timeout` 600 seconds, `lease_seconds` 9
 - **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database). The proxy creates its files private to its user, and refuses a database, WAL or shared-memory file that group or others can read, and a directory that group or others can write.
 - **Health check:** `GET /v1/models` without a key answers 401 only when php-fpm runs, the config loads and the ledger database opens; any 5xx means one of them failed (the log says which). It does not read the ledger's tables (a wrong `db_path` in a writable directory opens a new, empty database); `GET /v1/balance` with a real key does. The proxy fails closed: while the config is invalid or the database cannot be read or written (a full or read-only disk), a request that cannot load the config or reserve in the ledger answers 500 and is not charged. At `log_level` `info` each probe logs a `refused` line. `bin/virsilipas verify` checks the balances themselves.
 - **Before launch, test a client hang-up under your real php-fpm and nginx.** Abort detection depends on the server telling PHP that the connection closed; it is covered by the tests under the PHP built-in server, not under every stack.
+- **Memory.** Decoding and checking a request takes a few times its size, but a crafted body of very many tiny messages takes about 67 times its size (measured: a 4 MiB body of tiny messages needed about 270 MB). Such a request needs a valid key; when the worker runs out of memory it fails with a 500 before anything is reserved or charged, but it ties up that worker meanwhile. Keep `client_max_body_size` modest and size `memory_limit` for it: with PHP's default of 128M, a `client_max_body_size` of `1m`; for the proxy's own 4 MiB limit, `memory_limit` 384M for this pool. `memory_limit` bounds one worker; `pm.max_children` times it is the worst case.
+- **Version headers.** The proxy removes PHP's `X-Powered-By` header itself. Also set `expose_php = Off` in php.ini (Debian's production php.ini already does) and `server_tokens off;` in nginx, so that neither announces its version.
+- **Never point `root` at a checkout,** or at a release's top directory: serve only `public/`, and run only `index.php`. A checkout holds `.git` and the test suite, whose stand-in upstream (`tests/fake-upstream.php`) writes every request it receives, its `Authorization` header included, to the temporary directory. Releases unpacked by `tools/deploy.php` (`git archive`) leave `tests/` and `.github/` out (`.gitattributes`).
+
+A complete nginx site, as a starting point. The paths are the ones [Releasing and upgrading](#releasing-and-upgrading) uses (`/opt/virsilipas` is the live release), and `$virsilipas_source` comes from the `geo` block under [Access control](#access-control), which goes in the `http` block:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name proxy.example.com;
+    # ssl_certificate and ssl_certificate_key as for any site
+    root /opt/virsilipas/public;      # the live release's public/, never a checkout
+    access_log off;                    # or a format without the client address (see Privacy)
+    client_max_body_size 4m;           # the proxy refuses a chat body over 4 MiB anyway; see Memory above
+    client_body_buffer_size 4m;        # the same value: request bodies stay in memory, never in a temporary file
+
+    location / {
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root/index.php;   # the only script that ever runs
+        fastcgi_param VIRSILIPAS_SOURCE $virsilipas_source;
+        fastcgi_pass unix:/run/php/virsilipas.sock;
+        fastcgi_buffering off;         # streams arrive as they are written
+        fastcgi_read_timeout 660s;     # above upstream_timeout (600 by default)
+    }
+
+    location /admin/ {
+        allow 192.0.2.10;              # your billing system
+        deny all;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root/index.php;
+        fastcgi_param VIRSILIPAS_SOURCE $virsilipas_source;
+        fastcgi_pass unix:/run/php/virsilipas.sock;
+    }
+}
+```
+
+and its php-fpm pool:
+
+```ini
+; /etc/php/8.4/fpm/pool.d/virsilipas.conf
+[virsilipas]
+user = www-data
+group = www-data
+listen = /run/php/virsilipas.sock
+listen.owner = www-data
+listen.group = www-data
+pm = static
+pm.max_children = 32                    ; your peak of requests at once, streams included
+request_terminate_timeout = 660s        ; above upstream_timeout
+env[VIRSILIPAS_CONFIG] = /etc/virsilipas/config.php
+php_admin_value[memory_limit] = 384M     ; see Memory above
+php_admin_value[upload_tmp_dir] = /run/virsilipas-tmp   ; on tmpfs, mode 700, owned by www-data (see Privacy)
+php_admin_flag[zlib.output_compression] = off
+```
+
+`/run` is a tmpfs on Debian and is emptied at boot; recreate the directory with a systemd-tmpfiles line such as `d /run/virsilipas-tmp 0700 www-data www-data -`.
 
 ### Access control
 
@@ -305,9 +363,9 @@ The database holds every balance, so back it up. Do not copy the file while the 
 sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).sqlite'"
 ```
 
-If you back up with `.dump` (SQL text) instead, carry the schema version with it: `sqlite3 DB .dump "SELECT 'PRAGMA user_version = ' || user_version || ';' FROM pragma_user_version;"`. A plain `.dump` omits `user_version`, and the proxy refuses a database whose version it cannot read.
+If you back up with `.dump` (SQL text) instead, carry the schema version with it: `sqlite3 DB .dump "SELECT 'PRAGMA user_version = ' || user_version || ';' FROM pragma_user_version;"`. A plain `.dump` omits `user_version`: the proxy itself serves such a database, but the next `bin/virsilipas init` (which every deploy runs) refuses it.
 
-To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
+To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable. Before starting php-fpm again, run `bin/virsilipas init` and `bin/virsilipas verify` as the PHP user: `init` upgrades a backup from an older release and refuses one it cannot read, and `verify` checks every balance.
 
 ## Credits
 
@@ -332,7 +390,7 @@ Details that matter in production:
 - **Responses** are rebuilt from known fields only: id, object, created, choices (with their message or delta text, reasoning, tool calls and finish reason), the alias as the model, and as usage `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` (the output tokens spent thinking, 0 when the upstream reports none) and `credits` (what the reported usage costs, at most the reservation). In a stream, each event that carries usage shows the report the request is charged by, so the last one matches the charge unless text arrived after the last report that advanced the counts; a later equal or lower report does not cover that text, and the charge adds an upper bound for it (flagged `estimated`). Each kept field must also have its expected type (text fields strings, tool-call arguments a string); a value of any other type is dropped. Anything else an upstream adds (costs, account data, provider names, its model ids) is dropped.
 - **Upstream errors** never produce a 200 before a stream has started; once it has (the 200 is already sent), an upstream error ends the stream with a generic error event and no `[DONE]`, and the output relayed until then is charged. A non-streaming answer must arrive complete and carry a usable answer: non-empty text, reasoning or refusal, or a function tool call with a non-empty id, name and arguments. A stream starts only with an event that carries a completion choice (a delta with at least one valid field); events dropped before that add nothing to the charge, and at `[DONE]` the proxy stops reading the upstream, so nothing after it is relayed or charged. Otherwise the client gets one of the proxy's own errors (see [Errors](docs/API.md#errors) in docs/API.md), no upstream text, and no charge; when the upstream still sent a usage report (it answered 2xx without a usable answer, and billed it), the usage row keeps its counts and cost, with nothing charged, so cost tracking sees what the upstream billed. A stream that ends without its final marker gets an error event at the end (`code` `upstream_error`).
 - **Retries and failover.** Before anything has been sent to the client, a failed attempt is retried on the same upstream (`retries`, 0 to 2, default 1) only when the upstream cannot have done the work: the connection failed before the request was sent, or it answered 408, 409, 429, 502, 503 or 504. Between tries the proxy waits the upstream's `Retry-After` (or `retry-after-ms`) when it is at most 60 seconds, else 0.5 s, then 1 s. When the tries are used up, or the upstream answered 500 (or another 5xx), 401, 402, 403 or 404, the request moves to the next upstream in the alias's route. It ends at once, with no retry and no failover, when output may already exist (a 2xx status arrived, or a sent request timed out or broke) and when the upstream rejected the request itself (400, 413, 422 and other statuses), because every upstream would. All attempts together get `upstream_timeout`. One reservation covers them all, the customer pays the alias's rates whichever upstream answered, and only the answer delivered is charged. The usage row records the upstream that served the request (or was tried last), and each failed attempt is logged as `upstream_attempt` (warn).
-- **Credit log.** Every change to a balance writes one row to `credit_log` in the same transaction: a grant (its `grant_id`), a reservation taken when a request starts and the unused part returned when it settles (both `lease:<id>`), or the `opening` balance carried over by a schema upgrade. Each row holds the change and the balance after it; a change of zero (a request that used its whole reservation) writes no row. The table is append-only: the database refuses UPDATE and DELETE on it. `bin/virsilipas history <ref> [N]` shows a key's last N changes; `bin/virsilipas verify` checks that every key's changes sum to its balance and that each row's balance is the running sum, and exits 1 on any mismatch, which means something changed a balance outside the proxy.
+- **Credit log.** Every change to a balance writes one row to `credit_log` in the same transaction: a grant (its `grant_id`), a reservation taken when a request starts and the unused part returned when it settles (both `lease:<id>`), or the `opening` balance carried over by a schema upgrade. Each row holds the change and the balance after it; a change of zero (a request that used its whole reservation) writes no row. The table is append-only: the database refuses UPDATE, DELETE and an INSERT that would replace a row on it. `bin/virsilipas history <ref> [N]` shows a key's last N changes; `bin/virsilipas verify` checks that every key's changes sum to its balance and that each row's balance is the running sum, and exits 1 on any mismatch, which means something changed a balance outside the proxy.
 - **Usage over time.** Each usage row also carries `upstream` (the host of the route URL that served the request), `stream`, `duration_ms`, `reasoning_tokens` (the reasoning share of the output tokens, read from `completion_tokens_details.reasoning_tokens` or a top-level `reasoning_tokens`) and `upstream_cost` (the upstream's own `estimated_cost`, kept in millionths of its unit; when it reports none and the route entry that served the request sets `cost`, the cost computed from those prices, flagged `cost_computed`; otherwise `NULL`), `source` (internal or external, from the lease), `first_byte_ms` (from the first upstream request, after any pacing wait, to the first byte of the answer sent to the client: the first relayed chunk of a stream, or the whole answer otherwise; `NULL` when no answer reached the client, as for an error) and `attempts` (upstream requests made for it, retries and failover included; `0` on rows written before schema 8). None of these change what is charged; a request with none of this detail still gets a usage row. In a stream, a repeat report with the same three counts may add a detail the adopted report lacked (the cached split, the reasoning count, the cost) once; a later repeat cannot change or remove it. `bin/virsilipas stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]` prints one JSON line per UTC time bucket and group. `week` is the year and SQLite's Monday-based week number (`2026-W41`), `hour_of_day` folds all days into 00 to 23, and `weekday` into 0 (Sunday) to 6. `by` is a comma list of `model`, `upstream`, `key`, `status`, `source` (internal or external), `group` (the key's group), or `-` for none; `since`/`until` are `YYYY-MM-DD` in UTC, `until` exclusive) with requests, prompt/cached/completion/reasoning tokens, credits charged, the upstream cost and how many requests carried one (and how many of those were computed from configured prices), hang-ups, estimated charges, failed requests (non-2xx), the mean duration, the mean time to first byte (`mean_first_byte_ms`), the requests that needed more than one upstream attempt (`retried`), and the requests that waited for spend pacing (`delayed`) with their mean wait (`mean_delay_ms`).
 - **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered (a worker that dies just before forwarding also leaves its reservation charged); if the request is settled late, the difference is returned. `bin/virsilipas status <ref>` counts such leases as `held`. `lease_seconds` must be longer than `upstream_timeout`.
 - **Runaway output.** If the credits for a stream's reported usage pass the reservation, the proxy stops the upstream request there. Output delivered after the last usage report that advanced the count is charged as an upper bound (its bytes); a repeated or lower report does not cover it. Upstreams that report usage on every chunk often send the cached split only with the final report, whose counts repeat the last running report; such a repeat adds the cached split once and nothing else; a later repeat cannot change or remove it.
@@ -483,9 +541,9 @@ runuser -u www-data -- env VIRSILIPAS_CONFIG=/etc/virsilipas/config.php \
 
 `deploy.php` fetches the mirror, unpacks the tag into its own directory (no `.git`, a `REVISION` file naming the tag and commit), lints it, checks that the new release accepts the config (if not, it stops there with the old release still serving), waits up to `--drain` seconds for requests in flight to finish, and stops php-fpm. It then backs up the ledger to `/var/lib/virsilipas-snapshots/pre-<tag>-<time>.sqlite`, checks the backup's integrity, runs `init` as the PHP user, switches the symlink, runs `verify`, checks `REVISION` through the symlink, and starts php-fpm. Its last check is that `GET /v1/models` without a key answers 401. `deploy.php --help` lists the paths and the service name it assumes.
 
-If any step after php-fpm stopped fails, `deploy.php` points the symlink back at the previous release, puts the backup in place, starts php-fpm and exits 1. It restores the backup only if nothing but the migration has written to the ledger since the backup was taken. The CLI works while php-fpm is stopped, and a started release serves requests, so `deploy.php` compares every table except `credit_log` with the backup first. If they differ, or cannot be compared, it keeps the ledger as it is; once the new schema is in place it also keeps the new release live, and it says so. php-fpm is stopped before that comparison, so the only write that can slip in between the check and the restore is a CLI command run in that moment.
+If any step after php-fpm stopped fails, `deploy.php` points the symlink back at the previous release, puts the backup in place, starts php-fpm and exits 1. It restores the backup only if nothing but the migration has written to the ledger since the backup was taken. The CLI works while php-fpm is stopped, and a started release serves requests, so `deploy.php` compares every column the backup has, in every table except `credit_log`, with the backup first. If they differ, or cannot be compared, it keeps the ledger as it is; once the new schema is in place it also keeps the new release live, and it says so. php-fpm is stopped before that comparison, so the only write that can slip in between the check and the restore is a CLI command run in that moment.
 
-`smoke.php` makes one small request with a new key (`smoke-<time>-<random>`; it costs a few dozen real tokens). It then checks the credit log rows, the balance and `verify`, and disables the key.
+`smoke.php` makes one small request with a new key (`smoke-<time>-<random>`; it costs a few dozen real tokens). It then checks the credit log rows, the balance, `GET /v1/balance`, `GET /v1/usage` and `verify`, and removes the key for good.
 
 **Never run an older release against a newer ledger.** An older release's `init` refuses a newer schema, so `deploy.php` rolls such a deploy back. To return to the state before an upgrade, stop php-fpm, restore that upgrade's `pre-<tag>` backup as described under [Backups](#backups), and deploy the older tag. Everything written to the ledger since the upgrade is lost, so decide that consciously.
 
@@ -508,10 +566,14 @@ Set `log_dir` and the proxy writes one JSON object per line to `<log_dir>/YYYYMM
 |---|---|---|
 | `error` | unexpected failures | `exception` (class and code location; run `bin/virsilipas` to see a configuration error in full) |
 | `warn` (default) | problems with the upstream or its configuration | `request` that failed upstream, was charged an estimate, or reported usage above its reservation; `upstream_attempt` (a failed attempt before a retry or failover: the route entry, the try, the upstream host, its status and what followed); `upstream_skipped` (an upstream whose key file is missing or empty); `throttle_error` (the throttle could not decide; the request went ahead without a wait); `spend_cap_crossed` (a request's cost carried a spend window past 80% or 100% of its cap); `cap_log_error` (the crossing check itself failed; the request is unaffected); `admin_auth_failed` |
-| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `capped` (refused by a server-wide cap: the code and `Retry-After`), `key_create`, `key_rotate`, `key_active`, `key_limits`, `grant` |
+| `info` | every request and admin action | `request`, `refused` (status and the proxy's fixed reason), `throttled` (a delayed or shed request: its weight and the wait or `Retry-After`), `capped` (refused by a server-wide cap: the code and `Retry-After`), `key_create`, `key_rotate`, `key_remove`, `key_active`, `key_limits`, `grant` |
 | `debug` | request admission | `admit` (alias, prompt bound, reservation) |
 
-The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically: rotate or compress old daily files with your usual tooling.
+The usage table stays the per-request billing record; the log is for operating the service. At `info` the proxy writes about 260 bytes per request (about 2.2 GB a day at 100 requests a second), so `warn` is the default. Nothing is deleted automatically, and at `info` each line carries the key's ref, so keep the files only as long as you need them. logrotate does not fit names that change every day (it rotates a fixed name, and a pattern leaves each day's file to the next run, or never). Compress and expire them by age instead, for example from root's crontab:
+
+```sh
+15 0 * * * find /var/log/virsilipas -maxdepth 1 -name '*.jsonl' -mtime +1 -exec gzip -q {} + ; find /var/log/virsilipas -maxdepth 1 -name '*.jsonl.gz' -mtime +90 -delete
+```
 
 ## Parallelism
 
@@ -529,14 +591,15 @@ Runs the requests with `--concurrency` in flight per process across `--processes
 ## CLI
 
 ```
-virsilipas init | key-create <ref> | key-rotate <ref> | key-disable <ref> | key-enable <ref> | grant <ref> <credits> <grant_id>
+virsilipas init | key-create <ref> | key-rotate <ref> | key-disable <ref> | key-enable <ref> | key-remove <ref>
+           | grant <ref> <credits> <grant_id> [expires_at]
            | limit <ref> <max_concurrent|requests_per_minute|credits_per_minute> <N|default> | status <ref>
            | bonus <ref> <0..300> | group <ref> <name|-> | history <ref> [N] | verify | caps
            | stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]
            | keys | top [--once] [--interval N]
 ```
 
-`keys` prints one JSON line per key: ref, active, balance, group, bonus, when it was created, when it was last used and when it was removed (`null` while it lives). `top` is a live view of the traffic, redrawn every `--interval` seconds (default 2, 1 to 60) until interrupted; `--once` prints one view without terminal control codes. It shows the requests in flight (internal and external, the oldest one's age, and the ten oldest by key ref, source, age and credits reserved), the caps against their limits, and for the last minute, 5 minutes and hour: requests and requests per second, failures, duration and time to first byte (p50 and p95, over successful requests), output tokens per second, tokens, credits charged, the upstream cost, retried requests and client hang-ups; then the last 5 minutes by model and upstream, and the most recent requests with their key ref, status and timings. It reads the ledger only, so it shows metadata and never a prompt or an answer. Run it as the php-fpm user (or root) with the same config.
+`key-remove` removes a key for good, as `POST /admin/keys/remove` does. `grant` takes an optional `expires_at` (unix seconds, stored, not enforced), as `POST /admin/grants` does. `--help` prints the usage without needing a config. `keys` prints one JSON line per key: ref, active, balance, group, bonus, when it was created, when it was last used and when it was removed (`null` while it lives). `top` is a live view of the traffic, redrawn every `--interval` seconds (default 2, 1 to 60) until interrupted; `--once` prints one view without terminal control codes. It shows the requests in flight (internal and external, the oldest one's age, and the ten oldest by key ref, source, age and credits reserved), the caps against their limits, and for the last minute, 5 minutes and hour: requests and requests per second, failures, duration and time to first byte (p50 and p95, over successful requests), output tokens per second, tokens, credits charged, the upstream cost, retried requests and client hang-ups; then the last 5 minutes by model and upstream, and the most recent requests with their key ref, status and timings. It reads the ledger only, so it shows metadata and never a prompt or an answer. Run it as the php-fpm user (or root) with the same config.
 
 ## Tests
 
@@ -547,7 +610,13 @@ php tests/run.php integration
 
 The end-to-end tests start a fake upstream and seven proxy processes with the PHP built-in server. Separate processes are needed because one built-in server process queues connections and serves them one at a time. They include a load smoke test that runs `tools/bench.php` with parallel streams across two processes, and runs of `tools/smoke.php` against the test proxy. Run the suite from a git checkout: `tests/SecretGuardTest.php` reads the tracked files and fails if a config file, key, certificate, database, log or credential value is committed, and it fails rather than passes when git cannot list the files. Words a deployment must never publish, such as its upstream provider, are not stored in the repository: list them in `.forbidden-words` (gitignored, one per line) or in `VIRSILIPAS_FORBIDDEN_WORDS` (comma-separated; CI reads a repository secret of that name), and the guard refuses them in any tracked file however they are spaced or cased.
 
-CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on PHP 8.2, 8.3 and 8.4, keeps the test output when a run fails, and runs PHPStan as an advisory check that reports but does not fail the build.
+CI (GitHub Actions) runs a syntax lint of every PHP file and the whole suite on PHP 8.2, 8.3, 8.4 and 8.5 with every error, notice and deprecation reported (a `Deprecated` or `Warning` line in a test server's log fails the run), keeps the test output when a run fails, and runs PHPStan as an advisory check that reports but does not fail the build.
+
+## Contributing
+
+Issues and pull requests are welcome. Read [AGENTS.md](AGENTS.md) first: it is the project's governing text, with the rules a change has to keep (no dependencies, nothing deployment-specific, no request bodies stored or logged, fail closed) and the invariants the tests protect, and it points to the design decisions in [docs/adr/](docs/adr/). Run `php tests/run.php` before you send a change, and add a test for anything that touches metering, grants, throttling or error handling.
+
+Contributions are accepted under the Apache License 2.0, as its section 5 provides: what you submit is licensed under the same terms as the project. There is no contributor licence agreement and no sign-off to add. Report security issues privately as [SECURITY.md](SECURITY.md) says, not in a public issue.
 
 ## Reporting security issues
 

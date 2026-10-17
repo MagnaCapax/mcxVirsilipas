@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 use MagnaCapax\Virsilipas\Ledger;
 
-// Schema 9: removing a key for good, grants that carry a stored (not enforced) expiry, and GET /v1/usage,
+// Schema 9 (and 10: an index on grants(key_id) and a REPLACE-proof credit log): removing a key for good, grants that carry a stored (not enforced) expiry, and GET /v1/usage,
 // where a key reads its own balance, consumption and grants and nothing about any other key.
 
 function testRemoveKeyMakesItUnusableButKeepsBalanceAndHistory(): void
@@ -55,7 +55,7 @@ function testMigrateUpgradesASchemaEightLedgerKeepingItsGrants(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v8.sqlite");
-    same(9, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['inv-1', 70, 1000, null], array_map(static fn ($v) => is_numeric($v) ? (int) $v : $v,
         $db->query('SELECT grant_id, credits, created_at, expires_at FROM grants')->fetch(\PDO::FETCH_NUM)), 'an old grant keeps its values and never expires');
     same(null, $db->query('SELECT removed_at FROM keys')->fetchColumn(), 'an old key is not removed');
@@ -171,4 +171,107 @@ function testIntegrationUsageShowsOnlyTheCallersOwnData(): void
         json_decode(http('GET', '/v1/usage?days=400', null, $keyA)['body'], true)['days']]);
     same(401, http('GET', '/v1/usage')['status'], 'no key');
     same(401, http('GET', '/v1/usage', null, 'admin-secret')['status'], 'the admin token is not a key');
+}
+
+function testIntegrationUsageGrantsParameter(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $ledger = Harness::get()['ledger'];
+    for ($i = 1; $i <= 4; $i++) {
+        $ledger->grant($ref, "more-$i-$ref", 1);
+    }
+    $ids = static fn (string $q): array => array_column(json_decode(http('GET', "/v1/usage$q", null, $key)['body'], true)['grants'], 'grant_id');
+    same(["more-4-$ref", "more-3-$ref"], $ids('?grants=2'), 'the newest M, newest first');
+    same(5, count($ids('')), 'default 200 lists them all');
+    same(5, count($ids('?days=7&grants=1000')));
+    foreach (['0', '1001', 'abc', '-1', '1.5', '', '10000', ' 1'] as $bad) {
+        $r = http('GET', '/v1/usage?grants=' . urlencode($bad), null, $key);
+        same(400, $r['status'], "grants=$bad refused");
+        same(['invalid_value', 'grants'], [json_decode($r['body'], true)['error']['code'], json_decode($r['body'], true)['error']['param']]);
+    }
+    same(400, http('GET', '/v1/usage?grants[]=3', null, $key)['status'], 'grants as an array refused');
+}
+
+function testMigrateUpgradesASchemaNineLedgerAddingTheGrantsIndexAndTheReplaceTrigger(): void
+{
+    $dir = tempDir();
+    $db = new \PDO("sqlite:$dir/v9.sqlite");
+    $db->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v9.sql'));
+    $db->exec("INSERT INTO keys (id, ref, key_hash, balance, active, created_at) VALUES (1, 'old', '" . hash('sha256', 'vsk-old') . "', 70, 1, 0)");
+    $db->exec("INSERT INTO grants (grant_id, key_id, credits, created_at, expires_at) VALUES ('inv-1', 1, 70, 1000, NULL)");
+    $db->exec("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (1000, 1, 'grant', 70, 70, 'inv-1')");
+    // Schema 9 had no guard against REPLACE: the hole schema 10 closes.
+    $db->exec("INSERT OR REPLACE INTO credit_log (id, ts, key_id, kind, delta, balance_after, ref) VALUES (1, 1000, 1, 'grant', 70, 70, 'inv-1')");
+    unset($db);
+    $l = new Ledger("$dir/v9.sqlite");
+    $l->migrate();
+    $l->migrate();
+    $db = new \PDO("sqlite:$dir/v9.sqlite");
+    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(['credit_log_no_delete', 'credit_log_no_replace', 'credit_log_no_update'],
+        $db->query("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")->fetchAll(\PDO::FETCH_COLUMN));
+    $plan = implode(' ', $db->query("EXPLAIN QUERY PLAN SELECT grant_id FROM grants WHERE key_id = 1 ORDER BY rowid DESC LIMIT 5")->fetchAll(\PDO::FETCH_COLUMN, 3));
+    check(str_contains($plan, 'grants_key'), "grants() uses the key index: $plan");
+    same([['grant_id' => 'inv-1', 'credits' => 70, 'created_at' => 1000, 'expires_at' => null]], $l->grants(1, 10), 'the old grant stays');
+    same(1, $l->findKey('vsk-old')['id']);
+    same(80, $l->grant('old', 'inv-2', 10)['balance']);
+    same([], $l->verify()['problems']);
+}
+
+function testCreditLogRefusesAnInsertThatReplacesARow(): void
+{
+    $path = tempDir() . '/ledger.sqlite';
+    $l = new Ledger($path);
+    $l->migrate();
+    $l->createKey('a');
+    $l->grant('a', 'g1', 500);
+    $raw = new \PDO("sqlite:$path", null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    foreach (["INSERT OR REPLACE INTO credit_log (id, ts, key_id, kind, delta, balance_after, ref) VALUES (1, 1, 1, 'grant', 501, 501, 'forged')",
+        "REPLACE INTO credit_log (id, ts, key_id, kind, delta, balance_after, ref) VALUES (1, 1, 1, 'grant', 501, 501, 'forged')",
+        "INSERT INTO credit_log (id, ts, key_id, kind, delta, balance_after, ref) VALUES (1, 1, 1, 'grant', 501, 501, 'forged') ON CONFLICT(id) DO UPDATE SET delta = 501"] as $sql) {
+        try {
+            $raw->exec($sql);
+            check(false, "$sql was allowed");
+        } catch (\PDOException $e) {
+            check(str_contains($e->getMessage(), 'append-only'), "$sql refused: " . $e->getMessage());
+        }
+    }
+    same([['grant', 500, 500, 'g1']], array_map(static fn ($r) => [$r['kind'], $r['delta'], $r['balance_after'], $r['ref']], $l->history('a')), 'the row is unchanged');
+    $l->grant('a', 'g2', 5);
+    same(2, count($l->history('a')), 'ordinary appends still work');
+    same([], $l->verify()['problems']);
+}
+
+function testCliRemovesAKeyGrantsWithAnExpiryAndPrintsHelpWithoutAConfig(): void
+{
+    $dir = tempDir();
+    file_put_contents("$dir/config.php", '<?php return ' . var_export(configArrayFor($dir), true) . ';');
+    $run = static function (array $env, string ...$args): array {
+        $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/bin/virsilipas', ...$args], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, $env);
+        $out = (string) stream_get_contents($pipes[1]);
+        $err = (string) stream_get_contents($pipes[2]);
+        return [proc_close($p), $out, $err];
+    };
+    $env = ['VIRSILIPAS_CONFIG' => "$dir/config.php"];
+    $run($env, 'init');
+    $run($env, 'key-create', 'a');
+    $exp = time() + 86400;
+    [$code, $out] = $run($env, 'grant', 'a', '50', 'g1', (string) $exp);
+    same([0, ['applied' => true, 'balance' => 50, 'expires_at' => $exp]], [$code, json_decode($out, true)]);
+    [$code, , $err] = $run($env, 'grant', 'a', '50', 'g2', '1');
+    same([1, true], [$code, str_contains($err, 'expires_at must be null or a future unix time')]);
+    [$code, $out] = $run($env, 'key-remove', 'a');
+    $r = json_decode($out, true);
+    same([0, 'a', true, 50], [$code, $r['ref'], $r['applied'], $r['balance']]);
+    same(false, json_decode($run($env, 'key-remove', 'a')[1], true)['applied'], 'removing again changes nothing');
+    [$code, , $err] = $run($env, 'key-enable', 'a');
+    same([1, true], [$code, str_contains($err, 'removed')]);
+
+    foreach (['--help', '-h', 'help'] as $h) {
+        [$code, $out, $err] = $run(['VIRSILIPAS_CONFIG' => "$dir/missing.php"], $h);
+        same([0, ''], [$code, $err], "$h needs no config");
+        check(str_starts_with($out, 'Usage: virsilipas') && str_contains($out, 'key-remove <ref>'), $out);
+    }
+    [$code, , $err] = $run(['VIRSILIPAS_CONFIG' => "$dir/config.php"]);
+    same([2, true], [$code, str_starts_with($err, 'Usage: virsilipas')], 'no command: usage on stderr, exit 2');
 }

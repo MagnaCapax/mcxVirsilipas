@@ -125,7 +125,8 @@ try {
         throw new RuntimeException("backup $backup fails its integrity check");
     }
     say("ledger backed up to $backup");
-    $backupPrint = fingerprint($backup);
+    $printSql = fingerprintSql($backup);
+    $backupPrint = fingerprint($backup, $printSql);
 
     // 4. Migrate, switch, verify, start.
     if (!is_link($opt['current'])) { // first deploy: a plain directory becomes the previous release
@@ -159,9 +160,9 @@ try {
     // the new release, or a grant, key or limit change made with the CLI (which does not need php-fpm),
     // would be lost. Migrations only add tables or columns, so the rows of the other tables must match the backup.
     $changed = false;
-    if ($restoreNeeded && isset($backupPrint)) {
+    if ($restoreNeeded && isset($backupPrint, $printSql)) {
         try {
-            $changed = fingerprint($db) !== $backupPrint;
+            $changed = fingerprint($db, $printSql) !== $backupPrint;
         } catch (Throwable $x) {
             $changed = true; // cannot compare: never restore blind
         }
@@ -266,16 +267,39 @@ function inFlight(string $db): int
 }
 
 /**
- * sha256 of the rows of every table except credit_log, read-only and streamed (the usage table can be large).
- * Only the schema-3 columns are read, never the schema text: a migration that adds columns (schema 4 added five
- * to usage) changes neither, so a deploy that failed after its migration still compares equal and is rolled back.
+ * The query fingerprint() runs: every column the backup has, of every table it has except credit_log, in primary-key
+ * order. Taken from the backup, never from the migrated ledger: a migration only adds tables and columns, so the
+ * migrated ledger still compares equal, while any write to an existing column (a CLI grant, bonus, group or limit
+ * change, a served request) makes the two differ.
  */
-function fingerprint(string $db): string
+function fingerprintSql(string $backup): string
 {
-    $sql = 'SELECT id, ref, key_hash, balance, active, created_at, max_concurrent, requests_per_minute, credits_per_minute FROM keys ORDER BY id;'
-        . ' SELECT grant_id, key_id, credits, created_at FROM grants ORDER BY grant_id;'
-        . ' SELECT id, key_id, reserved, created_at, expires_at, settled FROM leases ORDER BY id;'
-        . ' SELECT id, ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation FROM usage ORDER BY id;';
+    $quote = static fn (string $name): string => '"' . str_replace('"', '""', $name) . '"';
+    $sql = '';
+    $tables = run(['sqlite3', '-readonly', '-batch', '-list', $backup,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN ('credit_log', 'sqlite_sequence') AND name NOT LIKE 'sqlite_%' ORDER BY name"]);
+    foreach ($tables === '' ? [] : explode("\n", $tables) as $table) {
+        // name, then pk (its position in the primary key, 0 for none), one line per column.
+        $cols = $pk = [];
+        foreach (explode("\n", run(['sqlite3', '-readonly', '-batch', '-list', $backup, 'SELECT name, pk FROM pragma_table_info(' . "'" . str_replace("'", "''", $table) . "'" . ')'])) as $line) {
+            [$name, $pos] = explode('|', $line, 2) + [1 => '0'];
+            $cols[] = $quote($name);
+            if ((int) $pos > 0) {
+                $pk[(int) $pos] = $quote($name);
+            }
+        }
+        ksort($pk);
+        $sql .= 'SELECT ' . implode(', ', $cols) . ' FROM ' . $quote($table) . ' ORDER BY ' . ($pk === [] ? 'rowid' : implode(', ', $pk)) . ';';
+    }
+    if (!str_contains($sql, 'FROM "keys"')) {
+        throw new RuntimeException("cannot read the tables of $backup");
+    }
+    return $sql;
+}
+
+/** sha256 of the rows fingerprintSql() selects, read-only and streamed (the usage table can be large). */
+function fingerprint(string $db, string $sql): string
+{
     $p = proc_open(['sqlite3', '-readonly', '-nofollow', '-batch', '-list', $db, $sql], [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
     if (!is_resource($p)) {
         throw new RuntimeException("cannot read $db");

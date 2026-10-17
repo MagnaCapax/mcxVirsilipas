@@ -13,6 +13,8 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 
 // Keep running after a client hangs up so every request is settled.
 ignore_user_abort(true);
+// No PHP version in the response, whatever expose_php says.
+header_remove('X-Powered-By');
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';

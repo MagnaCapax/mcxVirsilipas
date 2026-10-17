@@ -91,7 +91,6 @@ function runRequests(array $o, int $count): array
                 'total' => curl_getinfo($ch, CURLINFO_TOTAL_TIME), 'credits' => reportedCredits($bufs[$id], $status)];
             unset($bufs[$id]);
             curl_multi_remove_handle($mh, $ch);
-            curl_close($ch);
             if ($started < $count) {
                 $add();
             }
@@ -127,7 +126,6 @@ function balance(array $o): ?array
     $ch = curl_init($o['url'] . '/v1/balance');
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $o['key']]]);
     $j = json_decode((string) curl_exec($ch), true);
-    curl_close($ch);
     return is_array($j) && is_int($j['balance'] ?? null) ? $j : null;
 }
 

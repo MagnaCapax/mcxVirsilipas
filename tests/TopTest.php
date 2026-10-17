@@ -23,7 +23,7 @@ function testMigrateUpgradesASchemaSevenLedgerAddingPerformanceColumns(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v7.sqlite");
-    same(9, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same([null, 0, 900], array_map(static fn ($v) => $v === null ? null : (int) $v, $db->query('SELECT first_byte_ms, attempts, duration_ms FROM usage')->fetch(\PDO::FETCH_NUM)),
         'an old row has no first-byte time and 0 attempts (unknown), and keeps its values');
     same(1, (int) $db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'usage_key'")->fetchColumn());
