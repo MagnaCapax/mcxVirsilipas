@@ -6,11 +6,16 @@ namespace MagnaCapax\Virsilipas;
 
 /**
  * A refusal that maps straight to an HTTP status and an OpenAI-style error body:
- * {"error": {"message", "type", "param", "code"}}. Every message and code is one of the proxy's own
+ * {"error": {"message", "type", "param", "code"}}, or on the Anthropic Messages routes that format's
+ * {"type": "error", "error": {"type", "message"}}. Every message and code is one of the proxy's own
  * fixed strings; nothing an upstream said is ever put in one.
  */
 final class HttpError extends \RuntimeException
 {
+    /** The Anthropic error type for each status the proxy answers; any other is api_error. */
+    private const ANTHROPIC_TYPES = [400 => 'invalid_request_error', 401 => 'authentication_error', 402 => 'billing_error', 403 => 'permission_error',
+        404 => 'not_found_error', 413 => 'request_too_large', 429 => 'rate_limit_error', 503 => 'overloaded_error', 504 => 'timeout_error'];
+
     /** A stable machine-readable reason, e.g. model_not_found or context_length_exceeded (Exception::$code is the int one). */
     public readonly ?string $errorCode;
 
@@ -32,5 +37,14 @@ final class HttpError extends \RuntimeException
             header('Retry-After: ' . $this->retryAfter);
         }
         Http::json($this->status, ['error' => ['message' => $this->getMessage(), 'type' => $this->type, 'param' => $this->param, 'code' => $this->errorCode]]);
+    }
+
+    /** The same refusal in the Anthropic Messages error format: the same status, message and Retry-After. */
+    public function sendAnthropic(): void
+    {
+        if ($this->retryAfter !== null) {
+            header('Retry-After: ' . $this->retryAfter);
+        }
+        Http::json($this->status, ['type' => 'error', 'error' => ['type' => self::ANTHROPIC_TYPES[$this->status] ?? 'api_error', 'message' => $this->getMessage()]]);
     }
 }

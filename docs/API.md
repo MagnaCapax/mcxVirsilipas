@@ -2,11 +2,13 @@
 
 This is the complete HTTP API of the proxy as the code in this repository implements it: every route, what each accepts and returns, every header it sets and every error it can answer. How credits, metering, limits and throttling work is explained in the [README](../README.md); this file links there instead of repeating it. `tests/DocsTest.php` fails when a route, error code, error message or response header in the code is missing here, so the two change together.
 
-There are ten routes: four for clients and six for your billing system.
+There are twelve routes: six for clients and six for your billing system.
 
 | Method and path | Auth | What it does |
 |---|---|---|
 | [`POST /v1/chat/completions`](#post-v1chatcompletions) | key | OpenAI-compatible chat completions, streaming or not |
+| [`POST /v1/messages`](#post-v1messages) | key | Anthropic Messages format, streaming or not, passed through to upstreams that serve it |
+| [`POST /v1/messages/count_tokens`](#post-v1messagescount_tokens) | key | a free, conservative estimate of a messages request's input tokens |
 | [`GET /v1/models`](#get-v1models) | key | the model aliases and their rates |
 | [`GET /v1/balance`](#get-v1balance) | key | the calling key's balance, limits and priority |
 | [`GET /v1/usage`](#get-v1usage) | key | the calling key's own usage per day and per model, and its grants |
@@ -21,10 +23,10 @@ Any other method or path answers 404 `not found`.
 
 ## Conventions
 
-- **Authentication.** Every route needs `Authorization: Bearer <token>`. The client routes take a customer key (keys start with `vsk-`); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
-- **Bodies.** Request bodies are a JSON object, at most 4 MiB for chat and 64 KiB for the admin routes. Responses are JSON (`Content-Type: application/json`) except a streamed chat answer, which is `text/event-stream`.
+- **Authentication.** Every route needs `Authorization: Bearer <token>` (the two messages routes also take `x-api-key: <key>`). The client routes take a customer key (keys start with `vsk-`); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
+- **Bodies.** Request bodies are a JSON object, at most 4 MiB for chat and messages and 64 KiB for the admin routes. Responses are JSON (`Content-Type: application/json`) except a streamed answer, which is `text/event-stream`.
 - **Credits** are integers. What a credit is worth is your decision; the rates are per million tokens (see [Credits](../README.md#credits)).
-- **Errors** use OpenAI's shape, with one of the proxy's fixed messages:
+- **Errors** use OpenAI's shape (the Anthropic shape on the messages routes, see [POST /v1/messages](#post-v1messages)), with one of the proxy's fixed messages:
 
   ```json
   {"error": {"message": "credit balance too low for this request", "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}
@@ -128,6 +130,103 @@ After the reservation, the request may wait for spend pacing, then goes upstream
 - A refusal before the reservation costs nothing.
 - An upstream failure with no usable answer costs nothing. Its reservation is returned in full.
 - A delivered answer is charged by the upstream's usage report, at most the reservation. A client hang-up and an answer with no usage report are covered under [How metering works](../README.md#how-metering-works).
+
+### POST /v1/messages
+
+The Anthropic Messages format, for clients that speak only that API (such as Claude Code; see [Claude Code](../README.md#claude-code)). It is a metered pass-through, not a translation: the request goes to the `messages_url` of an upstream that serves this format natively, and is metered, limited, throttled and settled exactly like chat completions.
+
+```sh
+curl https://proxy.example/v1/messages \
+  -H "x-api-key: $VIRSILIPAS_KEY" -H 'anthropic-version: 2023-06-01' -H 'Content-Type: application/json' \
+  -d '{"model": "default", "max_tokens": 50, "messages": [{"role": "user", "content": "Say hello."}]}'
+```
+
+- **The key** comes as `x-api-key: <key>` or as `Authorization: Bearer <key>` (when both are sent, `x-api-key` wins). Neither: 401 `missing key: send x-api-key or Authorization: Bearer`.
+- **The model** is an alias whose route has at least one upstream with a `messages_url` (see `config.example.php`). Only those route entries serve this route, in route order, with retries and failover as on chat. Any other alias, or an unknown one: 404 `unknown model, or not served in the Messages format; see /v1/models`.
+- **Headers forwarded:** `anthropic-version` (when the client sends none, `2023-06-01`) and `anthropic-beta`, each when it is printable ASCII of at most 1 KiB. The upstream gets its own key as `x-api-key` and as `Authorization: Bearer`.
+- **Errors** use the Anthropic shape, with the same statuses, messages and `Retry-After` as everywhere else, and the `type` chosen by status (400 `invalid_request_error`, 401 `authentication_error`, 402 `billing_error`, 403 `permission_error`, 404 `not_found_error`, 413 `request_too_large`, 429 `rate_limit_error`, 503 `overloaded_error`, 504 `timeout_error`, any other `api_error`). The OpenAI-style `code` and `param` are not part of this shape:
+
+  ```json
+  {"type": "error", "error": {"type": "billing_error", "message": "credit balance too low for this request"}}
+  ```
+
+**Request fields.** Only these are read or forwarded; any other field (`container`, `mcp_servers`, `service_tier` and so on) is dropped without an error. The deployment's `params` are not applied here: they are chat completions fields.
+
+| Field | Rules |
+|---|---|
+| `model` | required; an alias as above. |
+| `messages` | required; a non-empty array of objects with a string `role` and `content`: a string or a non-empty list of content blocks (below). Other message fields are dropped. Otherwise 400 `invalid_messages`. |
+| `system` | a string, or a non-empty list of `text` blocks. |
+| `max_tokens` | optional positive integer, otherwise 400 `invalid_value`. Clamped to the server's `max_tokens_cap` and to what the balance covers, as on chat; without it the request asks for the cap. |
+| `stream` | `true` streams the answer; anything else does not. |
+| `thinking` | forwarded as sent, except that a `budget_tokens` at or above the clamped `max_tokens` is lowered to `max_tokens - 1` (the upstream needs room for an answer). Thinking tokens are part of `output_tokens` and paid at the output rate. |
+| `tools` | a list of client tool definitions, each keeping `type`, `name`, `description`, `input_schema` and `cache_control`. A server tool (a `type` other than `custom`, such as a web search) answers 400 `unsupported_tool` `only client tools are supported`: it carries fees no token rate covers. Not a list: 400 `tools must be a list of tool definitions`. |
+| `stop_sequences`, `temperature`, `top_p`, `top_k`, `tool_choice`, `metadata` | forwarded as sent. |
+
+Content blocks keep only their own fields; any other block type, such as an image or a document, answers 400 `unsupported_content` `only text, tool use, tool result and thinking content is supported`, and content that is neither a string nor a non-empty list of blocks answers 400 `content must be a string or a non-empty list of content blocks`:
+
+| Block `type` | Fields kept |
+|---|---|
+| `text` | `text`, `cache_control` |
+| `tool_use` | `id`, `name`, `input`, `cache_control` |
+| `tool_result` | `tool_use_id`, `content` (a string or a list of `text` blocks), `is_error`, `cache_control` |
+| `thinking` | `thinking`, `signature` |
+| `redacted_thinking` | `data` |
+
+The prompt bound is the byte length of every forwarded field plus 16, and when `tools` are given 1024 more for the tool-use prompt an upstream adds by itself.
+
+**Response, not streamed.** 200 with the message rebuilt at the top level and its content blocks as the upstream sent them:
+
+```json
+{"id": "msg_1", "type": "message", "role": "assistant", "model": "default",
+ "content": [{"type": "text", "text": "Hello!"}], "stop_reason": "end_turn", "stop_sequence": null,
+ "usage": {"input_tokens": 11, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 3}}
+```
+
+- `model` is always the alias; `id`, `stop_reason` and `stop_sequence` are passed on when they are strings.
+- `usage` has the four standard counts of the report the request is charged by, all 0 when the upstream sent no valid report (the charge is then an upper bound, see [How metering works](../README.md#how-metering-works)). Anything else the upstream adds at the message or usage level is dropped.
+- A 200 needs at least one usable content block: non-empty `text` or `thinking`, `redacted_thinking`, or a `tool_use` with an `id` and a `name`. Anything else answers 502 `upstream_error`, free.
+
+**Response, streamed.** 200 with `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`, and the format's named events:
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"default","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":11,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello!"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+- `message_start` is rebuilt like a non-streamed message (no content yet). `content_block_start`, `content_block_delta` and `content_block_stop` keep `index` and their `content_block` or `delta` as the upstream sent them. `message_delta` keeps `stop_reason`, `stop_sequence` and, as `usage.output_tokens`, the output count the request is charged by. `message_stop` and `ping` are relayed as they are; any other event is dropped.
+- The 200 is sent at the first content block event after a `message_start`, which is held until then. Until then, an upstream failure is a normal error response and costs nothing.
+- `message_stop` ends the stream; nothing after it is relayed or charged. After the 200, an upstream error, or a stream that ends without `message_stop`, ends it with an error event; the output already relayed is charged:
+
+  ```
+  event: error
+  data: {"type":"error","error":{"type":"api_error","message":"upstream stream ended early"}}
+  ```
+
+**Order of checks** is chat's: the key (401, 403), the body (413, 400 `invalid_json`), the model (404), the messages, system and tools (400), busy shedding, `max_tokens`, then the reservation in the same order.
+
+**Charging.** As on chat (see [How metering works](../README.md#how-metering-works)), from the Anthropic usage counts: `input_tokens` and `cache_creation_input_tokens` are fresh input, `cache_read_input_tokens` is cached input and `output_tokens` is output (thinking included). A report counts only with integer `input_tokens` and `output_tokens` (and integer cache counts when present; absent or `null` is 0) and at least one input token. In a stream the input counts come from `message_start` and the cumulative output count from `message_delta`; a client that hangs up is charged by the upstream's own final counts when the upstream sends them, else by the last counts seen plus the bytes delivered after them. The usage row records the same fields as on chat; the reasoning count is 0, because the format reports none apart from `output_tokens`.
+
+### POST /v1/messages/count_tokens
+
+`{"model": "default", "messages": [...], "system": ..., "tools": [...]}` → 200 `{"input_tokens": 64}`
+
+The proxy's own conservative estimate: the prompt bound a `POST /v1/messages` request with the same fields would reserve for (see above), never fewer tokens than the upstream would count. Nothing goes upstream and nothing is reserved or charged; it needs a valid key (as on `POST /v1/messages`), an alias served in the Messages format, and fields that `POST /v1/messages` would accept, with the same errors.
 
 ### GET /v1/models
 
@@ -277,29 +376,34 @@ Errors:
 
 ## Errors
 
-Every error the API can answer. The client-route errors have a `code`; the admin errors have `code: null` and are told apart by their message.
+Every error the API can answer. The client-route errors have a `code`; the admin errors have `code: null` and are told apart by their message. On the two messages routes the same errors come in the Anthropic shape, without `code` and `param` (see [POST /v1/messages](#post-v1messages)). "messages" below means `POST /v1/messages`; `POST /v1/messages/count_tokens` answers only its errors for the key, the body, the model and the content (it reserves nothing and goes nowhere).
 
 | Status | `type` | `code` | Message | Retry-After | Where |
 |---|---|---|---|---|---|
 | 400 | `invalid_request_error` | `invalid_json` | request body must be a JSON object · request body has a number out of range (such as `1e999`, which no float holds) | | all POST routes |
-| 400 | `invalid_request_error` | `invalid_messages` | messages must be a non-empty array · each message needs a role · message name must be a string · message tool_call_id must be a string · tool_calls must be a non-empty list · each tool call needs string id, type, function name and arguments (a JSON string) | | chat |
+| 400 | `invalid_request_error` | `invalid_messages` | messages must be a non-empty array · each message needs a role · message name must be a string · message tool_call_id must be a string · tool_calls must be a non-empty list · each tool call needs string id, type, function name and arguments (a JSON string) | | chat · messages (the first two) |
+| 400 | `invalid_request_error` | `invalid_messages` | content must be a string or a non-empty list of content blocks | | messages |
 | 400 | `invalid_request_error` | `unsupported_content` | only text content is supported · message content must be text | | chat |
-| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 · grants must be an integer from 1 to 1000 | | chat · usage |
-| 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat, from the upstream |
-| 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat, from the upstream |
+| 400 | `invalid_request_error` | `unsupported_content` | only text, tool use, tool result and thinking content is supported | | messages |
+| 400 | `invalid_request_error` | `unsupported_tool` | only client tools are supported | | messages |
+| 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 · grants must be an integer from 1 to 1000 · tools must be a list of tool definitions | | chat · messages · usage |
+| 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat · messages, from the upstream |
+| 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat · messages, from the upstream |
 | 401 | `authentication_error` | `invalid_api_key` | missing bearer key · invalid key | | client routes |
-| 402 | `insufficient_quota` | `insufficient_quota` | credit balance too low for this request | | chat |
+| 401 | `authentication_error` | `invalid_api_key` | missing key: send x-api-key or Authorization: Bearer | | messages |
+| 402 | `insufficient_quota` | `insufficient_quota` | credit balance too low for this request | | chat · messages |
 | 403 | `permission_error` | `key_disabled` | key is disabled | | client routes |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat |
+| 404 | `invalid_request_error` | `model_not_found` | unknown model, or not served in the Messages format; see /v1/models | | messages |
 | 413 | `invalid_request_error` | `request_too_large` | request body too large | | all POST routes |
-| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 1 for concurrency; else until the oldest request in the key's window is a minute old | chat |
-| 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat |
-| 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat, from the upstream |
-| 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat, from the upstream |
-| 503 | `server_error` | `server_busy` | the server is busy; retry shortly | `ceil(5 x busy_min_weight / weight)`, 1 to 60 | chat |
-| 503 | `server_error` | `spend_cap_reached` | the server has reached its spending limit for this hour (or day, or month) | until that window ends | chat |
-| 503 | `api_error` | `upstream_unavailable` | upstream unavailable, retry shortly | 1 | chat, from the upstream |
-| 504 | `api_error` | `upstream_timeout` | upstream timed out | | chat, from the upstream |
+| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 1 for concurrency; else until the oldest request in the key's window is a minute old | chat · messages |
+| 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat · messages |
+| 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat · messages, from the upstream |
+| 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat · messages, from the upstream |
+| 503 | `server_error` | `server_busy` | the server is busy; retry shortly | `ceil(5 x busy_min_weight / weight)`, 1 to 60 | chat · messages |
+| 503 | `server_error` | `spend_cap_reached` | the server has reached its spending limit for this hour (or day, or month) | until that window ends | chat · messages |
+| 503 | `api_error` | `upstream_unavailable` | upstream unavailable, retry shortly | 1 | chat · messages, from the upstream |
+| 504 | `api_error` | `upstream_timeout` | upstream timed out | | chat · messages, from the upstream |
 | 400 | `invalid_request_error` | `null` | ref must be a non-empty string (max 200 bytes) · active must be true or false · grant needs a string grant_id and an integer credits · grant needs a grant_id and nonzero credits of at most 1000000000000000 · grant would take the balance out of range · unknown limit; use max_concurrent, requests_per_minute, credits_per_minute · \<limit\> must be null (the default) or an integer from 1 to 1000000000000000 · bonus_pct must be an integer from 0 to 300 · key_group must be at most 64 of a-z, 0-9, dot, dash and underscore · expires_at must be null or a future unix time in seconds | | admin |
 | 401 | `authentication_error` | `null` | invalid admin token | | admin |
 | 404 | `invalid_request_error` | `null` | unknown ref | | admin |
@@ -308,7 +412,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 404 | `invalid_request_error` | `null` | not found | | any other method or path |
 | 500 | `api_error` | `null` | internal error | | any route: an unexpected failure, such as a config that cannot be loaded or a ledger that cannot be read or written |
 
-- **Upstream-derived errors.** The rows marked "from the upstream" are the proxy's own answers, chosen from the last failed attempt after retries and failover; the upstream's own text is never relayed. The last attempt decides:
+- **Upstream-derived errors.** The rows marked "from the upstream" are the proxy's own answers (on `POST /v1/messages` too, where an upstream's 529 is a 5xx like any other), chosen from the last failed attempt after retries and failover; the upstream's own text is never relayed. The last attempt decides:
   - an upstream error code `context_length_exceeded`: 400 `context_length_exceeded`;
   - the time limit passed: 504 `upstream_timeout`;
   - a response or stream event too large: 502 `upstream_error`;
@@ -325,8 +429,8 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 |---|---|---|
 | `Content-Type` | every response | `application/json`, or `text/event-stream` for a stream |
 | `Retry-After` | every 429 and 503 | seconds (see [Errors](#errors)) |
-| `X-Request-Id` | chat, once the reservation is made (an upstream error included) | the request's lease id, the same id as in its usage row and log lines; quote it to support |
-| `X-Virsilipas-Weight` | chat, once it passes the key, body, model and message checks and is not shed as busy (a 400 for `max_tokens` and a refusal from the reservation included) | the key's priority weight |
+| `X-Request-Id` | chat and `POST /v1/messages`, once the reservation is made (an upstream error included) | the request's lease id, the same id as in its usage row and log lines; quote it to support |
+| `X-Virsilipas-Weight` | chat and `POST /v1/messages`, once it passes the key, body, model and message checks and is not shed as busy (a 400 for `max_tokens` and a refusal from the reservation included) | the key's priority weight |
 | `X-Virsilipas-Delay-Ms` | as `X-Virsilipas-Weight` | the spend-pacing wait before the request went upstream, 0 when none |
 | `Cache-Control` | a stream | `no-cache` |
 | `X-Accel-Buffering` | a stream | `no`, so nginx does not buffer the stream |

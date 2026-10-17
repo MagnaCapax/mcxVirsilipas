@@ -24,6 +24,22 @@ final class Http
         return $m[1];
     }
 
+    /**
+     * The key of an Anthropic-format client: from x-api-key, else from Authorization: Bearer (such clients send one or
+     * the other).
+     */
+    public static function apiKey(): string
+    {
+        $k = $_SERVER['HTTP_X_API_KEY'] ?? '';
+        if (is_string($k) && $k !== '') {
+            return $k;
+        }
+        if (($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '') === '') {
+            throw new HttpError(401, 'missing key: send x-api-key or Authorization: Bearer', 'authentication_error', code: 'invalid_api_key');
+        }
+        return self::bearer();
+    }
+
     /** @return array<string, mixed> */
     public static function jsonBody(int $maxBytes): array
     {

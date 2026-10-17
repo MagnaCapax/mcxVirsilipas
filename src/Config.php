@@ -18,8 +18,8 @@ final class Config
     private const KEYS = ['db_path', 'upstream_url', 'upstream_key_file', 'upstream_timeout', 'max_tokens_cap', 'max_concurrent_per_key', 'lease_seconds',
         'requests_per_minute', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
         'upstreams', 'models', 'caps'];
-    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'key_file', 'stream_options', 'params', 'description', 'context_length'];
-    private const UPSTREAM_KEYS = ['url', 'key_file', 'stream_options'];
+    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'description', 'context_length'];
+    private const UPSTREAM_KEYS = ['url', 'messages_url', 'key_file', 'stream_options'];
     private const ROUTE_KEYS = ['upstream', 'model', 'params', 'cost'];
 
     public readonly string $dbPath;
@@ -32,8 +32,9 @@ final class Config
     /** @var array<string, array{description: string, context_length: ?int}> alias => what /v1/models shows about it besides its rates */
     public readonly array $info;
     /**
-     * @var array<string, list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>>
-     * alias => its upstreams in failover order: where each request goes, the model id it asks for and the request fields set there
+     * @var array<string, list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>>
+     * alias => its upstreams in failover order: where each request goes (`messages_url`: where an Anthropic Messages request
+     * goes, null when that upstream serves none), the model id it asks for and the request fields set there
      */
     public readonly array $routes;
     public readonly int $retries;
@@ -185,7 +186,7 @@ final class Config
     /**
      * Where a model alias's requests go on its $hop-th upstream (0 = the first), with that upstream's own
      * key read from its own key file at request time. A missing key fails this upstream; it never borrows another's.
-     * @return array{url: string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}
+     * @return array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}
      */
     public function route(string $alias, int $hop = 0): array
     {
@@ -194,14 +195,15 @@ final class Config
         if ($key === '') {
             throw new \RuntimeException('upstream key file missing or empty');
         }
-        return ['url' => $r['url'], 'key' => $key, 'stream_options' => $r['stream_options'], 'model' => $r['model'], 'params' => $r['params']];
+        return ['url' => $r['url'], 'messages_url' => $r['messages_url'], 'key' => $key, 'stream_options' => $r['stream_options'], 'model' => $r['model'], 'params' => $r['params']];
     }
 
     /**
-     * The named upstreams: name => url, key_file and stream_options. The global upstream_url and
-     * upstream_key_file, when set, are the upstream that models without a route of their own use.
+     * The named upstreams: name => url, the optional messages_url (its Anthropic Messages endpoint, served with the same
+     * key), key_file and stream_options. The global upstream_url and upstream_key_file, when set, are the upstream that
+     * models without a route of their own use.
      * @param array<string, mixed> $c
-     * @return array<string, array{url: string, key_file: string, stream_options: array<string, mixed>}>
+     * @return array<string, array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>}>
      */
     private function upstreams(array $c): array
     {
@@ -215,7 +217,7 @@ final class Config
                 throw new \InvalidArgumentException('config: each upstreams entry needs a non-empty name and a settings array');
             }
             self::known($u, self::UPSTREAM_KEYS, "upstreams.$name.");
-            $out[$name] = ['url' => self::url($u, 'url', "upstreams.$name."), 'key_file' => self::str($u, 'key_file', "upstreams.$name."),
+            $out[$name] = ['url' => self::url($u, 'url', "upstreams.$name."), 'messages_url' => self::messagesUrl($u, "upstreams.$name."), 'key_file' => self::str($u, 'key_file', "upstreams.$name."),
                 'stream_options' => isset($u['stream_options']) ? self::streamOptions($u, 'stream_options', "upstreams.$name.") : $this->streamOptions];
         }
         return $out;
@@ -247,17 +249,18 @@ final class Config
     /**
      * A model's upstreams in failover order. A model either lists them ('route': upstream name, model id and
      * optional params per entry), or names one model id served by its own url and key_file, or by the global upstream.
-     * Params are merged per entry: the model's, then the entry's on top.
+     * Params are merged per entry: the model's, then the entry's on top. A model's own messages_url needs its own key_file,
+     * as its own url does: the global key never goes to another endpoint.
      * @param array<string, mixed> $m
-     * @param array<string, array{url: string, key_file: string, stream_options: array<string, mixed>}> $upstreams
+     * @param array<string, array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>}> $upstreams
      * @param array<string, mixed> $params
-     * @return list<array{url: string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>
+     * @return list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>
      */
     private function hops(string $alias, array $m, array $upstreams, array $params): array
     {
         if (isset($m['route'])) {
-            if (isset($m['model']) || isset($m['url']) || isset($m['key_file']) || isset($m['stream_options'])) {
-                throw new \InvalidArgumentException("config: models.$alias has a route, so its model belongs in the route entries and url, key_file and stream_options in upstreams");
+            if (isset($m['model']) || isset($m['url']) || isset($m['messages_url']) || isset($m['key_file']) || isset($m['stream_options'])) {
+                throw new \InvalidArgumentException("config: models.$alias has a route, so its model belongs in the route entries and url, messages_url, key_file and stream_options in upstreams");
             }
             if (!is_array($m['route']) || $m['route'] === [] || !array_is_list($m['route'])) {
                 throw new \InvalidArgumentException("config: models.$alias.route must be a non-empty list of upstream and model entries");
@@ -287,6 +290,10 @@ final class Config
         } else {
             throw new \InvalidArgumentException("config: models.$alias has no upstream: give it a route, its own url and key_file, or set upstream_url");
         }
+        if (isset($m['messages_url']) && !isset($m['key_file'])) {
+            throw new \InvalidArgumentException("config: models.$alias.messages_url needs models.$alias.key_file as well");
+        }
+        $u['messages_url'] = self::messagesUrl($m, "models.$alias.");
         $u['stream_options'] = isset($m['stream_options']) ? self::streamOptions($m, 'stream_options', "models.$alias.") : $this->streamOptions;
         return [$u + ['model' => $m['model'], 'params' => $params, 'cost' => null]];
     }
@@ -348,6 +355,15 @@ final class Config
             throw new \InvalidArgumentException("config: $prefix$k must be an https URL (plain http only to 127.0.0.1, ::1 or localhost)");
         }
         return $u;
+    }
+
+    /**
+     * The optional messages_url of an upstream or a model: an upstream URL like url (same scheme rule), or null.
+     * @param array<string, mixed> $c
+     */
+    private static function messagesUrl(array $c, string $prefix): ?string
+    {
+        return array_key_exists('messages_url', $c) ? self::url($c, 'messages_url', $prefix) : null;
     }
 
     /**

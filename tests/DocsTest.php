@@ -13,7 +13,7 @@ const CLI_ONLY_MESSAGES = ['limit must be from 1 to 100000']; // Ledger::history
 function apiFacts(): array
 {
     $root = dirname(__DIR__);
-    preg_match_all("/'([A-Z]+ \\/[a-z0-9\\/]+)' =>/", (string) file_get_contents("$root/public/index.php"), $m);
+    preg_match_all("/'([A-Z]+ \\/[a-z0-9_\\/]+)' =>/", (string) file_get_contents("$root/public/index.php"), $m);
     $routes = $m[1];
     $src = '';
     foreach (array_merge(glob("$root/src/*.php") ?: [], ["$root/public/index.php"]) as $f) {

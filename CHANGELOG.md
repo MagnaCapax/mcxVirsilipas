@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.10.0 (2026-10-17)
+
+No schema change.
+
+- **`POST /v1/messages`: the Anthropic Messages format, for Claude Code.** A metered pass-through to upstreams that serve the format natively, not a translation: an upstream (or a model in the older single-upstream form, beside its own `key_file`) may set `messages_url`, called with that upstream's own key; only the aliases routed to such an upstream can be used, on those route entries only, in route order with the usual retries and failover. Any other alias answers 404 `not_found_error`. The key comes as `x-api-key` or `Authorization: Bearer`. Only allowlisted fields go upstream (model, messages, system, max_tokens, stop_sequences, stream, temperature, top_p, top_k, tools, tool_choice, thinking, metadata), with text, tool use, tool result and thinking blocks and client tools; images, documents and server tools are refused (400). `max_tokens` is clamped as on chat, a thinking budget that no longer fits is lowered to fit, and `anthropic-version` and `anthropic-beta` are forwarded. Metering from the Anthropic counts: input and cache writes as fresh input, cache reads as cached input, output (thinking included) as output, streamed or not, with a client hang-up charged by the upstream's own final counts as on chat. Answers and stream events are rebuilt at their top level (the alias as the model, the standard usage counts) and content blocks pass as sent; errors use the Anthropic error shape with the proxy's fixed messages. The model's `params` do not apply on this route.
+- **`POST /v1/messages/count_tokens`** answers `{"input_tokens": N}`, the proxy's own conservative estimate (the prompt bound a messages request would reserve for), free and without an upstream call.
+- **README:** a *Claude Code* section (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`). **docs/API.md:** both routes. **docs/adr/0020:** the Messages format is a metered pass-through; ADR 0013 amended. AGENTS.md invariants 5, 6, 7, 8 and 14 name the route's rules.
+
 ## v0.9.1 (2026-10-17)
 
 Schema 9 to 10: an index on `grants(key_id)` and a trigger `credit_log_no_replace`. `init` upgrades a schema-2 to 9 ledger in place; no row changes. An older release's `init` refuses a schema-10 ledger.

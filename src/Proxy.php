@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace MagnaCapax\Virsilipas;
 
 /**
- * The customer-facing side: OpenAI-compatible chat completions with per-key metering in credits.
+ * The customer-facing side: OpenAI-compatible chat completions with per-key metering in credits, and the same metering
+ * for the Anthropic Messages format passed through to upstreams that serve it (see Messages).
  *
  * Flow per request: authenticate the key, admit only text requests built from known fields,
  * reserve an upper bound of credits (clamping max_tokens to the balance), forward to the
@@ -109,8 +110,71 @@ final class Proxy
         $stream = ($req['stream'] ?? false) === true;
         // Every forwarded byte counts, the operator's params included; one bound must cover whichever upstream answers.
         $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params']), $this->config->routes[$alias]));
-        $rates = $this->config->models[$alias];
+        $build = static fn (array $route, int $maxTokens): array => [$route['url'], ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
+            self::encode(self::rewrite($req, $route['model'], $maxTokens, $stream, $route['stream_options'], $route['params']))];
+        $this->serve($key, $alias, array_keys($this->config->routes[$alias]), $promptBound, $req, $stream, false, $build);
+    }
 
+    /**
+     * POST /v1/messages: the Anthropic Messages format, passed through to the upstreams of the alias's route that have a
+     * messages_url (in route order), metered like chat. The key may come as x-api-key or as a bearer token; errors use
+     * that format's shape (public/index.php). The operator's params are not applied: they are chat completions fields.
+     */
+    public function messages(): void
+    {
+        $key = $this->authenticate(true);
+        $req = Http::jsonBody(self::MAX_BODY_BYTES);
+        [$alias, $hops] = $this->messagesAlias($req);
+        $fields = Messages::fields($req);
+        $stream = ($req['stream'] ?? false) === true;
+        $build = static fn (array $route, int $maxTokens): array => [(string) $route['messages_url'], Messages::headers($route['key']),
+            self::encode(Messages::rewrite($fields, $route['model'], $maxTokens, $stream))];
+        $this->serve($key, $alias, $hops, Messages::promptBound($fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, true, $build);
+    }
+
+    /**
+     * POST /v1/messages/count_tokens: the proxy's own conservative estimate, the prompt bound a request with these fields
+     * would reserve for (never fewer tokens than the upstream would count). Nothing goes upstream, nothing is reserved
+     * or charged.
+     */
+    public function countTokens(): void
+    {
+        $this->authenticate(true);
+        $req = Http::jsonBody(self::MAX_BODY_BYTES);
+        $this->messagesAlias($req);
+        Http::json(200, ['input_tokens' => Messages::promptBound(Messages::fields($req))]);
+    }
+
+    /**
+     * The requested alias and the indexes of its route entries that serve the Messages format, or a 404 when the alias is
+     * unknown or none of its upstreams has a messages_url.
+     * @param array<string, mixed> $req
+     * @return array{0: string, 1: list<int>}
+     */
+    private function messagesAlias(array $req): array
+    {
+        $alias = $req['model'] ?? null;
+        $hops = is_string($alias) && isset($this->config->routes[$alias])
+            ? array_keys(array_filter($this->config->routes[$alias], static fn (array $h): bool => $h['messages_url'] !== null)) : [];
+        if (!is_string($alias) || $hops === []) {
+            throw new HttpError(404, 'unknown model, or not served in the Messages format; see /v1/models', code: 'model_not_found', param: 'model');
+        }
+        return [$alias, $hops];
+    }
+
+    /**
+     * The metered part of a request, shared by chat completions and messages: admission, the reservation, the attempts
+     * over the alias's route entries $hops in order (retries and failover), and the settlement. $maxReq holds the
+     * client's max_tokens fields, read after admission as docs/API.md's order of checks says. $build gives, for one
+     * route entry and the clamped max_tokens, the upstream URL, the request headers and the body.
+     * @param array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} $key
+     * @param list<int> $hops
+     * @param array<string, mixed> $maxReq
+     * @param \Closure(array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}, int): array{0: string, 1: list<string>, 2: string} $build
+     */
+    private function serve(array $key, string $alias, array $hops, int $promptBound, array $maxReq, bool $stream, bool $messages, \Closure $build): void
+    {
+        $rates = $this->config->models[$alias];
         $internal = self::internalCaller();
         [$weight, $delayMs] = $this->admission($key, $internal);
 
@@ -118,7 +182,7 @@ final class Proxy
             $lease = $this->ledger->reserve(
                 $key['id'],
                 $promptBound,
-                self::requestedMaxTokens($req),
+                self::requestedMaxTokens($maxReq),
                 $this->config->maxTokensCap,
                 $rates,
                 $this->config->limitDefaults(),
@@ -135,7 +199,7 @@ final class Proxy
         }
 
         $result = self::attemptResult(0);
-        [$upstream, $servedHop, $started, $attempts] = ['', 0, hrtime(true), 0];
+        [$upstream, $servedHop, $started, $attempts] = ['', $hops[0], hrtime(true), 0];
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
             // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
@@ -152,7 +216,7 @@ final class Proxy
                 'prompt_bound' => $promptBound, 'reserved' => $lease['reserved'], 'max_tokens' => $lease['max_tokens']]);
             // The alias's upstreams in order. Each gets the first try plus `retries` more when a failure cost nothing
             // upstream; anything that may have generated output, or that the client caused, ends the request.
-            foreach (array_keys($this->config->routes[$alias]) as $hop) {
+            foreach ($hops as $hop) {
                 try {
                     $route = $this->config->route($alias, $hop);
                 } catch (\RuntimeException) {
@@ -160,8 +224,8 @@ final class Proxy
                     $result = self::attemptResult(0, 'next');
                     continue;
                 }
-                [$upstream, $servedHop] = [(string) parse_url($route['url'], PHP_URL_HOST), $hop]; // which upstream served it, for tracking per upstream
-                $body = self::encode(self::rewrite($req, $route['model'], $lease['max_tokens'], $stream, $route['stream_options'], $route['params']));
+                [$url, $headers, $body] = $build($route, $lease['max_tokens']);
+                [$upstream, $servedHop] = [(string) parse_url($url, PHP_URL_HOST), $hop]; // which upstream served it, for tracking per upstream
                 for ($try = 0; $try <= $this->config->retries; $try++) {
                     if (connection_aborted()) {
                         break 2; // the client is gone: no further attempt is made for it
@@ -172,7 +236,7 @@ final class Proxy
                         break 2;
                     }
                     $attempts++;
-                    $result = $this->forward($route, $body, $stream, $alias, $rates, $lease['reserved'], $left);
+                    $result = $this->forward($url, $headers, $body, $stream, $messages, $alias, $rates, $lease['reserved'], $left);
                     if ($result['delivered'] || $result['kind'] === 'final') {
                         break 2;
                     }
@@ -191,7 +255,8 @@ final class Proxy
                 }
             }
             if (!$result['delivered']) {
-                self::failure($result)->send();
+                $error = self::failure($result);
+                $messages ? $error->sendAnthropic() : $error->send();
             }
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
@@ -803,10 +868,13 @@ final class Proxy
         return [$weight, $delay];
     }
 
-    /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} */
-    private function authenticate(): array
+    /**
+     * The caller's key: a bearer token, or with $apiKeyHeader (the Messages routes) also an x-api-key header.
+     * @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}
+     */
+    private function authenticate(bool $apiKeyHeader = false): array
     {
-        $key = $this->ledger->findKey(Http::bearer());
+        $key = $this->ledger->findKey($apiKeyHeader ? Http::apiKey() : Http::bearer());
         if ($key === null) {
             throw new HttpError(401, 'invalid key', 'authentication_error', code: 'invalid_api_key');
         }
@@ -823,21 +891,26 @@ final class Proxy
      * the caller may try again, try the next upstream, or send a generic error of the right class.
      * Upstream bodies are never relayed; of an error body only a recognised machine code is kept.
      * A client that hangs up stops the upstream request, and so does a stream whose reported usage
-     * passes the reservation; what was delivered is still charged.
-     * @param array{url: string, key: string, stream_options: array<string, mixed>} $route
+     * passes the reservation; what was delivered is still charged. $messages selects the Anthropic Messages format
+     * (Messages: its answer check, rebuilt views and stream events) instead of chat completions.
+     * @param list<string> $headers
      * @param string $body the request as JSON (encode())
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
      * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool, first_byte_ns: ?int}
      */
-    private function forward(array $route, string $body, bool $stream, string $alias, array $rates, int $reserved, int $timeout): array
+    private function forward(string $url, array $headers, string $body, bool $stream, bool $messages, string $alias, array $rates, int $reserved, int $timeout): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
-        /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int} $s */
+        // held and raw are the Messages format's: the message_start held until the first content, and the usage counts so far.
+        /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int, held: string, raw: array<string, mixed>} $s */
         $s = ['first_byte' => null, 'status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
-            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null];
+            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null, 'held' => '', 'raw' => []];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
-        $handle = static function (string $event) use (&$s, $alias, $rates, $reserved): string {
+        $handle = static function (string $event) use (&$s, $messages, $alias, $rates, $reserved): string {
+            if ($messages) {
+                return Messages::event($s, $event, $alias, $rates, $reserved);
+            }
             $e = self::parseEvent($event);
             if ($e === null || $s['done'] || $s['failed']) {
                 return ''; // nothing after the terminal marker, or after an upstream error, is relayed or counted
@@ -894,11 +967,11 @@ final class Proxy
             return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
         };
 
-        $ch = curl_init($route['url']);
+        $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $body,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
+            CURLOPT_HTTPHEADER => $headers,
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_TIMEOUT => $timeout,
             CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$s): int {
@@ -988,7 +1061,8 @@ final class Proxy
             $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']); // after a hang-up too: it may hold the final report
             if (!$s['aborted']) {
                 if (!$s['done']) {
-                    $tail .= 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error', 'param' => null, 'code' => 'upstream_error']]) . "\n\n";
+                    $tail .= $messages ? Messages::earlyEnd()
+                        : 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error', 'param' => null, 'code' => 'upstream_error']]) . "\n\n";
                 }
                 echo $tail;
                 flush();
@@ -997,18 +1071,20 @@ final class Proxy
         }
 
         $json = (!$stream && $curlErr === 0 && $status >= 200 && $status <= 299) ? json_decode($s['full'], true) : null;
-        if (self::hasChoices($json, true)) {
+        $usage = static fn (mixed $u): ?array => $messages ? Messages::usage($u) : self::validUsage($u);
+        $view = $messages ? Messages::answer($json, $alias) : (self::hasChoices($json, true) ? self::publicView($json, $alias, $rates, $reserved) : null);
+        if ($view !== null) {
             http_response_code(200);
             header('Content-Type: application/json');
-            $view = self::publicView($json, $alias, $rates, $reserved);
             $result['first_byte_ns'] = hrtime(true);
             echo json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            $bound = self::viewBytes($view); // what the client received, never discarded upstream fields
-            return ['usage' => self::validUsage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
+            // What the client received, never discarded upstream fields.
+            $bound = $messages ? Messages::bytes($view['content']) : self::viewBytes($view);
+            return ['usage' => $usage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
         }
 
         // A 2xx without a usable answer is free for the client, but its usage report (what the upstream billed) is kept for tracking.
         return ['kind' => self::outcome($status, $curlErr, $sent, $s['too_big']), 'timed_out' => $curlErr === CURLE_OPERATION_TIMEDOUT && $sent,
-            'code' => self::errorCode($s['err']), 'usage' => $stream ? $s['usage'] : (is_array($json) ? self::validUsage($json['usage'] ?? null) : null)] + $result;
+            'code' => self::errorCode($s['err']), 'usage' => $stream ? $s['usage'] : (is_array($json) ? $usage($json['usage'] ?? null) : null)] + $result;
     }
 }

@@ -17,6 +17,14 @@ $seen = array_intersect_key($req, array_flip(['model', 'n', 'best_of', 'store', 
 // Where the request arrived and with which key, for the per-model upstream test (fake keys only).
 $seen['path'] = (string) ($_SERVER['REQUEST_URI'] ?? '');
 $seen['auth'] = (string) ($_SERVER['HTTP_AUTHORIZATION'] ?? '');
+// For the Messages format: which fields and block fields arrived (names only), the thinking setting and the headers.
+$seen['keys'] = array_keys($req);
+$seen['block_keys'] = is_array($req['messages'][0]['content'] ?? null) ? array_keys($req['messages'][0]['content'][0] ?? []) : [];
+$seen['tool_keys'] = array_keys($req['tools'][0] ?? []);
+$seen['thinking'] = $req['thinking'] ?? null;
+$seen['x_api_key'] = (string) ($_SERVER['HTTP_X_API_KEY'] ?? '');
+$seen['anthropic_version'] = (string) ($_SERVER['HTTP_ANTHROPIC_VERSION'] ?? '');
+$seen['anthropic_beta'] = (string) ($_SERVER['HTTP_ANTHROPIC_BETA'] ?? '');
 file_put_contents($dir . '/last-request.json', json_encode($seen));
 // Every request in order, for the retry and failover tests.
 file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPEND | LOCK_EX);
@@ -24,6 +32,47 @@ file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPE
 $model = (string) ($req['model'] ?? '');
 $chunks = 10;
 $prompt = 11;
+
+// The Anthropic Messages format, on a /v1/messages path. scenario-anth-ok reports cache writes and reads (100 fresh +
+// 50 written + 800 read input tokens, 40 output); scenario-anth-slow streams slowly with plain counts (11 input, 10
+// output) reported only at the end, for the hang-up test; scenario-anth-529 is overloaded. Private fields sit at the
+// message and usage level, where the proxy must drop them; content blocks pass as sent.
+if (str_ends_with($seen['path'], '/v1/messages')) {
+    if ($model === 'scenario-anth-529') {
+        http_response_code(529);
+        header('Content-Type: application/json');
+        echo '{"type":"error","error":{"type":"overloaded_error","message":"private upstream detail: overloaded"}}';
+        exit;
+    }
+    $slow = $model === 'scenario-anth-slow';
+    $in = $slow ? ['input_tokens' => 11] : ['input_tokens' => 100, 'cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800];
+    $out = $slow ? 10 : 40;
+    $private = ['service_tier' => 'PRIVATE-DETAIL', 'estimated_cost' => 0.5];
+    if (empty($req['stream'])) {
+        header('Content-Type: application/json');
+        echo json_encode(['id' => 'msg_1', 'type' => 'message', 'role' => 'assistant', 'model' => $model, 'provider' => 'PRIVATE-DETAIL',
+            'content' => [['type' => 'thinking', 'thinking' => 'pondering', 'signature' => 'sig'], ['type' => 'text', 'text' => 'hello world']],
+            'stop_reason' => 'end_turn', 'stop_sequence' => null, 'usage' => $in + ['output_tokens' => $out] + $private]);
+        exit;
+    }
+    header('Content-Type: text/event-stream');
+    $sse = static function (string $type, array $data): void {
+        echo "event: $type\ndata: " . json_encode(['type' => $type] + $data) . "\n\n";
+        flush();
+    };
+    $sse('message_start', ['message' => ['id' => 'msg_1', 'type' => 'message', 'role' => 'assistant', 'model' => $model, 'provider' => 'PRIVATE-DETAIL',
+        'content' => [], 'stop_reason' => null, 'stop_sequence' => null, 'usage' => $in + ['output_tokens' => 1] + $private]]);
+    $sse('ping', []);
+    $sse('content_block_start', ['index' => 0, 'content_block' => ['type' => 'text', 'text' => '']]);
+    for ($i = 1; $i <= $chunks; $i++) {
+        $sse('content_block_delta', ['index' => 0, 'delta' => ['type' => 'text_delta', 'text' => "t$i "]]);
+        usleep($slow ? 200000 : 10000);
+    }
+    $sse('content_block_stop', ['index' => 0]);
+    $sse('message_delta', ['delta' => ['stop_reason' => 'end_turn', 'stop_sequence' => null], 'usage' => ['output_tokens' => $out] + $private]);
+    $sse('message_stop', []);
+    exit;
+}
 // scenario-no-cost is an upstream that reports no cost of its own.
 $usage = static fn (int $completion): array => array_diff_key([
     'prompt_tokens' => $prompt, 'completion_tokens' => $completion, 'total_tokens' => $prompt + $completion,

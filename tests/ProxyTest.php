@@ -209,10 +209,10 @@ function testConfigRoutesPerModel(): void
     file_put_contents("$dir/upstream.key", "global-key\n");
     file_put_contents("$dir/second.key", " second-key \n");
     $c = new Config(configArrayFor($dir, ['upstream_url' => 'https://llm.example.com/v1/chat/completions']));
-    same(['url' => 'https://llm.example.com/v1/chat/completions', 'key' => 'global-key',
+    same(['url' => 'https://llm.example.com/v1/chat/completions', 'messages_url' => null, 'key' => 'global-key',
         'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true], 'model' => 'scenario-ok', 'params' => []],
         $c->route('ok'), 'a plain model uses the global upstream');
-    same(['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'key' => 'second-key', 'stream_options' => ['include_usage' => true],
+    same(['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'messages_url' => null, 'key' => 'second-key', 'stream_options' => ['include_usage' => true],
         'model' => 'scenario-ok', 'params' => []], $c->route('second-upstream'), 'a model with its own url, key_file and stream_options uses them');
     unlink("$dir/second.key");
     try {

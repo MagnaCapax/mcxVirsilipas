@@ -111,12 +111,19 @@ function configArrayFor(string $dir, array $overrides = []): array
     $models['dead-first'] = ['route' => [$hop('dead', 'scenario-ok'), $hop('backup', 'scenario-ok')]] + unitRates();
     $models['pinned'] = ['route' => [$hop('primary', 'scenario-ok', ['chat_template_kwargs' => ['thinking' => false]])],
         'params' => ['reasoning_effort' => 'low'], 'description' => 'fast, little reasoning', 'context_length' => 128000] + unitRates();
+    // Anthropic Messages aliases: the 'msgs' upstream has a messages_url (and its own key); 'primary' has none, so only
+    // the second entry of anth-mixed serves /v1/messages. anth is priced like 'weighted', for the cached-input test.
+    $models['anth'] = ['route' => [$hop('msgs', 'scenario-anth-ok')], 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    $models['anth-slow'] = ['route' => [$hop('msgs', 'scenario-anth-slow')]] + unitRates();
+    $models['anth-overloaded'] = ['route' => [$hop('msgs', 'scenario-anth-529')]] + unitRates();
+    $models['anth-mixed'] = ['route' => [$hop('primary', 'scenario-ok'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();
     return $overrides + [
         'upstreams' => [
             'primary' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],
             'backup' => ['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'key_file' => "$dir/second.key"],
             'dead' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],
             'nokey' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/missing.key"],
+            'msgs' => ['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'messages_url' => 'http://127.0.0.1:1/second/v1/messages', 'key_file' => "$dir/second.key"],
         ],
         'db_path' => "$dir/ledger.sqlite",
         'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
@@ -162,6 +169,8 @@ final class Harness
         $cfg['models']['second-upstream']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
         $cfg['upstreams']['primary']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
         $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+        $cfg['upstreams']['msgs']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
+        $cfg['upstreams']['msgs']['messages_url'] = "http://127.0.0.1:$up/second/v1/messages";
         file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
         // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
         $ports = [];
@@ -236,16 +245,17 @@ function serverLogProblems(): array
 }
 
 /**
- * One HTTP request to the proxy. $stopAfterBytes > 0 makes the client hang up mid-response.
+ * One HTTP request to the proxy. $stopAfterBytes > 0 makes the client hang up mid-response. $headers are sent as well.
  * @param array<string, mixed>|null $body
+ * @param list<string> $headers
  * @return array{status: int, body: string}
  */
-function http(string $method, string $path, ?array $body = null, ?string $bearer = null, int $stopAfterBytes = 0): array
+function http(string $method, string $path, ?array $body = null, ?string $bearer = null, int $stopAfterBytes = 0, array $headers = []): array
 {
     $ch = curl_init(Harness::get()['proxy'] . $path);
     $out = '';
     $retryAfter = $requestId = null;
-    $headers = ['Content-Type: application/json'];
+    $headers[] = 'Content-Type: application/json';
     if ($bearer !== null) {
         $headers[] = "Authorization: Bearer $bearer";
     }

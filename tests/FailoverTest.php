@@ -209,7 +209,7 @@ function testConfigRoutesAndParams(): void
     unset($base['upstream_url'], $base['upstream_key_file']);
     $c = new Config(['upstreams' => $up, 'models' => ['m' => $model + ['params' => ['reasoning_effort' => 'low'],
         'route' => [['upstream' => 'a', 'model' => 'x'], ['upstream' => 'b', 'model' => 'y', 'params' => ['reasoning_effort' => 'high', 'top_k' => 5]]]]]] + $base);
-    same(['url' => $up['a']['url'], 'key' => 'key-a', 'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true],
+    same(['url' => $up['a']['url'], 'messages_url' => null, 'key' => 'key-a', 'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true],
         'model' => 'x', 'params' => ['reasoning_effort' => 'low']], $c->route('m', 0));
     same(['key-b', 'y', ['reasoning_effort' => 'high', 'top_k' => 5]], [$c->route('m', 1)['key'], $c->route('m', 1)['model'], $c->route('m', 1)['params']],
         'an upstream entry has its own key, model id and params over the model params');

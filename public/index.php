@@ -18,6 +18,8 @@ header_remove('X-Powered-By');
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+// The Anthropic Messages routes answer errors in that format.
+$anthropic = $path === '/v1/messages' || str_starts_with($path, '/v1/messages/');
 
 try {
     $config = Config::load(virsilipas_config_path());
@@ -28,6 +30,8 @@ try {
 
     match ("$method $path") {
         'POST /v1/chat/completions' => $proxy->chat(),
+        'POST /v1/messages' => $proxy->messages(),
+        'POST /v1/messages/count_tokens' => $proxy->countTokens(),
         'GET /v1/models' => $proxy->models(),
         'GET /v1/balance' => $proxy->balance(),
         'GET /v1/usage' => $proxy->usage(),
@@ -43,13 +47,14 @@ try {
     // The reason is one of the proxy's fixed messages; the request path is client text and is not logged.
     Log::write('info', 'refused', ['status' => $e->status, 'reason' => $e->getMessage()]);
     if (!headers_sent()) {
-        $e->send();
+        $anthropic ? $e->sendAnthropic() : $e->send();
     }
 } catch (\Throwable $e) {
     // Fail closed. Log the class and the code location only: an exception message can carry
     // data. `bin/virsilipas` prints configuration errors in full.
     Log::write('error', 'exception', ['class' => get_class($e), 'at' => basename($e->getFile()) . ':' . $e->getLine()]);
     if (!headers_sent()) {
-        (new HttpError(500, 'internal error', 'api_error'))->send();
+        $err = new HttpError(500, 'internal error', 'api_error');
+        $anthropic ? $err->sendAnthropic() : $err->send();
     }
 }

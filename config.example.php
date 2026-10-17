@@ -8,8 +8,13 @@ return [
     // The upstreams: name => any OpenAI-compatible chat completions endpoint (https, or plain http only to 127.0.0.1,
     // ::1 or localhost) and the file holding only its API key (readable by the PHP process, by nobody else). Each
     // upstream's key goes to that upstream only. 'stream_options' may be set per upstream (default: the one below).
+    // 'messages_url' (optional, same scheme rule): the upstream's own Anthropic Messages endpoint, for POST /v1/messages
+    // (Claude Code). It is called with the same key_file; only the aliases routed to an upstream that has one can be used
+    // there, and only on those route entries. For a model in the older form below, set it beside the model's own key_file.
     'upstreams' => [
         'main' => ['url' => 'https://llm.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/main.key'],
+        // 'main' => ['url' => 'https://llm.example.com/v1/chat/completions', 'messages_url' => 'https://llm.example.com/v1/messages',
+        //     'key_file' => '/etc/virsilipas/main.key'],
         'spare' => ['url' => 'https://other.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/spare.key'],
     ],
 
