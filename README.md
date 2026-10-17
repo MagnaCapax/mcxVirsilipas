@@ -14,6 +14,210 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 
 **The name.** *Virsilipas* is the song-box of the Kalevala. The singer opens it before singing ("virsilippahan viritän", Runo I), and the giant Vipunen, "in whose mouth was great knowledge", opens it to sing out all he knows (Runo XVII). This proxy opens the box for as many words as a key has paid for.
 
+## Where to find what
+
+| You want to | Read |
+|---|---|
+| Try it on your own machine in five minutes, with no upstream account | [Quick start](#quick-start-five-minutes-on-your-own-machine) |
+| Call a running proxy from code or a tool | [Call the API](#call-the-api), then [docs/API.md](docs/API.md) for every field, header and error |
+| Find out why a request fails | [Troubleshooting](#troubleshooting) |
+| Run it for real users | [Install](#install), [Configuration](#configuration-the-minimum-then-what-to-add), [php-fpm and nginx](#php-fpm-and-nginx), [Access control](#access-control), [Backups](#backups) |
+| Understand what a request costs and what stops spending | [Credits](#credits), [How metering works](#how-metering-works), [Cost and rate controls at a glance](#cost-and-rate-controls-at-a-glance) |
+| Upgrade a running copy | [Releasing and upgrading](#releasing-and-upgrading) |
+| See why it is built this way | [docs/adr/](docs/adr/) |
+
+## Quick start: five minutes on your own machine
+
+This runs the proxy against the stand-in upstream the test suite uses (`tests/fake-upstream.php`), so it needs no upstream account and costs nothing. You need PHP 8.2 or newer with the `curl` and `pdo_sqlite` extensions, and `curl`, in a bash shell at the top of a checkout of this repository. Both servers listen on 127.0.0.1 only. If port 8080 or 8081 is taken, change it everywhere below.
+
+**1. Write a config** in a new directory that only you can read:
+
+```sh
+DEMO=$(mktemp -d)
+echo fake-upstream-key > "$DEMO/upstream.key"      # the stand-in does not check its key
+ADMIN_TOKEN=$(php -r 'echo bin2hex(random_bytes(32));')   # for the admin API; only its sha256 goes in the config
+cat > "$DEMO/config.php" <<EOF
+<?php
+return [
+    'db_path' => '$DEMO/ledger.sqlite',
+    'upstreams' => ['local' => ['url' => 'http://127.0.0.1:8081/v1/chat/completions', 'key_file' => '$DEMO/upstream.key']],
+    'models' => ['default' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000,
+        'route' => [['upstream' => 'local', 'model' => 'demo-model']]]],
+    'admin_token_sha256' => '$(printf %s "$ADMIN_TOKEN" | php -r 'echo hash("sha256", stream_get_contents(STDIN));')',
+];
+EOF
+export VIRSILIPAS_CONFIG="$DEMO/config.php"
+```
+
+**2. Start the stand-in upstream and the proxy** in the background, with their output in `$DEMO`:
+
+```sh
+FAKE_UPSTREAM_DIR="$DEMO" php -S 127.0.0.1:8081 tests/fake-upstream.php > "$DEMO/upstream.log" 2>&1 & UPSTREAM_PID=$!
+php -S 127.0.0.1:8080 public/index.php > "$DEMO/proxy.log" 2>&1 & PROXY_PID=$!
+```
+
+**3. Create the database, a key and some credits:**
+
+```sh
+bin/virsilipas init                                      # ok
+export VIRSILIPAS_KEY=$(bin/virsilipas key-create alice)  # a key is shown only once; this keeps it in the shell
+bin/virsilipas grant alice 1000000 demo-1                # {"applied":true,"balance":1000000}
+```
+
+**4. Send a request:**
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $VIRSILIPAS_KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "default", "messages": [{"role": "user", "content": "Say hello."}]}'
+```
+
+You get an OpenAI-style chat completion back. The answer is in `choices[0].message.content` (the stand-in always says "hello world") and its cost in `usage.credits`: 39 here, which is 11 prompt tokens at 1,000,000 credits per million plus 7 output tokens at 4,000,000 per million.
+
+Things to try while it runs:
+
+```sh
+bin/virsilipas history alice    # the grant, the reservation the request took and the unused part it gave back
+curl http://127.0.0.1:8080/v1/balance -H "Authorization: Bearer $VIRSILIPAS_KEY"
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $VIRSILIPAS_KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "default", "stream": true, "messages": [{"role": "user", "content": "Count to ten."}]}'
+VIRSILIPAS_URL=http://127.0.0.1:8080 php examples/client.php chat "one word, please"
+curl http://127.0.0.1:8080/admin/grants \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"ref": "alice", "grant_id": "demo-2", "credits": 500000}'
+bin/virsilipas top --once       # the requests, tokens, credits and timings so far
+```
+
+When you are done, stop both servers and delete the demo directory:
+
+```sh
+kill $UPSTREAM_PID $PROXY_PID && rm -r -- "$DEMO"
+```
+
+To serve real users, the steps are the same with a real upstream in place of the stand-in: its https chat completions URL and a file holding its API key in `upstreams`, and its model id in each `route`. [Install](#install) covers the production setup, and [Before enabling a model](#before-enabling-a-model) lists what to check about a model before customers can use it.
+
+## Call the API
+
+The proxy speaks the OpenAI chat completions format. A client needs four things:
+
+| | |
+|---|---|
+| Base URL | your deployment's address plus `/v1`, for example `https://proxy.example/v1` |
+| Authentication | `Authorization: Bearer <key>`; keys start with `vsk-` |
+| Model | one of the aliases `GET /v1/models` lists, such as `default` |
+| Credits left | `GET /v1/balance` |
+
+The examples read the address and the key from the environment, so they never contain a key and are safe to copy and share:
+
+```sh
+export VIRSILIPAS_URL=https://proxy.example
+read -rs VIRSILIPAS_KEY && export VIRSILIPAS_KEY   # paste the key and press Enter; it is not shown or kept in your shell history
+```
+
+### curl
+
+```sh
+curl "$VIRSILIPAS_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $VIRSILIPAS_KEY" -H 'Content-Type: application/json' \
+  -d '{"model": "default", "messages": [{"role": "user", "content": "Say hello."}]}'
+```
+
+To stream, add `"stream": true` to the body and `-N` to curl. The answer arrives as `data: {...}` events, and the stream ends with `data: [DONE]`. The last event that carries `usage` shows the credits the request is charged, except in the cases the [streamed response](docs/API.md#post-v1chatcompletions) section of docs/API.md describes.
+
+### JavaScript
+
+Node 18 or newer, no packages. Save as `hello.mjs` and run `node hello.mjs`:
+
+```js
+const res = await fetch(`${process.env.VIRSILIPAS_URL}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${process.env.VIRSILIPAS_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ model: 'default', messages: [{ role: 'user', content: 'Say hello.' }] }),
+});
+const reply = await res.json();
+if (!res.ok) throw new Error(`${res.status} ${reply.error.code}: ${reply.error.message}`);
+console.log(reply.choices[0].message.content);
+console.log(`credits: ${reply.usage.credits}`);
+```
+
+### PHP: the example clients
+
+```sh
+php examples/hello-world.php "Say hello"
+php examples/client.php models
+php examples/client.php balance
+php examples/client.php chat "one word, please" --model default
+php examples/client.php chat "one word, please" --key-file /path/to/key   # the key from a file instead of VIRSILIPAS_KEY
+```
+
+`examples/hello-world.php` is the smallest client: one question to the `default` alias (or `VIRSILIPAS_MODEL`), the answer, and the credits it cost. `examples/client.php` is a fuller one with no dependencies beyond the `curl` and `json` extensions. The key comes from `--key-file` or `VIRSILIPAS_KEY`, never the command line, so it never shows in `ps` and is never printed. `chat` streams the answer as it arrives (`--no-stream` for one JSON answer) and hides reasoning unless `--show-thinking` is given; it ends with a `usage:` line (prompt, completion, cached and reasoning tokens, and the credits charged). `models` prints each alias's rates; `balance` prints the balance, reservations, requests in flight, weight, bonus, limits and the last minute's use. On a 429 or 503 with `Retry-After` it waits and retries once; any other refusal prints the proxy's error (`message`, `type`, `code`) to stderr. Exit codes: 0 ok, 1 request failed, 2 usage error.
+
+### OpenAI-compatible tools and libraries
+
+A tool or library that lets you set an OpenAI-compatible base URL and API key can use the proxy: set the base URL to `https://proxy.example/v1`, the key to your `vsk-` key and the model to an alias from `GET /v1/models`. What it can expect:
+
+- Under `/v1` the proxy serves `POST /v1/chat/completions`, `GET /v1/models` and `GET /v1/balance`, and nothing else. Any other path answers 404 `not found`.
+- Message content must be text. An image, audio or file part answers 400 `unsupported_content`.
+- Function tools (`tools`, `tool_choice`, `parallel_tool_calls`) are forwarded, and tool calls come back in the answer.
+- Fields the proxy does not forward, such as `n` or `store`, are dropped without an error. The [request fields](docs/API.md#post-v1chatcompletions) table lists what is kept.
+
+To check the settings before a real task, list the models with the same address and key; a 200 with your aliases means both are right:
+
+```sh
+curl "$VIRSILIPAS_URL/v1/models" -H "Authorization: Bearer $VIRSILIPAS_KEY"
+```
+
+## Endpoints
+
+The full reference, with every request field, response shape, header and error, is [docs/API.md](docs/API.md).
+
+| Method and path | Auth | What it does |
+|---|---|---|
+| `POST /v1/chat/completions` | key | OpenAI-compatible chat completions, streaming or not; `model` is one of your aliases |
+| `GET /v1/models` | key | the aliases with their rates, `context_length` and `max_completion_tokens`; upstream model ids and URLs are never shown |
+| `GET /v1/balance` | key | the calling key's balance, reservations, limits, last minute's use and priority weight |
+| `POST /admin/keys` | admin token | creates a user's key, returned once |
+| `POST /admin/keys/rotate` | admin token | replaces a leaked key; the old one answers 401 at once |
+| `POST /admin/keys/active` | admin token | disables or re-enables a key |
+| `POST /admin/keys/limits` | admin token | sets a key's limits, `bonus_pct` and `key_group` |
+| `POST /admin/grants` | admin token | adds or removes credits, once per `grant_id` |
+
+Client routes take `Authorization: Bearer <key>`; admin routes take `Authorization: Bearer <admin token>`. Use a long random admin token (32 bytes or more); only its sha256 is stored in the config.
+
+## Troubleshooting
+
+Every error answer is `{"error": {"message", "type", "param", "code"}}`. Look up its status and `code` below; [Errors](docs/API.md#errors) in docs/API.md lists every one.
+
+**Calling the API**
+
+| You get | It means | What to do |
+|---|---|---|
+| 401 `invalid_api_key` | no `Authorization: Bearer` header, or a key the proxy does not know (a rotated key is refused at once) | copy the key again; `echo ${#VIRSILIPAS_KEY}` prints 0 when the variable is not set in this shell |
+| 403 `key_disabled` | the key has been disabled | ask whoever runs the proxy |
+| 404 `model_not_found` | `model` is not one of this proxy's aliases | use an `id` from `GET /v1/models` |
+| 404 `not found` (`code` is `null`) | a path or method the proxy does not serve | check that the base URL ends in `/v1`; only the routes under [Endpoints](#endpoints) exist |
+| 400 `unsupported_content` | a message has an image, audio or file part | send text only |
+| 402 `insufficient_quota` | the balance cannot cover the request's prompt, counted as one token per byte, plus one output token (see *Reserve* under [How metering works](#how-metering-works)) | add credits; `GET /v1/balance` shows what is left |
+| 429 `rate_limit_exceeded`, `server_rate_limit` or `upstream_busy` | a limit of the key, the server's request rate, or a busy upstream | wait the `Retry-After` seconds, then retry (`examples/client.php` does this once) |
+| 503 `server_busy`, `spend_cap_reached` or `upstream_unavailable` | the server is busy, the server's spending limit is reached, or no upstream could take the request | wait the `Retry-After` seconds; a spending limit holds until its hour, day or month ends |
+| 502 `upstream_error` or 504 `upstream_timeout` | the upstream failed or took too long | try again later; when you report it, give the `X-Request-Id` response header |
+| a stream arrives all at once at the end | something between you and the proxy buffers the response | whoever runs the proxy: see *Turn buffering off* under [php-fpm and nginx](#php-fpm-and-nginx) |
+
+A refused request costs nothing, and neither does an upstream failure that delivered no answer. A stream that fails after it started is charged for the output that had already arrived.
+
+**Running the proxy**
+
+| You see | Likely cause | What to do |
+|---|---|---|
+| every request answers 500 `internal error` | the config does not load, or the database cannot be opened, read or written | run `bin/virsilipas verify` as the php-fpm user with the same `VIRSILIPAS_CONFIG`: it prints the error in full, which the proxy keeps out of its own answers and log |
+| `config: <name> is not a setting here (a typo?)` | a misspelt or unknown setting | fix the name; the message lists the settings that level may have |
+| `ledger directory ... is writable by group or others` or `ledger file ... is accessible to other users; chmod 600 it` | the database directory or files are not private to the PHP user | `chmod 700` the directory, `chmod 600` the files, owned by the php-fpm user |
+| the CLI works but the proxy answers 500 | the database was created by another user (for example root) | run the CLI as the php-fpm user (`runuser -u www-data -- bin/virsilipas ...`); see [Install](#install) |
+| `GET /v1/models` without a key answers a 5xx instead of 401 | php-fpm, the config or the database failed | the log says which; see the health check under [php-fpm and nginx](#php-fpm-and-nginx) |
+| a model answers 503 `upstream_unavailable` on every request | its upstreams cannot be reached, or their key files are missing or empty | look for `upstream_skipped` and `upstream_attempt` lines in the log (level `warn`); see [Logging](#logging) |
+| `bin/virsilipas verify` exits 1 | a balance changed outside the proxy | see *Credit log* under [How metering works](#how-metering-works) |
+
 ## Run your own
 
 mcxVirsilipas is open source under the Apache License 2.0. Anyone may run their own copy for their own needs, read and review the code, change it, and build on it under the terms of the [License](LICENSE). The repository is the software only: your copy, its configuration, its upstream accounts and its bills are your own.
@@ -30,6 +234,79 @@ The software is provided "as is", without warranties or conditions of any kind, 
 - The credit metering and the caps below limit what the proxy lets through, but a cost the proxy computes from configured prices is an estimate. Your provider's own bill is the authoritative figure. Where your provider offers spending limits of its own, set them too.
 - Check every model before enabling it (see *Before enabling a model*), test a client hang-up on your own stack, and back up the ledger.
 - Nothing here is legal, tax or financial advice.
+
+## Install
+
+```sh
+cp config.example.php config.php      # edit: upstream, models, admin token hash, paths
+install -d -m 700 -o www-data -g www-data /var/lib/virsilipas     # the db_path directory, owned by the PHP user
+runuser -u www-data -- bin/virsilipas init                    # creates the SQLite database
+runuser -u www-data -- bin/virsilipas key-create customer-42  # prints the key once
+runuser -u www-data -- bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
+```
+
+Run the CLI as the user php-fpm runs as (`www-data` here), and make `config.php` readable by it: the database files belong to whoever creates them, and the proxy cannot open a database another user owns. To try it on a test machine without root, point `db_path` at a directory you own and run `bin/virsilipas` and `php -S` as yourself.
+
+Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`. `config.example.php` lists every setting; the proxy refuses a setting it does not know, so a misspelt key stops it with a message naming the key instead of silently dropping a limit.
+
+### Configuration: the minimum, then what to add
+
+The quick start's config is a complete one. Four settings are required:
+
+- `db_path`, the SQLite file;
+- `admin_token_sha256`, the sha256 of the admin token your billing system sends;
+- an upstream for every model: an entry in `upstreams` with its URL and `key_file` (config.example.php also shows the older single-upstream form);
+- `models`, at least one alias with its three rates (`input`, `cached_input` and `output`, in credits per million tokens; see [Credits](#credits)) and a `route` naming the upstream and the model id sent there.
+
+Everything else has a default: `upstream_timeout` 600 seconds, `lease_seconds` 900, `retries` 1, `max_tokens_cap` 16384, `max_concurrent_per_key` 4, no per-minute limits, `log_level` `warn` with the lines going to PHP's `error_log`, and `stream_options` `['include_usage' => true]`. [config.example.php](config.example.php) shows every setting with what it does.
+
+| To add | Set | Read |
+|---|---|---|
+| a second upstream to fail over to | another `upstreams` entry, and a second entry in the model's `route` | *Retries and failover* under [How metering works](#how-metering-works) |
+| default limits for every key | `max_concurrent_per_key`, `requests_per_minute`, `credits_per_minute` | *Limits* under [How metering works](#how-metering-works) |
+| a hard stop on upstream spend, or on the server's request rate | `caps`; a spend cap needs a `cost` on every route entry | [Caps](#caps-hard-limits-for-the-whole-server) |
+| slowing requests down as spend nears a daily budget, or when the server is busy | `throttle` | [Priority and throttling](#priority-and-throttling) |
+| a request field always sent for a model, such as a reasoning level | `params` on the model or on a route entry | config.example.php |
+| a description and context length in `GET /v1/models` | `description`, `context_length` | [GET /v1/models](docs/API.md#get-v1models) |
+| one log file per UTC day | `log_dir`, `log_level` | [Logging](#logging) |
+
+### php-fpm and nginx
+
+- **One worker per open stream.** A streaming request holds a php-fpm worker for its whole duration. Size `pm.max_children` for your peak number of concurrent streams, and set `request_terminate_timeout` above `upstream_timeout`.
+- **Turn buffering off**, or streams arrive all at once at the end. The proxy sends `X-Accel-Buffering: no`; also set `fastcgi_buffering off;` (or `proxy_buffering off;`) and a `fastcgi_read_timeout` above `upstream_timeout`. Keep `zlib.output_compression` off for this pool.
+- **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database). The proxy creates its files private to its user, and refuses a database, WAL or shared-memory file that group or others can read, and a directory that group or others can write.
+- **Health check:** `GET /v1/models` without a key answers 401 only when php-fpm runs, the config loads and the ledger database opens; any 5xx means one of them failed (the log says which). It does not read the ledger's tables (a wrong `db_path` in a writable directory opens a new, empty database); `GET /v1/balance` with a real key does. The proxy fails closed: while the config is invalid or the database cannot be read or written (a full or read-only disk), a request that cannot load the config or reserve in the ledger answers 500 and is not charged. At `log_level` `info` each probe logs a `refused` line. `bin/virsilipas verify` checks the balances themselves.
+- **Before launch, test a client hang-up under your real php-fpm and nginx.** Abort detection depends on the server telling PHP that the connection closed; it is covered by the tests under the PHP built-in server, not under every stack.
+
+### Access control
+
+The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, set a spend cap to 0 (see *Caps*), stop the php-fpm pool or block the port. To stop one customer, disable their key.
+
+The web server tells the proxy where a request comes from: the FastCGI parameter `VIRSILIPAS_SOURCE` set to `internal` marks a caller from your own network; anything else, or no parameter, is external. Set it from the client address, never from a request header (the proxy reads only the server variable, so a client cannot send it). Behind a reverse proxy or load balancer `$remote_addr` is that proxy's address, which would make every caller internal: use the real client address there (nginx `realip` with your proxies listed in `set_real_ip_from`). With nginx:
+
+```nginx
+geo $virsilipas_source {
+    default external;
+    192.0.2.0/24 internal;   # your own networks
+}
+# in the location that passes to php-fpm:
+fastcgi_param VIRSILIPAS_SOURCE $virsilipas_source;
+```
+
+The source sets the `internal_factor` in the weight and which `busy` line applies. Giving internal and external callers separate php-fpm pools (nginx can pick the pool by the same `geo`) keeps a flood from outside from taking the workers your own network uses.
+
+### Backups
+
+The database holds every balance, so back it up. Do not copy the file while the proxy runs: in WAL mode recent writes live in the `-wal` file, and a plain copy can miss them or be inconsistent. Use SQLite's online backup instead, which is safe while requests are running:
+
+```sh
+sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).sqlite'"
+```
+
+If you back up with `.dump` (SQL text) instead, carry the schema version with it: `sqlite3 DB .dump "SELECT 'PRAGMA user_version = ' || user_version || ';' FROM pragma_user_version;"`. A plain `.dump` omits `user_version`, and the proxy refuses a database whose version it cannot read.
+
+To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
+
 ## Credits
 
 A credit is an abstract unit: you decide what it is worth and how many you grant for a payment. Each model alias has three rates, in credits per million tokens: `input` (fresh prompt tokens), `cached_input` (prompt tokens the upstream served from its prompt cache) and `output` (completion tokens, reasoning included). A request costs
@@ -147,58 +424,7 @@ limit_req_status 429;
 ```
 ### Before enabling a model
 
-Check, with that model at its upstream (a model served by a second upstream is checked there), and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), its `prompt_tokens` include the cached tokens it reports in `prompt_tokens_details.cached_tokens` or `prompt_cache_hit_tokens` (send the same long prompt twice; on a cache hit `prompt_tokens` must not drop by the cached count), its cache writes, if it reports `cache_write_tokens` at all, cost no more than your `input` rate covers, and a client hang-up is detected under your real php-fpm and nginx (see below). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
-
-## Install
-
-```sh
-cp config.example.php config.php      # edit: upstream, models, admin token hash, paths
-install -d -m 700 -o www-data -g www-data /var/lib/virsilipas     # the db_path directory, owned by the PHP user
-runuser -u www-data -- bin/virsilipas init                    # creates the SQLite database
-runuser -u www-data -- bin/virsilipas key-create customer-42  # prints the key once
-runuser -u www-data -- bin/virsilipas grant customer-42 1000000 invoice-1001   # adds 1,000,000 credits
-```
-
-Run the CLI as the user php-fpm runs as (`www-data` here), and make `config.php` readable by it: the database files belong to whoever creates them, and the proxy cannot open a database another user owns. To try it on a test machine without root, point `db_path` at a directory you own and run `bin/virsilipas` and `php -S` as yourself.
-
-Point your web server at `public/index.php` for every path. The config path can be set with `VIRSILIPAS_CONFIG`. `config.example.php` lists every setting; the proxy refuses a setting it does not know, so a misspelt key stops it with a message naming the key instead of silently dropping a limit.
-
-### php-fpm and nginx
-
-- **One worker per open stream.** A streaming request holds a php-fpm worker for its whole duration. Size `pm.max_children` for your peak number of concurrent streams, and set `request_terminate_timeout` above `upstream_timeout`.
-- **Turn buffering off**, or streams arrive all at once at the end. The proxy sends `X-Accel-Buffering: no`; also set `fastcgi_buffering off;` (or `proxy_buffering off;`) and a `fastcgi_read_timeout` above `upstream_timeout`. Keep `zlib.output_compression` off for this pool.
-- **Database directory** must be writable by the PHP user (SQLite WAL creates files next to the database). The proxy creates its files private to its user, and refuses a database, WAL or shared-memory file that group or others can read, and a directory that group or others can write.
-- **Health check:** `GET /v1/models` without a key answers 401 only when php-fpm runs, the config loads and the ledger database opens; any 5xx means one of them failed (the log says which). It does not read the ledger's tables (a wrong `db_path` in a writable directory opens a new, empty database); `GET /v1/balance` with a real key does. The proxy fails closed: while the config is invalid or the database cannot be read or written (a full or read-only disk), a request that cannot load the config or reserve in the ledger answers 500 and is not charged. At `log_level` `info` each probe logs a `refused` line. `bin/virsilipas verify` checks the balances themselves.
-- **Before launch, test a client hang-up under your real php-fpm and nginx.** Abort detection depends on the server telling PHP that the connection closed; it is covered by the tests under the PHP built-in server, not under every stack.
-
-### Access control
-
-The proxy checks keys, not addresses. Decide who can reach it with your firewall. To stop all traffic at once, set a spend cap to 0 (see *Caps*), stop the php-fpm pool or block the port. To stop one customer, disable their key.
-
-The web server tells the proxy where a request comes from: the FastCGI parameter `VIRSILIPAS_SOURCE` set to `internal` marks a caller from your own network; anything else, or no parameter, is external. Set it from the client address, never from a request header (the proxy reads only the server variable, so a client cannot send it). Behind a reverse proxy or load balancer `$remote_addr` is that proxy's address, which would make every caller internal: use the real client address there (nginx `realip` with your proxies listed in `set_real_ip_from`). With nginx:
-
-```nginx
-geo $virsilipas_source {
-    default external;
-    192.0.2.0/24 internal;   # your own networks
-}
-# in the location that passes to php-fpm:
-fastcgi_param VIRSILIPAS_SOURCE $virsilipas_source;
-```
-
-The source sets the `internal_factor` in the weight and which `busy` line applies. Giving internal and external callers separate php-fpm pools (nginx can pick the pool by the same `geo`) keeps a flood from outside from taking the workers your own network uses.
-
-### Backups
-
-The database holds every balance, so back it up. Do not copy the file while the proxy runs: in WAL mode recent writes live in the `-wal` file, and a plain copy can miss them or be inconsistent. Use SQLite's online backup instead, which is safe while requests are running:
-
-```sh
-sqlite3 /var/lib/virsilipas/ledger.sqlite ".backup '/backup/ledger-$(date +%F).sqlite'"
-```
-
-If you back up with `.dump` (SQL text) instead, carry the schema version with it: `sqlite3 DB .dump "SELECT 'PRAGMA user_version = ' || user_version || ';' FROM pragma_user_version;"`. A plain `.dump` omits `user_version`, and the proxy refuses a database whose version it cannot read.
-
-To restore, stop the php-fpm pool, put the backup in place as the database file, delete any leftover `-wal` and `-shm` files next to it, and make it private to the PHP user (`chmod 600`): the proxy refuses a database that group or others can read, and the backup copy is usually created group-readable.
+Check, with that model at its upstream (a model served by a second upstream is checked there), and again whenever the model or the upstream changes: it honours `max_tokens` (including reasoning tokens), its reported prompt tokens stay within the prompt bound (the request's byte count), it reports `usage` with all three counts, including `total_tokens`, on streams too (ideally on every chunk), its `prompt_tokens` include the cached tokens it reports in `prompt_tokens_details.cached_tokens` or `prompt_cache_hit_tokens` (send the same long prompt twice; on a cache hit `prompt_tokens` must not drop by the cached count), its cache writes, if it reports `cache_write_tokens` at all, cost no more than your `input` rate covers, and a client hang-up is detected under your real php-fpm and nginx (see [php-fpm and nginx](#php-fpm-and-nginx)). Do not enable a model that fails any of these. The proxy caps what it debits at the reservation; it cannot stop an upstream that generates more than it was asked for, so an upstream that ignores `max_tokens` costs you the difference (visible as `over_reservation` in the usage table).
 
 ## Releasing and upgrading
 
@@ -260,23 +486,6 @@ If any step after php-fpm stopped fails, `deploy.php` points the symlink back at
 
 **Never run an older release against a newer ledger.** An older release's `init` refuses a newer schema, so `deploy.php` rolls such a deploy back. To return to the state before an upgrade, stop php-fpm, restore that upgrade's `pre-<tag>` backup as described under [Backups](#backups), and deploy the older tag. Everything written to the ledger since the upgrade is lost, so decide that consciously.
 
-## Endpoints
-
-The full reference, with every request field, response shape, header and error, is [docs/API.md](docs/API.md).
-
-| Method and path | Auth | What it does |
-|---|---|---|
-| `POST /v1/chat/completions` | key | OpenAI-compatible chat completions, streaming or not; `model` is one of your aliases |
-| `GET /v1/models` | key | the aliases with their rates, `context_length` and `max_completion_tokens`; upstream model ids and URLs are never shown |
-| `GET /v1/balance` | key | the calling key's balance, reservations, limits, last minute's use and priority weight |
-| `POST /admin/keys` | admin token | creates a user's key, returned once |
-| `POST /admin/keys/rotate` | admin token | replaces a leaked key; the old one answers 401 at once |
-| `POST /admin/keys/active` | admin token | disables or re-enables a key |
-| `POST /admin/keys/limits` | admin token | sets a key's limits, `bonus_pct` and `key_group` |
-| `POST /admin/grants` | admin token | adds or removes credits, once per `grant_id` |
-
-Client routes take `Authorization: Bearer <key>`; admin routes take `Authorization: Bearer <admin token>`. Use a long random admin token (32 bytes or more); only its sha256 is stored in the config.
-
 ## Privacy
 
 Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address, or with only its network (for example the /24 or /48), if you do not need it.
@@ -325,19 +534,6 @@ virsilipas init | key-create <ref> | key-rotate <ref> | key-disable <ref> | key-
 ```
 
 `keys` prints one JSON line per key: ref, active, balance, group, bonus, when it was created and when it was last used. `top` is a live view of the traffic, redrawn every `--interval` seconds (default 2, 1 to 60) until interrupted; `--once` prints one view without terminal control codes. It shows the requests in flight (internal and external, the oldest one's age, and the ten oldest by key ref, source, age and credits reserved), the caps against their limits, and for the last minute, 5 minutes and hour: requests and requests per second, failures, duration and time to first byte (p50 and p95, over successful requests), output tokens per second, tokens, credits charged, the upstream cost, retried requests and client hang-ups; then the last 5 minutes by model and upstream, and the most recent requests with their key ref, status and timings. It reads the ledger only, so it shows metadata and never a prompt or an answer. Run it as the php-fpm user (or root) with the same config.
-
-## Example clients
-
-```sh
-VIRSILIPAS_URL=https://proxy.example VIRSILIPAS_KEY=... php examples/hello-world.php "Say hello"
-
-export VIRSILIPAS_URL=https://proxy.example
-php examples/client.php models --key-file /path/to/key
-php examples/client.php balance --key-file /path/to/key
-php examples/client.php chat "one word, please" --model default --key-file /path/to/key
-```
-
-`examples/hello-world.php` is the smallest client: one question to the `default` alias (or `VIRSILIPAS_MODEL`), the answer, and the credits it cost. `examples/client.php` is a fuller one with no dependencies beyond the `curl` and `json` extensions. The key comes from `--key-file` or `VIRSILIPAS_KEY`, never the command line, so it never shows in `ps` and is never printed. `chat` streams the answer as it arrives (`--no-stream` for one JSON answer) and hides reasoning unless `--show-thinking` is given; it ends with a `usage:` line (prompt, completion, cached and reasoning tokens, and the credits charged). `models` prints each alias's rates; `balance` prints the balance, reservations, requests in flight, weight, bonus, limits and the last minute's use. On a 429 or 503 with `Retry-After` it waits and retries once; any other refusal prints the proxy's error (`message`, `type`, `code`) to stderr. Exit codes: 0 ok, 1 request failed, 2 usage error.
 
 ## Tests
 
