@@ -214,7 +214,7 @@ Checked with Gemini CLI 0.64.0, where each line is needed:
 
 - `security.auth.selectedType`: with `GOOGLE_GEMINI_BASE_URL` set and no auth method chosen, the CLI picks one it then refuses (`Invalid auth method selected.`).
 - `model.name` (or `-m default`, or `GEMINI_MODEL=default`): the alias for the conversation. With a fixed model the CLI also skips the extra routing call it otherwise makes on every turn.
-- `modelConfigs.customOverrides`: the CLI's own background tasks (routing, summaries, loop and edit checks, history compression) name models of their own; this override sends them to the alias as well.
+- `modelConfigs.customOverrides`: the CLI's own background tasks (routing, summaries, loop and edit checks, history compression) name models of their own; this override sends them to the alias as well. The `core` override also covers the conversation itself, so to use another alias change both the override and `model.name` (checked: changing only `model.name` to `large` still sent the request to `default`).
 - `agents.overrides`: two built-in subagents, on by default, name models of their own; `inherit` runs them on the conversation's model. Experimental agents and features that are off by default (the browser agent, automatic memory) name models of their own too and were not checked.
 
 A call that still names a model that is not one of your aliases (a later CLI version may add one) answers 404 `model_not_found`. For headless use (`gemini -p "..."`) outside a folder the CLI trusts, add `--skip-trust` or `GEMINI_CLI_TRUST_WORKSPACE=true`. `GEMINI_API_KEY_AUTH_MECHANISM=bearer` sends the key as `Authorization: Bearer`, which the proxy also accepts. What to expect:
