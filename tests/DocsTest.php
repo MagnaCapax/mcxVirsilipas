@@ -53,6 +53,10 @@ function testApiDocsCoverEveryRouteErrorAndHeader(): void
     check(count($facts['messages']) >= 30, 'messages found: ' . count($facts['messages']));
     check(count($facts['headers']) >= 7, 'headers found: ' . count($facts['headers']));
     $missing = [];
+    // The Gemini routes are matched by pattern (Gemini::target), not listed in the router: one per method.
+    foreach (\MagnaCapax\Virsilipas\Gemini::METHODS as $m) {
+        $facts['routes'][] = "POST /v1beta/models/{model}:$m";
+    }
     foreach ($facts['routes'] as $route) {
         if (!str_contains($doc, "`$route`") && !str_contains($doc, "### $route")) {
             $missing[] = "route $route";

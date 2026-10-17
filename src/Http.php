@@ -40,6 +40,23 @@ final class Http
         return self::bearer();
     }
 
+    /**
+     * The key of a Gemini-format client: from x-goog-api-key, else from a key query parameter, else from
+     * Authorization: Bearer (such clients send one of the three).
+     */
+    public static function googleKey(): string
+    {
+        foreach ([$_SERVER['HTTP_X_GOOG_API_KEY'] ?? '', $_GET['key'] ?? ''] as $k) {
+            if (is_string($k) && $k !== '') {
+                return $k;
+            }
+        }
+        if (($_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '') === '') {
+            throw new HttpError(401, 'missing key: send x-goog-api-key, a key parameter or Authorization: Bearer', 'authentication_error', code: 'invalid_api_key');
+        }
+        return self::bearer();
+    }
+
     /** @return array<string, mixed> */
     public static function jsonBody(int $maxBytes): array
     {

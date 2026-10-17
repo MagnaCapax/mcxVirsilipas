@@ -6,7 +6,8 @@ namespace MagnaCapax\Virsilipas;
 
 /**
  * The customer-facing side: OpenAI-compatible chat completions with per-key metering in credits, and the same metering
- * for the Anthropic Messages format passed through to upstreams that serve it (see Messages).
+ * for the Anthropic Messages format passed through to upstreams that serve it (see Messages) and for the Gemini API
+ * format translated to chat completions (see Gemini).
  *
  * Flow per request: authenticate the key, admit only text requests built from known fields,
  * reserve an upper bound of credits (clamping max_tokens to the balance), forward to the
@@ -112,7 +113,39 @@ final class Proxy
         $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params']), $this->config->routes[$alias]));
         $build = static fn (array $route, int $maxTokens): array => [$route['url'], ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
             self::encode(self::rewrite($req, $route['model'], $maxTokens, $stream, $route['stream_options'], $route['params']))];
-        $this->serve($key, $alias, array_keys($this->config->routes[$alias]), $promptBound, $req, $stream, false, $build);
+        $this->serve($key, $alias, array_keys($this->config->routes[$alias]), $promptBound, $req, $stream, 'chat', $build);
+    }
+
+    /**
+     * POST /v1beta/models/{model}:generateContent, :streamGenerateContent (with alt=sse) and :countTokens: the Gemini API
+     * format, translated to a chat request on the alias's own route (Gemini::request), checked, bounded, metered and
+     * rewritten exactly like one, its answer translated back. The key may come as x-goog-api-key, a key query parameter
+     * or a bearer token; errors use that format's shape (public/index.php). countTokens answers the prompt bound a
+     * generateContent request with these fields would reserve for (of the request itself or its generateContentRequest),
+     * and nothing goes upstream.
+     */
+    public function gemini(string $alias, string $method): void
+    {
+        $key = $this->authenticate(Http::googleKey());
+        $req = Http::jsonBody(self::MAX_BODY_BYTES);
+        if (!isset($this->config->models[$alias])) {
+            throw new HttpError(404, 'unknown model; see /v1/models', code: 'model_not_found', param: 'model');
+        }
+        $count = $method === 'countTokens';
+        [$chat, $maxReq] = Gemini::request($count && is_array($req['generateContentRequest'] ?? null) ? $req['generateContentRequest'] : $req);
+        $chat['messages'] = self::normalizeMessages($chat['messages']);
+        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($chat, $h['params']), $this->config->routes[$alias]));
+        if ($count) {
+            Http::json(200, ['totalTokens' => $promptBound]);
+            return;
+        }
+        $stream = $method === 'streamGenerateContent';
+        if ($stream && ($_GET['alt'] ?? null) !== 'sse') {
+            throw new HttpError(400, 'streamGenerateContent needs alt=sse', code: 'invalid_value', param: 'alt');
+        }
+        $build = static fn (array $route, int $maxTokens): array => [$route['url'], ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
+            self::encode(self::rewrite($chat, $route['model'], $maxTokens, $stream, $route['stream_options'], $route['params']))];
+        $this->serve($key, $alias, array_keys($this->config->routes[$alias]), $promptBound, $maxReq, $stream, 'gemini', $build);
     }
 
     /**
@@ -122,14 +155,14 @@ final class Proxy
      */
     public function messages(): void
     {
-        $key = $this->authenticate(true);
+        $key = $this->authenticate(Http::apiKey());
         $req = Http::jsonBody(self::MAX_BODY_BYTES);
         [$alias, $hops] = $this->messagesAlias($req);
         $fields = Messages::fields($req);
         $stream = ($req['stream'] ?? false) === true;
         $build = static fn (array $route, int $maxTokens): array => [(string) $route['messages_url'], Messages::headers($route['key']),
             self::encode(Messages::rewrite($fields, $route['model'], $maxTokens, $stream))];
-        $this->serve($key, $alias, $hops, Messages::promptBound($fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, true, $build);
+        $this->serve($key, $alias, $hops, Messages::promptBound($fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, 'messages', $build);
     }
 
     /**
@@ -139,7 +172,7 @@ final class Proxy
      */
     public function countTokens(): void
     {
-        $this->authenticate(true);
+        $this->authenticate(Http::apiKey());
         $req = Http::jsonBody(self::MAX_BODY_BYTES);
         $this->messagesAlias($req);
         Http::json(200, ['input_tokens' => Messages::promptBound(Messages::fields($req))]);
@@ -163,16 +196,17 @@ final class Proxy
     }
 
     /**
-     * The metered part of a request, shared by chat completions and messages: admission, the reservation, the attempts
+     * The metered part of a request, shared by chat completions, messages and the Gemini format: admission, the reservation, the attempts
      * over the alias's route entries $hops in order (retries and failover), and the settlement. $maxReq holds the
      * client's max_tokens fields, read after admission as docs/API.md's order of checks says. $build gives, for one
-     * route entry and the clamped max_tokens, the upstream URL, the request headers and the body.
+     * route entry and the clamped max_tokens, the upstream URL, the request headers and the body. $format is the client's
+     * format: chat, messages or gemini (a chat upstream request, its answer and errors in the Gemini shape).
      * @param array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} $key
      * @param list<int> $hops
      * @param array<string, mixed> $maxReq
      * @param \Closure(array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}, int): array{0: string, 1: list<string>, 2: string} $build
      */
-    private function serve(array $key, string $alias, array $hops, int $promptBound, array $maxReq, bool $stream, bool $messages, \Closure $build): void
+    private function serve(array $key, string $alias, array $hops, int $promptBound, array $maxReq, bool $stream, string $format, \Closure $build): void
     {
         $rates = $this->config->models[$alias];
         $internal = self::internalCaller();
@@ -236,7 +270,7 @@ final class Proxy
                         break 2;
                     }
                     $attempts++;
-                    $result = $this->forward($url, $headers, $body, $stream, $messages, $alias, $rates, $lease['reserved'], $left);
+                    $result = $this->forward($url, $headers, $body, $stream, $format, $alias, $rates, $lease['reserved'], $left);
                     if ($result['delivered'] || $result['kind'] === 'final') {
                         break 2;
                     }
@@ -255,8 +289,7 @@ final class Proxy
                 }
             }
             if (!$result['delivered']) {
-                $error = self::failure($result);
-                $messages ? $error->sendAnthropic() : $error->send();
+                self::failure($result)->sendAs($format);
             }
         } finally {
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
@@ -464,9 +497,9 @@ final class Proxy
     /**
      * JSON for the upstream, or a RuntimeException (a 500 before anything is sent) when the value cannot be encoded:
      * a body that fails to encode must never be forwarded empty or bounded as if it were.
-     * @param array<string, mixed> $v
+     * @param array<mixed>|\stdClass $v
      */
-    public static function encode(array $v): string
+    public static function encode(array|\stdClass $v): string
     {
         $json = json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($json === false) {
@@ -759,20 +792,21 @@ final class Proxy
     /**
      * Bytes of text a rebuilt response or event delivers to the client, over every choice's
      * message and delta. The upper-bound charge is derived from this, so it covers exactly what
-     * was relayed: neither discarded upstream fields nor relayed text outside a delta escape it.
+     * was relayed: neither discarded upstream fields nor relayed text outside a delta escape it. Without $calls the
+     * tool calls are left out.
      * @param array<string, mixed> $view
      */
-    private static function viewBytes(array $view): int
+    private static function viewBytes(array $view, bool $calls = true): int
     {
         $n = 0;
         foreach ($view['choices'] ?? [] as $c) {
-            $n += self::textBytes($c['message'] ?? null) + self::textBytes($c['delta'] ?? null);
+            $n += self::textBytes($c['message'] ?? null, $calls) + self::textBytes($c['delta'] ?? null, $calls);
         }
         return $n;
     }
 
     /** Bytes of text a message or delta carries: content, reasoning (either name), refusal and tool-call names and arguments. */
-    private static function textBytes(mixed $part): int
+    private static function textBytes(mixed $part, bool $calls): int
     {
         if (!is_array($part)) {
             return 0;
@@ -781,7 +815,7 @@ final class Proxy
         foreach (self::TEXT_FIELDS as $k) {
             $n += is_string($part[$k] ?? null) ? strlen($part[$k]) : 0;
         }
-        foreach (is_array($part['tool_calls'] ?? null) ? $part['tool_calls'] : [] as $t) {
+        foreach ($calls && is_array($part['tool_calls'] ?? null) ? $part['tool_calls'] : [] as $t) {
             $fn = is_array($t) ? ($t['function'] ?? null) : null;
             $n += is_array($fn) ? strlen(json_encode($fn, JSON_UNESCAPED_UNICODE) ?: '') : 0;
         }
@@ -869,12 +903,12 @@ final class Proxy
     }
 
     /**
-     * The caller's key: a bearer token, or with $apiKeyHeader (the Messages routes) also an x-api-key header.
+     * The caller's key: $key as the route reads it (Http::apiKey(), Http::googleKey()), else a bearer token.
      * @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}
      */
-    private function authenticate(bool $apiKeyHeader = false): array
+    private function authenticate(?string $key = null): array
     {
-        $key = $this->ledger->findKey($apiKeyHeader ? Http::apiKey() : Http::bearer());
+        $key = $this->ledger->findKey($key ?? Http::bearer());
         if ($key === null) {
             throw new HttpError(401, 'invalid key', 'authentication_error', code: 'invalid_api_key');
         }
@@ -885,86 +919,108 @@ final class Proxy
     }
 
     /**
+     * One chat completions stream event: updates usage and the byte bounds in forward()'s state and returns the rebuilt
+     * event to relay, true for the terminal [DONE], or null for nothing. With $holdCalls (the Gemini format, which sends
+     * function calls whole at the end) the bytes of tool-call fragments are kept apart in call_bytes and call_unmetered
+     * until Gemini::event() delivers them; everything else is counted when it is relayed.
+     * @param array<string, mixed> $s
+     * @param array{input: int, cached_input: int, output: int} $rates
+     * @return array<string, mixed>|true|null
+     */
+    private static function chatEvent(array &$s, string $event, string $alias, array $rates, int $reserved, bool $holdCalls): array|true|null
+    {
+        $e = self::parseEvent($event);
+        if ($e === null || $s['done'] || $s['failed']) {
+            return null; // nothing after the terminal marker, or after an upstream error, is relayed or counted
+        }
+        if ($e['done']) {
+            $s['done'] = true; // a [DONE] before any choice leaves the stream unstarted: a 502, no charge
+            return true;
+        }
+        $j = $e['json'];
+        $begun = $s['started'] || $s['start'];
+        if (isset($j['error'])) {
+            // Before the stream starts: a refusal (generic non-200). After: the stream ends here
+            // with the generic in-band error and no [DONE]; output already relayed is charged.
+            $s[$begun ? 'failed' : 'bad'] = true;
+            return null;
+        }
+        if (!isset($j['choices']) && !isset($j['usage'])) {
+            $s['bad'] = !$begun; // not a completion event; ignored once the stream has begun
+            return null;
+        }
+        if (self::hasChoices($j, false)) {
+            $s['start'] = true;
+        }
+        // Nothing is relayed before the first event with a usable delta; such events add no
+        // bytes to the charge (their usage, if valid, is still kept). Bytes are counted from
+        // the rebuilt event the client receives, never from raw upstream text, so nothing read
+        // after the client hung up is counted as delivered.
+        $relay = ($s['started'] || $s['start']) && !$s['aborted'];
+        $view = self::publicView($j, $alias, $rates, $reserved);
+        $n = $relay ? self::viewBytes($view, !$holdCalls) : 0;
+        $calls = $relay && $holdCalls ? self::viewBytes($view, true) - $n : 0;
+        [$s['bytes'], $s['unmetered'], $s['call_bytes'], $s['call_unmetered']] = [$s['bytes'] + $n, $s['unmetered'] + $n, $s['call_bytes'] + $calls, $s['call_unmetered'] + $calls];
+        $u = self::validUsage($j['usage'] ?? null);
+        // Usage is cumulative. Only a report that advances covers the text delivered since the
+        // last one; an equal or lower report changes nothing, so that text stays charged as bytes.
+        if ($u !== null && ($s['usage'] === null || $u['total'] > $s['usage']['total'])) {
+            $s['usage'] = $u;
+            [$s['unmetered'], $s['call_unmetered']] = [0, 0];
+            $s['over'] = self::usageCredits($u, 0, $rates) > $reserved;
+        } elseif ($u !== null && [$u['prompt'], $u['completion'], $u['total']] === [$s['usage']['prompt'], $s['usage']['completion'], $s['usage']['total']]) {
+            // The same counts again with details: upstreams that report running usage may send the cached
+            // split (and other details) only with the final report. A detail the adopted report lacks is
+            // added once and never changed or removed by a later repeat; it covers no text delivered since
+            // the last advance.
+            $s['usage']['cached'] = $s['usage']['cached'] === 0 ? $u['cached'] : $s['usage']['cached'];
+            $s['usage']['reasoning'] = $s['usage']['reasoning'] === 0 ? $u['reasoning'] : $s['usage']['reasoning'];
+            $s['usage']['cost'] ??= $u['cost'];
+        }
+        // A relayed usage object shows the report the request is charged by, not a repeat or a lower
+        // report the proxy did not adopt, so the client sees the same credits as the ledger.
+        if ($s['usage'] !== null && ($view['usage'] ?? null) !== null) {
+            $view['usage'] = self::usageView($s['usage'], $rates, $reserved);
+        }
+        return $relay ? $view : null;
+    }
+
+    /**
      * One attempt at one upstream. The client gets a 200 only once the upstream has answered 2xx
      * with a completion that has choices (non-stream) or a first event with choices (stream).
      * Otherwise nothing is sent and the result says what the failure allows (see attemptResult):
      * the caller may try again, try the next upstream, or send a generic error of the right class.
      * Upstream bodies are never relayed; of an error body only a recognised machine code is kept.
      * A client that hangs up stops the upstream request, and so does a stream whose reported usage
-     * passes the reservation; what was delivered is still charged. $messages selects the Anthropic Messages format
-     * (Messages: its answer check, rebuilt views and stream events) instead of chat completions.
+     * passes the reservation; what was delivered is still charged. $format is the client's format: chat, messages (the
+     * Anthropic Messages format: Messages' answer check, rebuilt views and stream events) or gemini (a chat upstream answer,
+     * relayed in the Gemini shape by Gemini).
      * @param list<string> $headers
      * @param string $body the request as JSON (encode())
      * @param array{model: string, input: int, cached_input: int, output: int} $rates
      * @return array{status: int, usage: ?array, aborted: bool, delivered: bool, completion_bound: int, unmetered: int, kind: string, retry_after: ?int, code: ?string, timed_out: bool, too_big: bool, first_byte_ns: ?int}
      */
-    private function forward(string $url, array $headers, string $body, bool $stream, bool $messages, string $alias, array $rates, int $reserved, int $timeout): array
+    private function forward(string $url, array $headers, string $body, bool $stream, string $format, string $alias, array $rates, int $reserved, int $timeout): array
     {
         // Shared by reference with the curl callbacks below, which change it during the transfer.
         // held and raw are the Messages format's: the message_start held until the first content, and the usage counts so far.
-        /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int, held: string, raw: array<string, mixed>} $s */
+        // calls, call_bytes, call_unmetered, finish and response_id are the Gemini format's: function calls put together from
+        // their fragments and their bytes (all of them, and those since the last usage report), held until the last chunk.
+        /** @var array{first_byte: ?int, status: int, usage: ?array, aborted: bool, started: bool, start: bool, done: bool, bad: bool, failed: bool, too_big: bool, over: bool, bytes: int, unmetered: int, buf: string, full: string, err: string, retry_after: ?int, held: string, raw: array<string, mixed>, calls: array<int, array<string, mixed>>, call_bytes: int, call_unmetered: int, finish: ?string, response_id: ?string} $s */
         $s = ['first_byte' => null, 'status' => 0, 'usage' => null, 'aborted' => false, 'started' => false, 'start' => false, 'done' => false, 'bad' => false, 'failed' => false,
-            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null, 'held' => '', 'raw' => []];
+            'too_big' => false, 'over' => false, 'bytes' => 0, 'unmetered' => 0, 'buf' => '', 'full' => '', 'err' => '', 'retry_after' => null, 'held' => '', 'raw' => [],
+            'calls' => [], 'call_bytes' => 0, 'call_unmetered' => 0, 'finish' => null, 'response_id' => null];
 
         // One event: update usage and the byte bounds, return the text to relay ('' = drop).
-        $handle = static function (string $event) use (&$s, $messages, $alias, $rates, $reserved): string {
-            if ($messages) {
+        $handle = static function (string $event) use (&$s, $format, $alias, $rates, $reserved): string {
+            if ($format === 'messages') {
                 return Messages::event($s, $event, $alias, $rates, $reserved);
             }
-            $e = self::parseEvent($event);
-            if ($e === null || $s['done'] || $s['failed']) {
-                return ''; // nothing after the terminal marker, or after an upstream error, is relayed or counted
+            $r = self::chatEvent($s, $event, $alias, $rates, $reserved, $format === 'gemini');
+            if ($format === 'gemini') {
+                return Gemini::event($s, $r, $alias);
             }
-            if ($e['done']) {
-                $s['done'] = true; // a [DONE] before any choice leaves the stream unstarted: a 502, no charge
-                return "data: [DONE]\n\n";
-            }
-            $j = $e['json'];
-            $begun = $s['started'] || $s['start'];
-            if (isset($j['error'])) {
-                // Before the stream starts: a refusal (generic non-200). After: the stream ends here
-                // with the generic in-band error and no [DONE]; output already relayed is charged.
-                $s[$begun ? 'failed' : 'bad'] = true;
-                return '';
-            }
-            if (!isset($j['choices']) && !isset($j['usage'])) {
-                $s['bad'] = !$begun; // not a completion event; ignored once the stream has begun
-                return '';
-            }
-            if (self::hasChoices($j, false)) {
-                $s['start'] = true;
-            }
-            // Nothing is relayed before the first event with a usable delta; such events add no
-            // bytes to the charge (their usage, if valid, is still kept). Bytes are counted from
-            // the rebuilt event the client receives, never from raw upstream text, so nothing read
-            // after the client hung up is counted as delivered.
-            $relay = ($s['started'] || $s['start']) && !$s['aborted'];
-            $view = self::publicView($j, $alias, $rates, $reserved);
-            $n = $relay ? self::viewBytes($view) : 0;
-            $s['bytes'] += $n;
-            $s['unmetered'] += $n;
-            $u = self::validUsage($j['usage'] ?? null);
-            // Usage is cumulative. Only a report that advances covers the text delivered since the
-            // last one; an equal or lower report changes nothing, so that text stays charged as bytes.
-            if ($u !== null && ($s['usage'] === null || $u['total'] > $s['usage']['total'])) {
-                $s['usage'] = $u;
-                $s['unmetered'] = 0;
-                $s['over'] = self::usageCredits($u, 0, $rates) > $reserved;
-            } elseif ($u !== null && [$u['prompt'], $u['completion'], $u['total']] === [$s['usage']['prompt'], $s['usage']['completion'], $s['usage']['total']]) {
-                // The same counts again with details: upstreams that report running usage may send the cached
-                // split (and other details) only with the final report. A detail the adopted report lacks is
-                // added once and never changed or removed by a later repeat; it covers no text delivered since
-                // the last advance.
-                $s['usage']['cached'] = $s['usage']['cached'] === 0 ? $u['cached'] : $s['usage']['cached'];
-                $s['usage']['reasoning'] = $s['usage']['reasoning'] === 0 ? $u['reasoning'] : $s['usage']['reasoning'];
-                $s['usage']['cost'] ??= $u['cost'];
-            }
-            // A relayed usage object shows the report the request is charged by, not a repeat or a lower
-            // report the proxy did not adopt, so the client sees the same credits as the ledger.
-            if ($s['usage'] !== null && ($view['usage'] ?? null) !== null) {
-                $view['usage'] = self::usageView($s['usage'], $rates, $reserved);
-            }
-            return $relay ? 'data: ' . json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n" : '';
+            return $r === true ? "data: [DONE]\n\n" : ($r === null ? '' : 'data: ' . json_encode($r, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n\n");
         };
 
         $ch = curl_init($url);
@@ -1061,8 +1117,11 @@ final class Proxy
             $tail = trim($s['buf']) === '' ? '' : $handle($s['buf']); // after a hang-up too: it may hold the final report
             if (!$s['aborted']) {
                 if (!$s['done']) {
-                    $tail .= $messages ? Messages::earlyEnd()
-                        : 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error', 'param' => null, 'code' => 'upstream_error']]) . "\n\n";
+                    $tail .= match ($format) {
+                        'messages' => Messages::earlyEnd(),
+                        'gemini' => Gemini::earlyEnd(),
+                        default => 'data: ' . json_encode(['error' => ['message' => 'upstream stream ended early', 'type' => 'api_error', 'param' => null, 'code' => 'upstream_error']]) . "\n\n",
+                    };
                 }
                 echo $tail;
                 flush();
@@ -1071,16 +1130,18 @@ final class Proxy
         }
 
         $json = (!$stream && $curlErr === 0 && $status >= 200 && $status <= 299) ? json_decode($s['full'], true) : null;
+        $messages = $format === 'messages';
         $usage = static fn (mixed $u): ?array => $messages ? Messages::usage($u) : self::validUsage($u);
         $view = $messages ? Messages::answer($json, $alias) : (self::hasChoices($json, true) ? self::publicView($json, $alias, $rates, $reserved) : null);
         if ($view !== null) {
             http_response_code(200);
             header('Content-Type: application/json');
             $result['first_byte_ns'] = hrtime(true);
-            echo json_encode($view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            // What the client received, never discarded upstream fields.
+            $u = $usage($json['usage'] ?? null);
+            echo json_encode($format === 'gemini' ? Gemini::answer($view, $alias, $u) : $view, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            // What the client received, never discarded upstream fields (a Gemini answer carries the same text and calls).
             $bound = $messages ? Messages::bytes($view['content']) : self::viewBytes($view);
-            return ['usage' => $usage($json['usage'] ?? null), 'delivered' => true, 'completion_bound' => $bound] + $result;
+            return ['usage' => $u, 'delivered' => true, 'completion_bound' => $bound] + $result;
         }
 
         // A 2xx without a usable answer is free for the client, but its usage report (what the upstream billed) is kept for tracking.

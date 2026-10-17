@@ -1,7 +1,7 @@
 # ADR 0013: The client contract: an OpenAI-compatible subset with aliases and allowlists
 
 Date: 2026-10-16
-In force since: v0.1.0 (routes with failover since v0.4.0; the Anthropic Messages pass-through since v0.10.0)
+In force since: v0.1.0 (routes with failover since v0.4.0; the Anthropic Messages pass-through since v0.10.0; the Gemini translation since v0.11.0)
 
 ## Status
 Accepted
@@ -15,7 +15,7 @@ Clients should work with existing OpenAI-compatible tools. At the same time the 
 - A small OpenAI-compatible subset, rebuilt on both sides from allowlists.
 
 ## Decision
-The client API is chat completions (streaming or not), the model list, the balance and the key's own usage (ADR 0019). Clients name aliases; the deployment maps each alias to a route of upstream models, and clients never see upstream model ids or URLs. Only allowlisted request fields and text content go upstream; images, audio and files are refused because their cost cannot be bounded. Responses are rebuilt from allowlisted fields, each of its expected type. Errors use OpenAI's error shape with the proxy's own fixed messages and stable codes; from an upstream error the proxy uses its status and `Retry-After`, and from its body only the code `context_length_exceeded`. Other endpoints (such as embeddings or a responses API) are out of scope until a deployment needs one, and adding one needs its own ADR, as the Anthropic Messages pass-through has (ADR 0020). docs/API.md is the reference.
+The client API is chat completions (streaming or not), the model list, the balance and the key's own usage (ADR 0019). Clients name aliases; the deployment maps each alias to a route of upstream models, and clients never see upstream model ids or URLs. Only allowlisted request fields and text content go upstream; images, audio and files are refused because their cost cannot be bounded. Responses are rebuilt from allowlisted fields, each of its expected type. Errors use OpenAI's error shape with the proxy's own fixed messages and stable codes; from an upstream error the proxy uses its status and `Retry-After`, and from its body only the code `context_length_exceeded`. Other endpoints (such as embeddings or a responses API) are out of scope until a deployment needs one, and adding one needs its own ADR, as the Anthropic Messages pass-through (ADR 0020) and the Gemini translation (ADR 0021) have. docs/API.md is the reference.
 
 ## Consequences
 - Existing clients work by changing the base URL and key.

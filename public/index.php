@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use MagnaCapax\Virsilipas\Admin;
 use MagnaCapax\Virsilipas\Config;
+use MagnaCapax\Virsilipas\Gemini;
 use MagnaCapax\Virsilipas\HttpError;
 use MagnaCapax\Virsilipas\Ledger;
 use MagnaCapax\Virsilipas\Log;
@@ -18,8 +19,14 @@ header_remove('X-Powered-By');
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-// The Anthropic Messages routes answer errors in that format.
-$anthropic = $path === '/v1/messages' || str_starts_with($path, '/v1/messages/');
+// The Anthropic Messages routes, and the Gemini routes under /v1beta/, answer errors in their own format.
+$format = match (true) {
+    $path === '/v1/messages' || str_starts_with($path, '/v1/messages/') => 'messages',
+    str_starts_with($path, '/v1beta/') => 'gemini',
+    default => 'chat',
+};
+// POST /v1beta/models/{model}:generateContent, :streamGenerateContent and :countTokens (Gemini::METHODS).
+$gemini = $method === 'POST' ? Gemini::target($path) : null;
 
 try {
     $config = Config::load(virsilipas_config_path());
@@ -28,7 +35,8 @@ try {
     $proxy = new Proxy($config, $ledger);
     $admin = new Admin($config, $ledger);
 
-    match ("$method $path") {
+    match ($gemini === null ? "$method $path" : 'gemini') {
+        'gemini' => $proxy->gemini(...$gemini),
         'POST /v1/chat/completions' => $proxy->chat(),
         'POST /v1/messages' => $proxy->messages(),
         'POST /v1/messages/count_tokens' => $proxy->countTokens(),
@@ -47,14 +55,13 @@ try {
     // The reason is one of the proxy's fixed messages; the request path is client text and is not logged.
     Log::write('info', 'refused', ['status' => $e->status, 'reason' => $e->getMessage()]);
     if (!headers_sent()) {
-        $anthropic ? $e->sendAnthropic() : $e->send();
+        $e->sendAs($format);
     }
 } catch (\Throwable $e) {
     // Fail closed. Log the class and the code location only: an exception message can carry
     // data. `bin/virsilipas` prints configuration errors in full.
     Log::write('error', 'exception', ['class' => get_class($e), 'at' => basename($e->getFile()) . ':' . $e->getLine()]);
     if (!headers_sent()) {
-        $err = new HttpError(500, 'internal error', 'api_error');
-        $anthropic ? $err->sendAnthropic() : $err->send();
+        (new HttpError(500, 'internal error', 'api_error'))->sendAs($format);
     }
 }

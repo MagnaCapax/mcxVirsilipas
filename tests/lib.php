@@ -62,7 +62,7 @@ const SCENARIOS = ['ok' => 'scenario-ok', 'final-only' => 'scenario-final-usage'
             'done-hang' => 'scenario-done-hang', 'stream-message-bytes' => 'scenario-stream-message-bytes', 'private-bytes' => 'scenario-private-bytes',
             'over-batch' => 'scenario-over-batch', 'error-after-start' => 'scenario-error-after-start', 'error-batched' => 'scenario-error-batched',
             'named-error' => 'scenario-named-error', 'slow-final' => 'scenario-slow-final', 'usage-only' => 'scenario-usage-only',
-            'reasoning-field' => 'scenario-reasoning-field'];
+            'reasoning-field' => 'scenario-reasoning-field', 'tool' => 'scenario-tool', 'tool-cut' => 'scenario-tool-cut'];
 
 /** One credit per token of every kind: the credit counts equal the token counts. */
 function unitRates(): array

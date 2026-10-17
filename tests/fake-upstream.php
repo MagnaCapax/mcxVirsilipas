@@ -25,6 +25,10 @@ $seen['thinking'] = $req['thinking'] ?? null;
 $seen['x_api_key'] = (string) ($_SERVER['HTTP_X_API_KEY'] ?? '');
 $seen['anthropic_version'] = (string) ($_SERVER['HTTP_ANTHROPIC_VERSION'] ?? '');
 $seen['anthropic_beta'] = (string) ($_SERVER['HTTP_ANTHROPIC_BETA'] ?? '');
+// For the Gemini format: the shape of the translated messages (roles, tool call ids, never the text) and the tool names.
+$seen['message_shape'] = array_map(static fn ($m): array => [$m['role'] ?? null, array_column($m['tool_calls'] ?? [], 'id'), $m['tool_call_id'] ?? null],
+    is_array($req['messages'] ?? null) ? $req['messages'] : []);
+$seen['tool_names'] = array_map(static fn ($t): ?string => $t['function']['name'] ?? null, is_array($req['tools'] ?? null) ? $req['tools'] : []);
 file_put_contents($dir . '/last-request.json', json_encode($seen));
 // Every request in order, for the retry and failover tests.
 file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPEND | LOCK_EX);
@@ -100,6 +104,32 @@ if ($failWith !== null) {
     exit;
 }
 switch ($model) {
+    case 'scenario-tool-cut':
+        // Text, then a function call's first fragment, then the connection closes: no usage, no finish, no [DONE].
+        header('Content-Type: text/event-stream');
+        $event(['id' => 'tc', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'let me look']]]]);
+        $event(['id' => 'tc', 'choices' => [['index' => 0, 'delta' => ['tool_calls' => [['index' => 0, 'id' => 'call_1', 'type' => 'function',
+            'function' => ['name' => 'list_directory', 'arguments' => '{"dir_path":']]]]]]]);
+        exit;
+    case 'scenario-tool':
+        // A function call: whole in a non-stream answer; in a stream, in three fragments (id and name first, then the
+        // arguments in two pieces), each event with a running usage report that covers it (11 prompt + 1..3 output).
+        $call = ['id' => 'call_1', 'type' => 'function', 'function' => ['name' => 'list_directory', 'arguments' => '{"dir_path":"."}']];
+        if (empty($req['stream'])) {
+            header('Content-Type: application/json');
+            echo json_encode(['id' => 'tc', 'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => null, 'tool_calls' => [$call]],
+                'finish_reason' => 'tool_calls']], 'usage' => $usage(3)]);
+            exit;
+        }
+        header('Content-Type: text/event-stream');
+        $event(['id' => 'tc', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'tool_calls' => [['index' => 0, 'id' => 'call_1', 'type' => 'function',
+            'function' => ['name' => 'list_directory', 'arguments' => '']]]]]], 'usage' => $usage(1)]);
+        foreach (['{"dir_', 'path":"."}'] as $i => $piece) {
+            $event(['id' => 'tc', 'choices' => [['index' => 0, 'delta' => ['tool_calls' => [['index' => 0, 'function' => ['arguments' => $piece]]]]]], 'usage' => $usage($i + 2)]);
+        }
+        $event(['id' => 'tc', 'choices' => [['index' => 0, 'delta' => new stdClass(), 'finish_reason' => 'tool_calls']], 'usage' => $usage(3)]);
+        echo "data: [DONE]\n\n";
+        exit;
     case 'scenario-split-shift':
         // A repeat of the same total that moves output tokens over to the prompt side: not a detail, a different split.
         header('Content-Type: text/event-stream');

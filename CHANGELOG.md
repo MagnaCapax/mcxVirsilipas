@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.11.0 (2026-10-17)
+
+No schema change.
+
+- **The Gemini API format, for Gemini CLI: `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent?alt=sse`.** A translation, not a pass-through (no upstream serves the format): the request becomes a chat completions request on the alias's own route (any alias, the model's `params` included) and goes through chat's validation, prompt bound, reservation, limits, caps, throttle, retries, failover and settlement unchanged; the answer comes back as one candidate. Text, function calls and function responses (paired by id, else by name in order) and the system instruction are translated; function declarations become function tools (`parametersJsonSchema`, else `parameters`, with upper-case type names lower-cased); `toolConfig` becomes `tool_choice`; `temperature`, `topP`, `stopSequences`, `seed`, the penalties, `maxOutputTokens` (clamped like `max_tokens`) and a JSON response type are mapped, and `thinkingConfig`, `topK`, `candidateCount`, safety settings and cached content are dropped. Inline data, files and any tool but function declarations are refused (400). Answers carry text, thoughts (the reasoning, as `thought` parts), function calls with object args, the finish reason and `usageMetadata` from the charged report; in a stream a function call is sent whole in the last chunk, and its bytes count as delivered only then. The key comes as `x-goog-api-key`, a `key` query parameter or `Authorization: Bearer`; errors use the Gemini error shape with the proxy's fixed messages.
+- **`POST /v1beta/models/{model}:countTokens`** answers `{"totalTokens": N}`, the chat prompt bound of the translated request, free and without an upstream call.
+- **README:** a *Gemini CLI* section (`GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`, and the `settings.json` that points the CLI's own model names at an alias, checked with Gemini CLI 0.64.0); a key in a query string and the access log. **docs/API.md:** the three routes. **docs/adr/0021:** the Gemini format is translated to chat completions; ADR 0013 amended. AGENTS.md invariants 5, 7 and 8 name the routes' rules.
+
 ## v0.10.0 (2026-10-17)
 
 No schema change.

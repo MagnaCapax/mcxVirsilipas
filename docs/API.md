@@ -2,13 +2,16 @@
 
 This is the complete HTTP API of the proxy as the code in this repository implements it: every route, what each accepts and returns, every header it sets and every error it can answer. How credits, metering, limits and throttling work is explained in the [README](../README.md); this file links there instead of repeating it. `tests/DocsTest.php` fails when a route, error code, error message or response header in the code is missing here, so the two change together.
 
-There are twelve routes: six for clients and six for your billing system.
+There are fifteen routes: nine for clients and six for your billing system.
 
 | Method and path | Auth | What it does |
 |---|---|---|
 | [`POST /v1/chat/completions`](#post-v1chatcompletions) | key | OpenAI-compatible chat completions, streaming or not |
 | [`POST /v1/messages`](#post-v1messages) | key | Anthropic Messages format, streaming or not, passed through to upstreams that serve it |
 | [`POST /v1/messages/count_tokens`](#post-v1messagescount_tokens) | key | a free, conservative estimate of a messages request's input tokens |
+| [`POST /v1beta/models/{model}:generateContent`](#post-v1betamodelsmodelgeneratecontent) | key | the Gemini API format, translated to chat completions |
+| [`POST /v1beta/models/{model}:streamGenerateContent`](#post-v1betamodelsmodelgeneratecontent) | key | the same, streamed (`?alt=sse`) |
+| [`POST /v1beta/models/{model}:countTokens`](#post-v1betamodelsmodelcounttokens) | key | a free, conservative estimate of a Gemini request's input tokens |
 | [`GET /v1/models`](#get-v1models) | key | the model aliases and their rates |
 | [`GET /v1/balance`](#get-v1balance) | key | the calling key's balance, limits and priority |
 | [`GET /v1/usage`](#get-v1usage) | key | the calling key's own usage per day and per model, and its grants |
@@ -23,10 +26,10 @@ Any other method or path answers 404 `not found`.
 
 ## Conventions
 
-- **Authentication.** Every route needs `Authorization: Bearer <token>` (the two messages routes also take `x-api-key: <key>`). The client routes take a customer key (keys start with `vsk-`); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
-- **Bodies.** Request bodies are a JSON object, at most 4 MiB for chat and messages and 64 KiB for the admin routes. Responses are JSON (`Content-Type: application/json`) except a streamed answer, which is `text/event-stream`.
+- **Authentication.** Every route needs `Authorization: Bearer <token>` (the two messages routes also take `x-api-key: <key>`, the Gemini routes `x-goog-api-key: <key>` or a `key` query parameter). The client routes take a customer key (keys start with `vsk-`); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
+- **Bodies.** Request bodies are a JSON object, at most 4 MiB for chat, messages and the Gemini routes and 64 KiB for the admin routes. Responses are JSON (`Content-Type: application/json`) except a streamed answer, which is `text/event-stream`.
 - **Credits** are integers. What a credit is worth is your decision; the rates are per million tokens (see [Credits](../README.md#credits)).
-- **Errors** use OpenAI's shape (the Anthropic shape on the messages routes, see [POST /v1/messages](#post-v1messages)), with one of the proxy's fixed messages:
+- **Errors** use OpenAI's shape (the Anthropic shape on the messages routes, see [POST /v1/messages](#post-v1messages), and the Gemini shape under `/v1beta/`, see [the Gemini routes](#post-v1betamodelsmodelgeneratecontent)), with one of the proxy's fixed messages:
 
   ```json
   {"error": {"message": "credit balance too low for this request", "type": "insufficient_quota", "param": null, "code": "insufficient_quota"}}
@@ -228,6 +231,90 @@ data: {"type":"message_stop"}
 
 The proxy's own conservative estimate: the prompt bound a `POST /v1/messages` request with the same fields would reserve for (see above), never fewer tokens than the upstream would count. Nothing goes upstream and nothing is reserved or charged; it needs a valid key (as on `POST /v1/messages`), an alias served in the Messages format, and fields that `POST /v1/messages` would accept, with the same errors.
 
+### POST /v1beta/models/{model}:generateContent
+
+The Gemini API format, for clients that speak only that API (such as Gemini CLI; see [Gemini CLI](../README.md#gemini-cli)). No upstream serves it, so it is a translation: the request becomes a chat completions request on the alias's own route, goes through chat's checks, reservation, limits, throttle, retries, failover and settlement unchanged, and the rebuilt chat answer comes back in this format. Three methods are served, all `POST`:
+
+| Method and path | What it does |
+|---|---|
+| `POST /v1beta/models/{model}:generateContent` | one answer, not streamed |
+| `POST /v1beta/models/{model}:streamGenerateContent` | a streamed answer; needs `?alt=sse` (otherwise 400 `invalid_value` `streamGenerateContent needs alt=sse`) |
+| `POST /v1beta/models/{model}:countTokens` | the proxy's own estimate, free (below) |
+
+```sh
+curl "https://proxy.example/v1beta/models/default:generateContent" \
+  -H "x-goog-api-key: $VIRSILIPAS_KEY" -H 'Content-Type: application/json' \
+  -d '{"contents": [{"role": "user", "parts": [{"text": "Say hello."}]}]}'
+```
+
+- **The model** is `{model}` in the path: one of your aliases, any alias (URL-encoded where needed). Unknown: 404 `model_not_found` `unknown model; see /v1/models`. A `model` field in the body is ignored. Any other path under `/v1beta/`, or another method, answers 404 `not found` in this format.
+- **The key** comes as `x-goog-api-key: <key>`, as a `key` query parameter, or as `Authorization: Bearer <key>`, in that order of preference. None: 401 `missing key: send x-goog-api-key, a key parameter or Authorization: Bearer`. A key in the query string ends up in any access log that records query strings; prefer the header.
+- **Errors** use this format's shape, with the same statuses, messages and `Retry-After` as everywhere else, `code` the HTTP status and `status` chosen by it (400 and 413 `INVALID_ARGUMENT`, 401 `UNAUTHENTICATED`, 402 `FAILED_PRECONDITION`, 403 `PERMISSION_DENIED`, 404 `NOT_FOUND`, 429 `RESOURCE_EXHAUSTED`, 500 `INTERNAL`, 502 and 503 `UNAVAILABLE`, 504 `DEADLINE_EXCEEDED`, any other `UNKNOWN`). The proxy's own `code` (such as `insufficient_quota`) and `param` are not part of this shape:
+
+  ```json
+  {"error": {"code": 402, "message": "credit balance too low for this request", "status": "FAILED_PRECONDITION"}}
+  ```
+
+**Request fields.** Only these are read; any other field (`safetySettings`, `cachedContent`, `labels` and so on) is dropped without an error. The chat request they become is bounded and forwarded like any chat request, the model's `params` included (they win).
+
+| Field | Becomes |
+|---|---|
+| `contents` | required; a non-empty list of contents, each with a `role` of `user` (the default when absent; `function` is read as `user`) or `model` and a non-empty list of `parts`. Otherwise 400 `invalid_messages` (`contents must be a non-empty array`, `each content needs a role of user or model and a non-empty list of parts`). |
+| `systemInstruction` | a string or a content whose parts are all text: the system message (parts joined by a newline). Otherwise 400 `unsupported_content` `systemInstruction must be text`. |
+| `tools` | a list of tools with only `functionDeclarations`; each declaration needs a `name` (400 `invalid_value` `each function declaration needs a name`) and becomes a chat function tool with its `description` and its parameter schema (`parametersJsonSchema`, else `parameters`), whose upper-case type names (`OBJECT`, `STRING`, ...) are lower-cased. Any other tool (search, URL context, code execution, ...): 400 `unsupported_tool` `only function declarations are supported`; it runs on the provider's side and carries fees no token rate covers. |
+| `toolConfig.functionCallingConfig` | `mode` `AUTO` or `VALIDATED`: `tool_choice` `auto`; `NONE`: `none`; `ANY`: `required`, or that one function when `allowedFunctionNames` lists exactly one. |
+| `generationConfig` | `temperature`, `topP` (`top_p`), `stopSequences` (`stop`), `seed`, `presencePenalty` (`presence_penalty`) and `frequencyPenalty` (`frequency_penalty`) as sent; `maxOutputTokens` is `max_tokens`, a positive integer (else 400 `invalid_value` `generationConfig.maxOutputTokens must be a positive integer`), clamped as on chat; `responseMimeType` `application/json` is `response_format`, a `json_schema` with `responseJsonSchema` (else `responseSchema`) lower-cased as above, or `json_object` without one. `thinkingConfig`, `topK`, `candidateCount` (one answer, always) and the rest are dropped: reasoning is the alias's own setting (its `params`). |
+
+Parts, each with exactly one of these (plus `thought` and `thoughtSignature`, which are dropped):
+
+| Part | Becomes |
+|---|---|
+| `text` | text: a user content's text parts are one user message, a model content's one assistant message (joined by a newline). A part with `"thought": true` is not replayed. |
+| `functionCall` (model contents) | a tool call of that assistant message: `name`, and `args` (an object, absent for `{}`) as its JSON arguments; a call without an `id` gets `call_1`, `call_2`, ... Otherwise 400 `invalid_messages` `a function call needs a name, and args that are an object`. |
+| `functionResponse` (user contents) | a tool message with `response` (an object, absent for `{}`) as its JSON content, for the call with the same `id`, or without an id for the oldest unanswered call of that name. Otherwise 400 `invalid_messages` `a function response needs a name, and a response that is an object`. |
+
+Any other part (`inlineData`, `fileData`, `executableCode`, ...), a function call in a user content or a function response in a model content answers 400 `unsupported_content` `only text, function call (model) and function response (user) parts are supported`, as images do on chat.
+
+**Response, not streamed.** 200 with one candidate made from the rebuilt chat completion (see [POST /v1/chat/completions](#post-v1chatcompletions)):
+
+```json
+{"candidates": [{"content": {"role": "model", "parts": [{"text": "Hello!"}]}, "finishReason": "STOP", "index": 0}],
+ "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 7, "totalTokenCount": 18, "cachedContentTokenCount": 0, "thoughtsTokenCount": 0},
+ "modelVersion": "default", "responseId": "chatcmpl-1"}
+```
+
+- `parts`: the reasoning (`reasoning_content` or `reasoning`) as a text part with `"thought": true`, then the content and a refusal as text parts, then each tool call as a `functionCall` with its `id`, `name` and `args` (the arguments decoded; `{}` when they are not a JSON object). An empty text makes no part.
+- `finishReason`: `stop` and `tool_calls` are `STOP`, `length` is `MAX_TOKENS`, `content_filter` is `SAFETY`, none is `STOP`, any other `OTHER`.
+- `usageMetadata` is the report the request is charged by: `promptTokenCount` the prompt tokens, `cachedContentTokenCount` the cached part of them, `thoughtsTokenCount` the reasoning tokens, `candidatesTokenCount` the other output tokens, `totalTokenCount` the total. It is left out when the upstream sent no valid report (the charge is then an upper bound).
+- `modelVersion` is always the alias; `responseId` is the chat answer's `id` when there is one. A 200 needs what chat needs; anything else answers 502 `upstream_error`, free.
+
+**Response, streamed.** 200 with `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no`; each chunk is a `data:` line with a response object, ended by a blank line (`\r\n\r\n`), and there is no end marker:
+
+```
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]},"index":0}],"modelVersion":"default","responseId":"chatcmpl-1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"lo!"}]},"index":0}],"modelVersion":"default","responseId":"chatcmpl-1"}
+
+data: {"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":2,"totalTokenCount":13,"cachedContentTokenCount":0,"thoughtsTokenCount":0},"modelVersion":"default","responseId":"chatcmpl-1"}
+```
+
+- Text and thoughts go out as they arrive. A function call is put together from its chat fragments and sent whole in the last chunk, which the chat stream's `[DONE]` triggers, with the `finishReason` and the `usageMetadata` the request is charged by.
+- The 200 is sent, as on chat, at the first chat event with a usable choice; until then an upstream failure is a normal error response and costs nothing.
+- After the 200, an upstream error, or a chat stream that ends without `[DONE]`, ends the stream with an error chunk, and function calls not yet sent are never sent; the output already relayed is charged:
+
+  ```
+  data: {"error":{"code":502,"message":"upstream stream ended early","status":"UNAVAILABLE"}}
+  ```
+
+**Order of checks** is chat's: the key (401, 403), the body (413, 400 `invalid_json`), the model (404), the contents, system instruction, tools and `maxOutputTokens` (400), then the translated messages as on chat, `alt=sse` for a stream (400), busy shedding, then the reservation in the same order.
+
+**Charging.** Exactly as on chat (see [How metering works](../README.md#how-metering-works)): the upstream's chat usage report at the alias's rates, the prompt bound counted over the translated request, and without a report the bytes of text the client received, where a function call's bytes count only once it is sent.
+
+### POST /v1beta/models/{model}:countTokens
+
+`{"contents": [...], "systemInstruction": ..., "tools": [...]}`, or the same fields inside `generateContentRequest` → 200 `{"totalTokens": 64}`
+
+The proxy's own conservative estimate: the prompt bound a `generateContent` request with the same fields would reserve for, never fewer tokens than the upstream would count. Nothing goes upstream and nothing is reserved or charged; it needs a valid key, a known alias and fields that `generateContent` would accept, with the same errors.
 ### GET /v1/models
 
 ```json
@@ -376,7 +463,7 @@ Errors:
 
 ## Errors
 
-Every error the API can answer. The client-route errors have a `code`; the admin errors have `code: null` and are told apart by their message. On the two messages routes the same errors come in the Anthropic shape, without `code` and `param` (see [POST /v1/messages](#post-v1messages)). "messages" below means `POST /v1/messages`; `POST /v1/messages/count_tokens` answers only its errors for the key, the body, the model and the content (it reserves nothing and goes nowhere).
+Every error the API can answer. The client-route errors have a `code`; the admin errors have `code: null` and are told apart by their message. On the two messages routes the same errors come in the Anthropic shape, without `code` and `param` (see [POST /v1/messages](#post-v1messages)), and on the Gemini routes in that shape (see [the Gemini routes](#post-v1betamodelsmodelgeneratecontent)); "gemini" below means generateContent and streamGenerateContent, and countTokens answers only the errors for the key, the body, the model and the content. "messages" below means `POST /v1/messages`; `POST /v1/messages/count_tokens` answers only its errors for the key, the body, the model and the content (it reserves nothing and goes nowhere).
 
 | Status | `type` | `code` | Message | Retry-After | Where |
 |---|---|---|---|---|---|
@@ -386,30 +473,35 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 400 | `invalid_request_error` | `unsupported_content` | only text content is supported · message content must be text | | chat |
 | 400 | `invalid_request_error` | `unsupported_content` | only text, tool use, tool result and thinking content is supported | | messages |
 | 400 | `invalid_request_error` | `unsupported_tool` | only client tools are supported | | messages |
+| 400 | `invalid_request_error` | `invalid_messages` | contents must be a non-empty array · each content needs a role of user or model and a non-empty list of parts · a function call needs a name, and args that are an object · a function response needs a name, and a response that is an object | | gemini |
+| 400 | `invalid_request_error` | `unsupported_content` | only text, function call (model) and function response (user) parts are supported · systemInstruction must be text | | gemini |
+| 400 | `invalid_request_error` | `unsupported_tool` | only function declarations are supported | | gemini |
+| 400 | `invalid_request_error` | `invalid_value` | each function declaration needs a name · generationConfig.maxOutputTokens must be a positive integer · streamGenerateContent needs alt=sse | | gemini |
 | 400 | `invalid_request_error` | `invalid_value` | max_tokens must be a positive integer · days must be an integer from 1 to 400 · grants must be an integer from 1 to 1000 · tools must be a list of tool definitions | | chat · messages · usage |
-| 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat · messages, from the upstream |
-| 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat · messages, from the upstream |
+| 400 | `invalid_request_error` | `context_length_exceeded` | the request is longer than the model accepts | | chat · messages · gemini, from the upstream |
+| 400 | `invalid_request_error` | `upstream_rejected` | upstream rejected the request (HTTP 400, 413 or 422) | | chat · messages · gemini, from the upstream |
 | 401 | `authentication_error` | `invalid_api_key` | missing bearer key · invalid key | | client routes |
 | 401 | `authentication_error` | `invalid_api_key` | missing key: send x-api-key or Authorization: Bearer | | messages |
-| 402 | `insufficient_quota` | `insufficient_quota` | credit balance too low for this request | | chat · messages |
+| 401 | `authentication_error` | `invalid_api_key` | missing key: send x-goog-api-key, a key parameter or Authorization: Bearer | | gemini |
+| 402 | `insufficient_quota` | `insufficient_quota` | credit balance too low for this request | | chat · messages · gemini |
 | 403 | `permission_error` | `key_disabled` | key is disabled | | client routes |
-| 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat |
+| 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat · gemini |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model, or not served in the Messages format; see /v1/models | | messages |
 | 413 | `invalid_request_error` | `request_too_large` | request body too large | | all POST routes |
-| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 1 for concurrency; else until the oldest request in the key's window is a minute old | chat · messages |
-| 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat · messages |
-| 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat · messages, from the upstream |
-| 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat · messages, from the upstream |
-| 503 | `server_error` | `server_busy` | the server is busy; retry shortly | `ceil(5 x busy_min_weight / weight)`, 1 to 60 | chat · messages |
-| 503 | `server_error` | `spend_cap_reached` | the server has reached its spending limit for this hour (or day, or month) | until that window ends | chat · messages |
-| 503 | `api_error` | `upstream_unavailable` | upstream unavailable, retry shortly | 1 | chat · messages, from the upstream |
-| 504 | `api_error` | `upstream_timeout` | upstream timed out | | chat · messages, from the upstream |
+| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 1 for concurrency; else until the oldest request in the key's window is a minute old | chat · messages · gemini |
+| 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat · messages · gemini |
+| 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat · messages · gemini, from the upstream |
+| 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat · messages · gemini, from the upstream |
+| 503 | `server_error` | `server_busy` | the server is busy; retry shortly | `ceil(5 x busy_min_weight / weight)`, 1 to 60 | chat · messages · gemini |
+| 503 | `server_error` | `spend_cap_reached` | the server has reached its spending limit for this hour (or day, or month) | until that window ends | chat · messages · gemini |
+| 503 | `api_error` | `upstream_unavailable` | upstream unavailable, retry shortly | 1 | chat · messages · gemini, from the upstream |
+| 504 | `api_error` | `upstream_timeout` | upstream timed out | | chat · messages · gemini, from the upstream |
 | 400 | `invalid_request_error` | `null` | ref must be a non-empty string (max 200 bytes) · active must be true or false · grant needs a string grant_id and an integer credits · grant needs a grant_id and nonzero credits of at most 1000000000000000 · grant would take the balance out of range · unknown limit; use max_concurrent, requests_per_minute, credits_per_minute · \<limit\> must be null (the default) or an integer from 1 to 1000000000000000 · bonus_pct must be an integer from 0 to 300 · key_group must be at most 64 of a-z, 0-9, dot, dash and underscore · expires_at must be null or a future unix time in seconds | | admin |
 | 401 | `authentication_error` | `null` | invalid admin token | | admin |
 | 404 | `invalid_request_error` | `null` | unknown ref | | admin |
 | 409 | `invalid_request_error` | `null` | a key already exists for this ref · grant_id was already used for a different ref, amount or expires_at | | admin |
 | 409 | `invalid_request_error` | `key_removed` | the key for this ref was removed; a removed ref cannot be changed or used again | | admin, after `POST /admin/keys/remove` |
-| 404 | `invalid_request_error` | `null` | not found | | any other method or path |
+| 404 | `invalid_request_error` | `null` | not found | | any other method or path (in the Gemini shape under `/v1beta/`) |
 | 500 | `api_error` | `null` | internal error | | any route: an unexpected failure, such as a config that cannot be loaded or a ledger that cannot be read or written |
 
 - **Upstream-derived errors.** The rows marked "from the upstream" are the proxy's own answers (on `POST /v1/messages` too, where an upstream's 529 is a 5xx like any other), chosen from the last failed attempt after retries and failover; the upstream's own text is never relayed. The last attempt decides:
@@ -429,8 +521,8 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 |---|---|---|
 | `Content-Type` | every response | `application/json`, or `text/event-stream` for a stream |
 | `Retry-After` | every 429 and 503 | seconds (see [Errors](#errors)) |
-| `X-Request-Id` | chat and `POST /v1/messages`, once the reservation is made (an upstream error included) | the request's lease id, the same id as in its usage row and log lines; quote it to support |
-| `X-Virsilipas-Weight` | chat and `POST /v1/messages`, once it passes the key, body, model and message checks and is not shed as busy (a 400 for `max_tokens` and a refusal from the reservation included) | the key's priority weight |
+| `X-Request-Id` | chat, `POST /v1/messages` and the Gemini generateContent and streamGenerateContent, once the reservation is made (an upstream error included) | the request's lease id, the same id as in its usage row and log lines; quote it to support |
+| `X-Virsilipas-Weight` | chat, `POST /v1/messages` and the Gemini generateContent and streamGenerateContent, once it passes the key, body, model and message checks and is not shed as busy (a 400 for `max_tokens` and a refusal from the reservation included) | the key's priority weight |
 | `X-Virsilipas-Delay-Ms` | as `X-Virsilipas-Weight` | the spend-pacing wait before the request went upstream, 0 when none |
 | `Cache-Control` | a stream | `no-cache` |
 | `X-Accel-Buffering` | a stream | `no`, so nginx does not buffer the stream |

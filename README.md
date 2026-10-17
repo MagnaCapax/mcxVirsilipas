@@ -7,6 +7,7 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 - Clients can read their remaining credits, their limits and their last minute's use, and their own usage per day and per model with the grants that added to the balance; you set per-key limits on concurrency, requests per minute and credits per minute.
 - Clients talk to it like any OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`), for text requests. Two example clients are in `examples/`.
 - Clients that speak only the Anthropic Messages API, such as Claude Code, use `/v1/messages`, passed through to upstreams that serve that format and metered the same way ([Claude Code](#claude-code)).
+- Clients that speak only the Gemini API, such as Gemini CLI, use `/v1beta/models/{model}:generateContent` and its streamed form, translated to chat completions on the same aliases and metered the same way ([Gemini CLI](#gemini-cli)).
 - Optional soft throttling: when the day's spend nears a budget, or the server is busy, requests slow down or are asked to retry, by a per-key priority weight (more credit and a larger bonus mean higher priority), instead of being refused.
 - Optional hard caps for the whole server: upstream spend per hour, day and month, and requests per minute across all keys. Set a spend cap to 0 to stop everything at once.
 - A key never spends more than its balance, parallel requests included: each request reserves an upper bound first, the reservation never exceeds the balance, and the charge never exceeds the reservation.
@@ -158,7 +159,7 @@ php examples/client.php chat "one word, please" --key-file /path/to/key   # the 
 
 A tool or library that lets you set an OpenAI-compatible base URL and API key can use the proxy: set the base URL to `https://proxy.example/v1`, the key to your `vsk-` key and the model to an alias from `GET /v1/models`. What it can expect:
 
-- Under `/v1` the proxy serves `POST /v1/chat/completions`, `GET /v1/models`, `GET /v1/balance` and `GET /v1/usage`, plus the Anthropic-format `POST /v1/messages` and `POST /v1/messages/count_tokens` ([Claude Code](#claude-code)), and nothing else. Any other path answers 404 `not found`.
+- Under `/v1` the proxy serves `POST /v1/chat/completions`, `GET /v1/models`, `GET /v1/balance` and `GET /v1/usage`, plus the Anthropic-format `POST /v1/messages` and `POST /v1/messages/count_tokens` ([Claude Code](#claude-code)), and nothing else; the Gemini-format routes are under `/v1beta` ([Gemini CLI](#gemini-cli)). Any other path answers 404 `not found`.
 - Message content must be text. An image, audio or file part answers 400 `unsupported_content`.
 - Function tools (`tools`, `tool_choice`, `parallel_tool_calls`) are forwarded, and tool calls come back in the answer.
 - Fields the proxy does not forward, such as `n` or `store`, are dropped without an error. The [request fields](docs/API.md#post-v1chatcompletions) table lists what is kept.
@@ -187,6 +188,43 @@ claude
 - `POST /v1/messages/count_tokens` answers the proxy's own estimate, which counts high (a token per byte), so the context can look fuller than it is. It costs nothing.
 - Errors come in the Anthropic error shape; [POST /v1/messages](docs/API.md#post-v1messages) in docs/API.md lists every field, event and error.
 
+### Gemini CLI
+
+Gemini CLI speaks only the Gemini API. No upstream serves that format here, so the proxy translates it: `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent` become chat completions requests on the alias's own route, metered against the same balance and in the same way as chat, and the answers are translated back. Every alias can be used; nothing has to be configured. Point Gemini CLI at the proxy with your key:
+
+```sh
+export GOOGLE_GEMINI_BASE_URL=https://proxy.example   # without /v1beta: the CLI adds /v1beta/models/... itself
+export GEMINI_API_KEY="$VIRSILIPAS_KEY"               # sent as x-goog-api-key
+gemini
+```
+
+and, in `~/.gemini/settings.json`, an alias for every model the CLI uses (here `default`):
+
+```json
+{
+  "security": {"auth": {"selectedType": "gemini-api-key"}},
+  "model": {"name": "default"},
+  "modelConfigs": {"customOverrides": [{"match": {"overrideScope": "core"}, "modelConfig": {"model": "default"}}]},
+  "agents": {"overrides": {"codebase_investigator": {"modelConfig": {"model": "inherit"}},
+                           "cli_help": {"modelConfig": {"model": "inherit"}}}}
+}
+```
+
+Checked with Gemini CLI 0.64.0, where each line is needed:
+
+- `security.auth.selectedType`: with `GOOGLE_GEMINI_BASE_URL` set and no auth method chosen, the CLI picks one it then refuses (`Invalid auth method selected.`).
+- `model.name` (or `-m default`, or `GEMINI_MODEL=default`): the alias for the conversation. With a fixed model the CLI also skips the extra routing call it otherwise makes on every turn.
+- `modelConfigs.customOverrides`: the CLI's own background tasks (routing, summaries, loop and edit checks, history compression) name models of their own; this override sends them to the alias as well.
+- `agents.overrides`: two built-in subagents, on by default, name models of their own; `inherit` runs them on the conversation's model. Experimental agents and features that are off by default (the browser agent, automatic memory) name models of their own too and were not checked.
+
+A call that still names a model that is not one of your aliases (a later CLI version may add one) answers 404 `model_not_found`. For headless use (`gemini -p "..."`) outside a folder the CLI trusts, add `--skip-trust` or `GEMINI_CLI_TRUST_WORKSPACE=true`. `GEMINI_API_KEY_AUTH_MECHANISM=bearer` sends the key as `Authorization: Bearer`, which the proxy also accepts. What to expect:
+
+- Text, function calls and function results (the CLI's own tools: files, shell, search in files, subagents) work. A pasted image or file answers 400 `unsupported_content`, and a tool that runs on the provider's side (the CLI's web search, URL context) answers 400 `unsupported_tool`, so a feature that needs one fails.
+- The CLI's thinking settings are not forwarded: how much an alias reasons is the deployment's setting (the model's `params`). Reasoning an upstream returns is shown as the CLI's thoughts and paid as output.
+- `generationConfig.maxOutputTokens` is clamped like `max_tokens` on chat; without it a request asks for the server's `max_tokens_cap`.
+- `:countTokens` answers the proxy's own estimate, which counts high (a token per byte). It costs nothing.
+- Errors come in the Gemini error shape; [the Gemini routes](docs/API.md#post-v1betamodelsmodelgeneratecontent) in docs/API.md list every field, chunk and error.
+
 ## Endpoints
 
 The full reference, with every request field, response shape, header and error, is [docs/API.md](docs/API.md).
@@ -196,6 +234,9 @@ The full reference, with every request field, response shape, header and error, 
 | `POST /v1/chat/completions` | key | OpenAI-compatible chat completions, streaming or not; `model` is one of your aliases |
 | `POST /v1/messages` | key | the Anthropic Messages format, streaming or not, for aliases with a `messages_url` upstream; the key as `x-api-key` or a bearer token |
 | `POST /v1/messages/count_tokens` | key | a conservative input-token estimate for a messages request; free, nothing goes upstream |
+| `POST /v1beta/models/{model}:generateContent` | key | the Gemini API format, translated to chat completions, for any alias; the key as `x-goog-api-key`, a `key` parameter or a bearer token |
+| `POST /v1beta/models/{model}:streamGenerateContent` | key | the same, streamed (`?alt=sse`) |
+| `POST /v1beta/models/{model}:countTokens` | key | a conservative input-token estimate for a Gemini request; free, nothing goes upstream |
 | `GET /v1/models` | key | the aliases with their rates, `context_length` and `max_completion_tokens`; upstream model ids and URLs are never shown |
 | `GET /v1/balance` | key | the calling key's balance, reservations, limits, last minute's use and priority weight |
 | `GET /v1/usage` | key | the calling key's own balance, usage per day and per model over the last `days` (default 30), and its newest `grants` grants (default 200) |
@@ -413,6 +454,7 @@ Details that matter in production:
 - **Upstream errors** never produce a 200 before a stream has started; once it has (the 200 is already sent), an upstream error ends the stream with a generic error event and no `[DONE]`, and the output relayed until then is charged. A non-streaming answer must arrive complete and carry a usable answer: non-empty text, reasoning or refusal, or a function tool call with a non-empty id, name and arguments. A stream starts only with an event that carries a completion choice (a delta with at least one valid field); events dropped before that add nothing to the charge, and at `[DONE]` the proxy stops reading the upstream, so nothing after it is relayed or charged. Otherwise the client gets one of the proxy's own errors (see [Errors](docs/API.md#errors) in docs/API.md), no upstream text, and no charge; when the upstream still sent a usage report (it answered 2xx without a usable answer, and billed it), the usage row keeps its counts and cost, with nothing charged, so cost tracking sees what the upstream billed. A stream that ends without its final marker gets an error event at the end (`code` `upstream_error`).
 - **Retries and failover.** Before anything has been sent to the client, a failed attempt is retried on the same upstream (`retries`, 0 to 2, default 1) only when the upstream cannot have done the work: the connection failed before the request was sent, or it answered 408, 409, 429, 502, 503 or 504. Between tries the proxy waits the upstream's `Retry-After` (or `retry-after-ms`) when it is at most 60 seconds, else 0.5 s, then 1 s. When the tries are used up, or the upstream answered 500 (or another 5xx), 401, 402, 403 or 404, the request moves to the next upstream in the alias's route. It ends at once, with no retry and no failover, when output may already exist (a 2xx status arrived, or a sent request timed out or broke) and when the upstream rejected the request itself (400, 413, 422 and other statuses), because every upstream would. All attempts together get `upstream_timeout`. One reservation covers them all, the customer pays the alias's rates whichever upstream answered, and only the answer delivered is charged. The usage row records the upstream that served the request (or was tried last), and each failed attempt is logged as `upstream_attempt` (warn).
 - **The Anthropic Messages format** (`POST /v1/messages`) goes through the same admit, reserve, forward and settle steps, with that format's allowlists of fields, content blocks and tools ([POST /v1/messages](docs/API.md#post-v1messages)) and without the model's `params`. Its usage counts map onto the three rates: `input_tokens` and `cache_creation_input_tokens` are fresh input, `cache_read_input_tokens` is cached input and `output_tokens` (thinking included) is output. When `tools` are given, the prompt bound adds 1024 tokens for the tool-use prompt an upstream adds by itself.
+- **The Gemini API format** (`POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent`) is translated into a chat completions request (text, function calls and results, function declarations and a few generation settings; [the Gemini routes](docs/API.md#post-v1betamodelsmodelgeneratecontent)), which then goes through every step above as it is, the model's `params` included; the answer is translated back. In a stream a function call is sent whole at the end, and its bytes count as delivered only once it is sent.
 - **Credit log.** Every change to a balance writes one row to `credit_log` in the same transaction: a grant (its `grant_id`), a reservation taken when a request starts and the unused part returned when it settles (both `lease:<id>`), or the `opening` balance carried over by a schema upgrade. Each row holds the change and the balance after it; a change of zero (a request that used its whole reservation) writes no row. The table is append-only: the database refuses UPDATE, DELETE and an INSERT that would replace a row on it. `bin/virsilipas history <ref> [N]` shows a key's last N changes; `bin/virsilipas verify` checks that every key's changes sum to its balance and that each row's balance is the running sum, and exits 1 on any mismatch, which means something changed a balance outside the proxy.
 - **Usage over time.** Each usage row also carries `upstream` (the host of the route URL that served the request), `stream`, `duration_ms`, `reasoning_tokens` (the reasoning share of the output tokens, read from `completion_tokens_details.reasoning_tokens` or a top-level `reasoning_tokens`) and `upstream_cost` (the upstream's own `estimated_cost`, kept in millionths of its unit; when it reports none and the route entry that served the request sets `cost`, the cost computed from those prices, flagged `cost_computed`; otherwise `NULL`), `source` (internal or external, from the lease), `first_byte_ms` (from the first upstream request, after any pacing wait, to the first byte of the answer sent to the client: the first relayed chunk of a stream, or the whole answer otherwise; `NULL` when no answer reached the client, as for an error) and `attempts` (upstream requests made for it, retries and failover included; `0` on rows written before schema 8). None of these change what is charged; a request with none of this detail still gets a usage row. In a stream, a repeat report with the same three counts may add a detail the adopted report lacked (the cached split, the reasoning count, the cost) once; a later repeat cannot change or remove it. `bin/virsilipas stats <hour|day|week|month|all|hour_of_day|weekday> [by] [since] [until]` prints one JSON line per UTC time bucket and group. `week` is the year and SQLite's Monday-based week number (`2026-W41`), `hour_of_day` folds all days into 00 to 23, and `weekday` into 0 (Sunday) to 6. `by` is a comma list of `model`, `upstream`, `key`, `status`, `source` (internal or external), `group` (the key's group), or `-` for none; `since`/`until` are `YYYY-MM-DD` in UTC, `until` exclusive) with requests, prompt/cached/completion/reasoning tokens, credits charged, the upstream cost and how many requests carried one (and how many of those were computed from configured prices), hang-ups, estimated charges, failed requests (non-2xx), the mean duration, the mean time to first byte (`mean_first_byte_ms`), the requests that needed more than one upstream attempt (`retried`), and the requests that waited for spend pacing (`delayed`) with their mean wait (`mean_delay_ms`).
 - **Crashed workers.** A lease outlives its request only if its worker died. When it expires it stops counting against concurrency, but its reservation stays charged, since the answer may already have been delivered (a worker that dies just before forwarding also leaves its reservation charged); if the request is settled late, the difference is returned. `bin/virsilipas status <ref>` counts such leases as `held`. `lease_seconds` must be longer than `upstream_timeout`.
@@ -572,7 +614,7 @@ If any step after php-fpm stopped fails, `deploy.php` points the symlink back at
 
 ## Privacy
 
-Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address, or with only its network (for example the /24 or /48), if you do not need it.
+Request and response bodies are never stored or logged. The usage table holds token counts, credits, the model alias, the upstream, status, duration and timestamps. Keys are stored only as sha256 hashes. A request may be served by any upstream in its alias's route, so list there only upstreams whose terms and data handling you accept for your customers' prompts. The proxy's own log never holds client addresses, but your web server's access log does by default: turn it off for this site (`access_log off;` in nginx) or use a log format without the client address, or with only its network (for example the /24 or /48), if you do not need it. A Gemini-format client may send its key as a `key` query parameter (Gemini CLI sends a header); an access log that records query strings then holds that key, so leave the query string out of the log format too.
 
 The proxy keeps no body, but the stack under it can write one to disk on its way through. To keep prompts and answers off disk entirely:
 
