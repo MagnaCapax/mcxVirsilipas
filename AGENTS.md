@@ -48,6 +48,7 @@ KISS, DRY, YAGNI. Delete first: question the requirement, delete the part, simpl
 | [0020](docs/adr/0020-anthropic-messages-pass-through.md) | The Anthropic Messages format is a metered pass-through |
 | [0021](docs/adr/0021-gemini-format-translated-to-chat.md) | The Gemini API format is translated to chat completions |
 | [0022](docs/adr/0022-architecture-layout-and-languages.md) | Architecture, layout and languages |
+| [0023](docs/adr/0023-public-aggregate-usage.md) | Public aggregate usage is an operator command, never a route |
 
 ## Invariants the tests protect
 

@@ -2,6 +2,12 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.12.0 (2026-10-18)
+
+No schema change.
+
+- **`bin/virsilipas public-usage <ref-prefix> [file]`: the aggregate usage a deployment may publish.** Over the keys whose ref starts with the prefix (required): windows of 24 hours, 7 and 30 days ending at the last complete UTC hour (credits, requests, prompt, cached, completion and reasoning tokens, the share of 2xx answers, the share of retried requests, the mean time to first byte), every model over 30 days with its tokens, credits and shares of credits and requests, the last 30 UTC days with each day's top 5 models, the last 7 days hour by hour split into the 5 largest models and the rest, and a weekday by hour heatmap over 30 days. No ref, no count of keys, no upstream, no cost and no grant; an output that would carry a ref is refused. With a file, written atomically and readable by everyone (0644). No new route: a web server serves the file. **docs/adr/0023:** public aggregate usage is an operator command, never a route. **README:** CLI.
+
 ## v0.11.0 (2026-10-17)
 
 No schema change.

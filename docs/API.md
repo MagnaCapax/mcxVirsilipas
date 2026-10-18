@@ -529,5 +529,5 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 
 ## Not part of the HTTP API
 
-- The command line (`bin/virsilipas`), which does everything the admin routes do (`key-remove` and `grant ... [expires_at]` included) and more (status, history, usage statistics, verify): see [CLI](../README.md#cli).
+- The command line (`bin/virsilipas`), which does everything the admin routes do (`key-remove` and `grant ... [expires_at]` included) and more (status, history, usage statistics, the public aggregate usage, verify): see [CLI](../README.md#cli).
 - The upstream side: which upstreams serve an alias, their URLs and keys live only in the deployment's config.

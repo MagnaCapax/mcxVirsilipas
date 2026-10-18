@@ -40,6 +40,10 @@ Usage: virsilipas <command> [args]
                                     and requests that were retried or failed over;
                                     by = comma list of model,upstream,key,status,source,group (or -); since/until =
                                     YYYY-MM-DD (UTC, until exclusive)
+  public-usage <ref-prefix> [file]  the aggregate usage of the keys whose ref starts with ref-prefix,
+                                    for publishing (ADR 0023): windows, models, daily, hourly, heatmap;
+                                    no ref, count, upstream, cost or grant. With file: written
+                                    atomically, mode 0644
   keys                              list every key: ref, active, balance, group, bonus, created and
                                     last used (unix time), one JSON line each
   top [--once] [--interval N]       live view of requests: rate, latency, time to first byte, tokens,
@@ -78,6 +82,7 @@ try {
         'verify' => verifyOrExit($ledger),
         'caps' => json_encode($ledger->capStatus($config->caps), JSON_FORCE_OBJECT),
         'keys' => implode("\n", array_map('json_encode', $ledger->keys())),
+        'public-usage' => publicUsage($ledger, $args),
         'top' => top($ledger, $config, $args),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
             ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
@@ -91,6 +96,28 @@ try {
 } catch (HttpError | \InvalidArgumentException | \RuntimeException $e) {
     fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
     exit(1);
+}
+
+/**
+ * Build the public aggregate usage (ADR 0023); print it, or write it atomically to a file anyone may read.
+ * @param list<string> $args
+ */
+function publicUsage(Ledger $ledger, array $args): string
+{
+    $now = time();
+    $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
+    $refs = array_column($ledger->keys(), 'ref');
+    $json = \MagnaCapax\Virsilipas\PublicUsage::encode(\MagnaCapax\Virsilipas\PublicUsage::build($rows, $now, arg($args, 0)), $refs);
+    if (!isset($args[1])) {
+        return rtrim($json, "\n");
+    }
+    $target = $args[1];
+    $tmp = $target . '.tmp-' . getmypid();
+    if (file_put_contents($tmp, $json) !== strlen($json) || !chmod($tmp, 0644) || !rename($tmp, $target)) {
+        @unlink($tmp);
+        throw new \RuntimeException('could not write ' . $target);
+    }
+    return json_encode(['written' => $target, 'bytes' => strlen($json)]);
 }
 
 /**
