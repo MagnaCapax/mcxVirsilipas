@@ -4,6 +4,12 @@
 
 A small PHP application: an OpenAI-compatible proxy that meters LLM usage per API key, in credits priced per model (fresh input, cached input, output), against one prepaid, never-expiring balance. Billing pushes grants; the proxy never refills a balance by itself.
 
+Start with [`development/`](development/README.md): the [engineering principles](development/engineering-principles.md) explain the organisation-wide rules with their reasons and the mistakes that taught them, and list the sibling repositories' docs and decisions. [ADR 0022](docs/adr/0022-architecture-layout-and-languages.md) maps the layout, the languages and how the principles apply here.
+
+## Principles
+
+KISS, DRY, YAGNI. Delete first: question the requirement, delete the part, simplify, then speed up, then automate (a needed but broken part is debugged, not deleted). Pit of success: safe defaults, risky paths explicit and loud. Never break old users. Tests that can fail. PHP for logic, shell only as thin glue, no Python. camelCase names in code, read from broad to specific; wire formats, config keys and ledger columns keep their existing snake_case. Files around 150 lines (a target, not a hard limit; split a big file when you change it anyway). Before committing, review the change with the [review unit in mcxPikkumies](https://github.com/MagnaCapax/mcxPikkumies/tree/main/pikkumies/tools/development/code-review) against these rules and the ADRs.
+
 ## Rules
 
 - **License:** Apache-2.0. New files carry no per-file headers; LICENSE and NOTICE cover the project.
@@ -41,6 +47,7 @@ A small PHP application: an OpenAI-compatible proxy that meters LLM usage per AP
 | [0019](docs/adr/0019-a-key-reads-its-own-usage.md) | A key reads its own usage, and nothing else |
 | [0020](docs/adr/0020-anthropic-messages-pass-through.md) | The Anthropic Messages format is a metered pass-through |
 | [0021](docs/adr/0021-gemini-format-translated-to-chat.md) | The Gemini API format is translated to chat completions |
+| [0022](docs/adr/0022-architecture-layout-and-languages.md) | Architecture, layout and languages |
 
 ## Invariants the tests protect
 
@@ -83,6 +90,7 @@ tools/deploy.php   deploy a release tag from a git mirror: backup, migrate, syml
 tools/smoke.php    live end-to-end check after a deploy (one request, credit log, verify)
 examples/          hello-world.php (smallest client) and client.php (models, balance, streaming chat)
 CHANGELOG.md       releases (git tags vX.Y.Z) and schema changes
+development/       engineering principles (copied from mcxPikkumies) and the contributor index
 tests/             plain PHP runner (php tests/run.php), fake upstream, end-to-end harness,
                    secret guard (fails if a credential or local file is tracked), schema fixtures
 ```
