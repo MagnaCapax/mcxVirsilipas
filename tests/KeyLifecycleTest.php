@@ -275,3 +275,37 @@ function testCliRemovesAKeyGrantsWithAnExpiryAndPrintsHelpWithoutAConfig(): void
     [$code, , $err] = $run(['VIRSILIPAS_CONFIG' => "$dir/config.php"]);
     same([2, true], [$code, str_starts_with($err, 'Usage: virsilipas')], 'no command: usage on stderr, exit 2');
 }
+
+function testKeyRefFindsTheRefOfACurrentKeyOnlyAndTheCliPrintsIt(): void
+{
+    $dir = tempDir();
+    $l = new Ledger("$dir/ledger.sqlite");
+    $l->migrate();
+    $a = $l->createKey('a');
+    $b = $l->createKey('b');
+    same('a', $l->refForKeyHash(hash('sha256', $a)));
+    $l->setActive('b', false);
+    same('b', $l->refForKeyHash(hash('sha256', $b)), 'a disabled key still names its ref');
+    $a2 = $l->rotateKey('a');
+    same(null, $l->refForKeyHash(hash('sha256', $a)), 'a rotated key\'s old digest names no ref');
+    same('a', $l->refForKeyHash(hash('sha256', $a2)));
+    $l->removeKey('a');
+    same(null, $l->refForKeyHash(hash('sha256', $a2)), 'a removed key names no ref');
+    same(null, $l->refForKeyHash(str_repeat('0', 64)));
+    foreach (['', 'removed:1', strtoupper(hash('sha256', $b)), hash('sha256', $b) . "\n"] as $bad) {
+        $threw = false;
+        try {
+            $l->refForKeyHash($bad);
+        } catch (\InvalidArgumentException $e) {
+            $threw = true;
+        }
+        same(true, $threw, 'not a digest: ' . json_encode($bad));
+    }
+
+    file_put_contents("$dir/config.php", '<?php return ' . var_export(configArrayFor($dir), true) . ';');
+    $p = proc_open([PHP_BINARY, dirname(__DIR__) . '/bin/virsilipas', 'key-ref', hash('sha256', $b)], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null,
+        ['VIRSILIPAS_CONFIG' => "$dir/config.php"]);
+    $out = (string) stream_get_contents($pipes[1]);
+    stream_get_contents($pipes[2]);
+    same([0, ['ref' => 'b']], [proc_close($p), json_decode($out, true)]);
+}

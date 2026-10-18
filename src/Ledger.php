@@ -259,6 +259,22 @@ final class Ledger
         });
     }
 
+    /**
+     * The ref whose current key has this sha256 hex digest, disabled keys included; null when no key has it (a rotated
+     * key's old digest, a removed key, or none). For a deployment's own services that hold only a key's digest.
+     */
+    public function refForKeyHash(string $hash): ?string
+    {
+        if (preg_match('/^[0-9a-f]{64}$/D', $hash) !== 1) {
+            throw new \InvalidArgumentException('a key hash is 64 lowercase hex digits');
+        }
+        $st = $this->db->prepare('SELECT ref FROM keys WHERE key_hash = ?');
+        $st->execute([$hash]);
+        $ref = $st->fetchColumn();
+        $st->closeCursor();
+        return $ref === false ? null : (string) $ref;
+    }
+
     public function setActive(string $ref, bool $active): void
     {
         $this->tx(function () use ($ref, $active): void {

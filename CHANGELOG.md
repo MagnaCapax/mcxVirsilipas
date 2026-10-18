@@ -2,6 +2,12 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.12.1 (2026-10-18)
+
+No schema change.
+
+- **`bin/virsilipas key-ref <sha256>`: the ref of the key with this digest.** Disabled keys included; `null` for a rotated key's old digest, a removed key or none. Read-only, CLI only (no route). For a deployment's own services that keep only a key's sha256. **README:** CLI.
+
 ## v0.12.0 (2026-10-18)
 
 No schema change.

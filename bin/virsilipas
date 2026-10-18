@@ -46,6 +46,8 @@ Usage: virsilipas <command> [args]
                                     atomically, mode 0644
   keys                              list every key: ref, active, balance, group, bonus, created and
                                     last used (unix time), one JSON line each
+  key-ref <sha256>                  the ref whose current key has this sha256 hex digest, or null
+                                    (a rotated key's old digest, a removed key, or none)
   top [--once] [--interval N]       live view of requests: rate, latency, time to first byte, tokens,
                                     credits, upstream cost, failures, retries, requests in flight and
                                     the caps, refreshed every N seconds (default 2; Ctrl-C quits);
@@ -82,6 +84,7 @@ try {
         'verify' => verifyOrExit($ledger),
         'caps' => json_encode($ledger->capStatus($config->caps), JSON_FORCE_OBJECT),
         'keys' => implode("\n", array_map('json_encode', $ledger->keys())),
+        'key-ref' => json_encode(['ref' => $ledger->refForKeyHash(arg($args, 0))]),
         'public-usage' => publicUsage($ledger, $args),
         'top' => top($ledger, $config, $args),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
