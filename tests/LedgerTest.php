@@ -68,7 +68,7 @@ function testKeyIsStoredHashedAndFound(): void
 {
     $l = freshLedger();
     $key = $l->createKey('a');
-    check(str_starts_with($key, 'vsk-') && strlen($key) === 52, 'key format');
+    check(preg_match('/^vsk-[0-9a-f]{48}$/D', $key) === 1 && strlen($key) === 52, 'a plain key: vsk- and 48 hex digits');
     same('a', $l->findKey($key)['ref'] ?? null);
     same(null, $l->findKey($key . 'x'));
 }
@@ -78,7 +78,7 @@ function testRotatedKeyReplacesTheOldOneAndKeepsTheBalance(): void
     [$l, $id] = fundedLedger(100);
     $old = $l->createKey('b');
     $new = $l->rotateKey('b');
-    check($new !== $old && str_starts_with($new, 'vsk-') && strlen($new) === 52, 'a new key in the same format');
+    check($new !== $old && preg_match('/^vsk-[0-9a-f]{48}$/D', $new) === 1 && strlen($new) === 52, 'a new key in the same format');
     same(null, $l->findKey($old), 'the old key stops working at once');
     same('b', $l->findKey($new)['ref'] ?? null);
     $a = $l->findKey($l->rotateKey('a'));
@@ -408,7 +408,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');

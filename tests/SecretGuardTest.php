@@ -66,7 +66,7 @@ function testNoSecretValueOrProviderNameIsCommitted(): void
         if (preg_match("~$privateKey~", $text)) {
             $problems[] = "$f: private key";
         }
-        if (preg_match('~vsk-[0-9a-f]{48}~', $text)) {
+        if (preg_match('~vsk-[A-Za-z0-9_-]{16,}~', $text)) { // a plain key or a named one (vsk-<ref>-<48 hex>)
             $problems[] = "$f: proxy key";
         }
         preg_match_all('~(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])~', $text, $m);

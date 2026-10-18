@@ -49,6 +49,7 @@ KISS, DRY, YAGNI. Delete first: question the requirement, delete the part, simpl
 | [0021](docs/adr/0021-gemini-format-translated-to-chat.md) | The Gemini API format is translated to chat completions |
 | [0022](docs/adr/0022-architecture-layout-and-languages.md) | Architecture, layout and languages |
 | [0023](docs/adr/0023-public-aggregate-usage.md) | Public aggregate usage is an operator command, never a route |
+| [0024](docs/adr/0024-keys-can-expire-and-carry-their-ref.md) | Keys can expire and carry their ref |
 
 ## Invariants the tests protect
 

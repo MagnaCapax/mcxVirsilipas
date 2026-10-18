@@ -903,8 +903,9 @@ final class Proxy
     }
 
     /**
-     * The caller's key: $key as the route reads it (Http::apiKey(), Http::googleKey()), else a bearer token.
-     * @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}
+     * The caller's key: $key as the route reads it (Http::apiKey(), Http::googleKey()), else a bearer token. A disabled
+     * or expired key is refused (ADR 0024; Ledger::reserve() checks the expiry again).
+     * @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int, expires_at: ?int}
      */
     private function authenticate(?string $key = null): array
     {
@@ -914,6 +915,9 @@ final class Proxy
         }
         if (!$key['active']) {
             throw new HttpError(403, 'key is disabled', 'permission_error', code: 'key_disabled');
+        }
+        if ($key['expires_at'] !== null && $key['expires_at'] <= time()) {
+            throw new HttpError(403, 'key has expired', 'permission_error', code: 'key_expired');
         }
         return $key;
     }

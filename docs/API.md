@@ -26,7 +26,7 @@ Any other method or path answers 404 `not found`.
 
 ## Conventions
 
-- **Authentication.** Every route needs `Authorization: Bearer <token>` (the two messages routes also take `x-api-key: <key>`, the Gemini routes `x-goog-api-key: <key>` or a `key` query parameter). The client routes take a customer key (keys start with `vsk-`); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
+- **Authentication.** Every route needs `Authorization: Bearer <token>` (the two messages routes also take `x-api-key: <key>`, the Gemini routes `x-goog-api-key: <key>` or a `key` query parameter). The client routes take a customer key (keys start with `vsk-`; a key may have an expiry, after which it answers 403 `key_expired` on every client route, see [ADR 0024](adr/0024-keys-can-expire-and-carry-their-ref.md)); the admin routes take the admin token, whose sha256 is set in the config (`admin_token_sha256`). Keys are stored only as sha256 hashes.
 - **Bodies.** Request bodies are a JSON object, at most 4 MiB for chat, messages and the Gemini routes and 64 KiB for the admin routes. Responses are JSON (`Content-Type: application/json`) except a streamed answer, which is `text/event-stream`.
 - **Credits** are integers. What a credit is worth is your decision; the rates are per million tokens (see [Credits](../README.md#credits)).
 - **Errors** use OpenAI's shape (the Anthropic shape on the messages routes, see [POST /v1/messages](#post-v1messages), and the Gemini shape under `/v1beta/`, see [the Gemini routes](#post-v1betamodelsmodelgeneratecontent)), with one of the proxy's fixed messages:
@@ -391,7 +391,7 @@ Every route except `POST /admin/keys` also answers 404 `unknown ref`. Every rout
 
 `{"ref": "customer-42"}` → 201 `{"ref": "customer-42", "key": "vsk-..."}`
 
-Creates the user's key. The key is returned only this once; the proxy keeps only its hash. A second key for the same ref: 409 `a key already exists for this ref`.
+Creates the user's key, a plain one that never expires (expiring and named keys are made with `bin/virsilipas key-create`). The key is returned only this once; the proxy keeps only its hash. A second key for the same ref: 409 `a key already exists for this ref`.
 
 The call is not idempotent, so treat it as done only once the key is stored or delivered to the user. If the response is lost (a timeout, a crash before the key was saved), a retry answers 409; call `POST /admin/keys/rotate` for the ref instead, which returns a new key and voids the lost one. There is one key per ref: create keys for a ref from one place at a time.
 
@@ -485,6 +485,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 401 | `authentication_error` | `invalid_api_key` | missing key: send x-goog-api-key, a key parameter or Authorization: Bearer | | gemini |
 | 402 | `insufficient_quota` | `insufficient_quota` | credit balance too low for this request | | chat · messages · gemini |
 | 403 | `permission_error` | `key_disabled` | key is disabled | | client routes |
+| 403 | `permission_error` | `key_expired` | key has expired (its expiry, set with `bin/virsilipas key-create --expires`, has passed; also when it passes between authentication and the reservation) | | client routes |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat · gemini |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model, or not served in the Messages format; see /v1/models | | messages |
 | 413 | `invalid_request_error` | `request_too_large` | request body too large | | all POST routes |
@@ -529,5 +530,5 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 
 ## Not part of the HTTP API
 
-- The command line (`bin/virsilipas`), which does everything the admin routes do (`key-remove` and `grant ... [expires_at]` included) and more (status, history, usage statistics, the public aggregate usage, verify): see [CLI](../README.md#cli).
+- The command line (`bin/virsilipas`), which does everything the admin routes do (`key-remove` and `grant ... [expires_at]` included) and more (keys that expire or carry their ref with `key-create --expires --named`, status, history, usage statistics, the public aggregate usage, verify): see [CLI](../README.md#cli).
 - The upstream side: which upstreams serve an alias, their URLs and keys live only in the deployment's config.

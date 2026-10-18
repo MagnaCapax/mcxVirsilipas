@@ -13,8 +13,14 @@ require dirname(__DIR__) . '/src/bootstrap.php';
 $usage = <<<'TXT'
 Usage: virsilipas <command> [args]
   init                              create the database tables (safe to re-run)
-  key-create <ref>                  create a key for <ref>; prints the key once
-  key-rotate <ref>                  replace <ref>'s key (a leaked key); prints the new key once
+  key-create <ref> [--expires=<when>] [--named] [--json]
+                                    create a key for <ref>; prints the key once. --expires: the key
+                                    stops working at <when>, +N followed by m, h or d (N 1 to 999999)
+                                    or a UTC time YYYY-MM-DDTHH:MM:SSZ. --named: the key carries the
+                                    ref, vsk-<ref>-<48 hex> (ref: 1 to 64 of A-Z a-z 0-9 _ -).
+                                    --json: one line {"ref", "key", "expires_at", "named"}
+  key-rotate <ref>                  replace <ref>'s key (a leaked key) with a plain one; prints the
+                                    new key once; the expiry stays
   key-disable <ref>                 refuse all requests for <ref>
   key-enable <ref>                  allow requests for <ref> again
   key-remove <ref>                  remove <ref>'s key for good (balance and history stay; the ref
@@ -44,8 +50,8 @@ Usage: virsilipas <command> [args]
                                     for publishing (ADR 0023): windows, models, daily, hourly, heatmap;
                                     no ref, count, upstream, cost or grant. With file: written
                                     atomically, mode 0644
-  keys                              list every key: ref, active, balance, group, bonus, created and
-                                    last used (unix time), one JSON line each
+  keys                              list every key: ref, active, balance, group, bonus, created, last
+                                    used, removed and expires (unix time), one JSON line each
   key-ref <sha256>                  the ref whose current key has this sha256 hex digest, or null
                                     (a rotated key's old digest, a removed key, or none)
   top [--once] [--interval N]       live view of requests: rate, latency, time to first byte, tokens,
@@ -70,7 +76,7 @@ try {
     $ledger = new Ledger($config->dbPath);
     $out = match ($cmd) {
         'init' => (function () use ($ledger) { $ledger->migrate(); return 'ok'; })(),
-        'key-create' => $ledger->createKey(arg($args, 0)),
+        'key-create' => keyCreate($ledger, $args),
         'key-rotate' => $ledger->rotateKey(arg($args, 0)),
         'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
@@ -145,6 +151,30 @@ function top(Ledger $ledger, Config $config, array $args): string
         echo "\033[H\033[2J", Top::render($ledger, $config->caps, time());
         sleep($interval);
     }
+}
+
+/**
+ * key-create <ref> [--expires=<when>] [--named] [--json]: the bare key by default, as before; one JSON line with --json.
+ * @param list<string> $args
+ */
+function keyCreate(Ledger $ledger, array $args): string
+{
+    $refs = array_values(array_filter($args, static fn (string $a): bool => !str_starts_with($a, '--')));
+    $flags = array_values(array_filter($args, static fn (string $a): bool => str_starts_with($a, '--')));
+    $expires = null;
+    foreach ($flags as $flag) {
+        if (str_starts_with($flag, '--expires=') && $expires === null) {
+            $expires = \MagnaCapax\Virsilipas\KeyExpiry::parse(substr($flag, 10), time());
+        } elseif (!in_array($flag, ['--named', '--json'], true) || count(array_keys($flags, $flag, true)) > 1) {
+            throw new \InvalidArgumentException("unknown or repeated option $flag; key-create <ref> [--expires=<when>] [--named] [--json]");
+        }
+    }
+    if (count($refs) !== 1) {
+        throw new \InvalidArgumentException('key-create takes one ref; run without arguments for usage');
+    }
+    $named = in_array('--named', $flags, true);
+    $key = $ledger->createKey(arg($refs, 0), $expires, $named);
+    return in_array('--json', $flags, true) ? json_encode(['ref' => $refs[0], 'key' => $key, 'expires_at' => $expires, 'named' => $named]) : $key;
 }
 
 /** @param list<string> $a */

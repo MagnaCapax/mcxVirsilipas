@@ -30,12 +30,12 @@ final class Ledger
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
     /** The latest expires_at accepted: 9999-12-31T23:59:59Z. */
     private const MAX_TIME = 253_402_300_799;
-    private const SCHEMA_VERSION = 10;
+    private const SCHEMA_VERSION = 11;
     /**
-     * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 8 gain the columns below, and every older
+     * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 10 gain the columns below, and every older
      * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
      */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9];
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9, 10];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -49,7 +49,8 @@ final class Ledger
      * milliseconds until the first byte reached the client (NULL when nothing did) and how many upstream attempts the
      * request made, retries and failover included (0 on rows written before schema 8). Schema 9, for the key lifecycle:
      * when a key was removed for good (NULL while it lives), and a grant's expiry time, stored for a future expiry
-     * policy and not enforced (NULL: never expires; every grant written before schema 9).
+     * policy and not enforced (NULL: never expires; every grant written before schema 9). Schema 11: when a key expires
+     * (ADR 0024), enforced at authentication and at reserve (NULL: never; every key created before schema 11).
      */
     private const ADDED_COLUMNS = [
         'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
@@ -58,7 +59,7 @@ final class Ledger
             'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))', 'first_byte_ms' => 'INTEGER',
             'attempts' => 'INTEGER NOT NULL DEFAULT 0'],
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''",
-            'removed_at' => 'INTEGER'],
+            'removed_at' => 'INTEGER', 'expires_at' => 'INTEGER'],
         'grants' => ['expires_at' => 'INTEGER'],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
@@ -229,13 +230,23 @@ final class Ledger
     /**
      * Creates a key for a ref: the billing system's stable id for the USER, so that all of a
      * user's purchases add to one balance. Returns the plaintext key, shown once.
+     * $expiresAt (unix seconds, in the future; null for never) is when the key stops authenticating (ADR 0024). A named
+     * key carries its ref in front of the same random part, 'vsk-<ref>-<48 hex>', so the ref must be 1 to 64 ASCII
+     * letters, digits, '_' or '-'.
      */
-    public function createKey(string $ref): string
+    public function createKey(string $ref, ?int $expiresAt = null, bool $named = false): string
     {
-        $key = 'vsk-' . bin2hex(random_bytes(24));
+        if ($named && preg_match('/^[A-Za-z0-9_-]{1,64}$/D', $ref) !== 1) {
+            throw new HttpError(400, 'named keys need a ref of 1-64 of A-Z a-z 0-9 _ -');
+        }
+        $now = time();
+        if ($expiresAt !== null && $expiresAt <= $now) {
+            throw new HttpError(400, 'a key expiry must be a future unix time in seconds');
+        }
+        $key = 'vsk-' . ($named ? $ref . '-' : '') . bin2hex(random_bytes(24));
         try {
-            $this->db->prepare('INSERT INTO keys (ref, key_hash, created_at) VALUES (?, ?, ?)')
-                ->execute([$ref, hash('sha256', $key), time()]);
+            $this->db->prepare('INSERT INTO keys (ref, key_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
+                ->execute([$ref, hash('sha256', $key), $now, $expiresAt]);
         } catch (\PDOException $e) {
             if ($e->getCode() !== '23000') {
                 throw $e; // only a constraint violation means "already exists"
@@ -248,7 +259,8 @@ final class Ledger
 
     /**
      * Replaces a ref's key with a new one (a leaked key): the old key stops working at once; the balance,
-     * limits, credit log and usage stay with the ref. Returns the new plaintext key, shown once.
+     * limits, credit log, usage and expiry stay with the ref. The new key is always a plain one (ADR 0024). Returns the
+     * new plaintext key, shown once.
      */
     public function rotateKey(string $ref): string
     {
@@ -369,10 +381,10 @@ final class Ledger
         return $rows;
     }
 
-    /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int}|null */
+    /** @return array{id: int, ref: string, balance: int, active: bool, bonus_pct: int, expires_at: ?int}|null */
     public function findKey(string $plainKey): ?array
     {
-        $st = $this->db->prepare('SELECT id, ref, balance, active, bonus_pct FROM keys WHERE key_hash = ?');
+        $st = $this->db->prepare('SELECT id, ref, balance, active, bonus_pct, expires_at FROM keys WHERE key_hash = ?');
         $st->execute([hash('sha256', $plainKey)]);
         $row = $st->fetch(\PDO::FETCH_ASSOC);
         $st->closeCursor();
@@ -380,7 +392,7 @@ final class Ledger
             return null;
         }
         return ['id' => (int) $row['id'], 'ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
-            'bonus_pct' => (int) $row['bonus_pct']];
+            'bonus_pct' => (int) $row['bonus_pct'], 'expires_at' => $row['expires_at'] === null ? null : (int) $row['expires_at']];
     }
 
     /** Sets a key's bonus percent (0 to MAX_BONUS_PCT), one of the two inputs of its priority weight. */
@@ -494,17 +506,18 @@ final class Ledger
 
     /**
      * Every key: its ref, whether it is active, its balance, group and bonus, when it was created and when it last
-     * settled a request (null if never) and when it was removed (null while it lives), ordered by ref.
-     * @return list<array{ref: string, active: bool, balance: int, key_group: string, bonus_pct: int, created_at: int, last_used: ?int, removed_at: ?int}>
+     * settled a request (null if never), when it was removed (null while it lives) and when it expires (null: never), ordered by ref.
+     * @return list<array{ref: string, active: bool, balance: int, key_group: string, bonus_pct: int, created_at: int, last_used: ?int, removed_at: ?int, expires_at: ?int}>
      */
     public function keys(): array
     {
         $rows = [];
-        foreach ($this->db->query('SELECT k.ref, k.active, k.balance, k.key_group, k.bonus_pct, k.created_at, k.removed_at,
+        foreach ($this->db->query('SELECT k.ref, k.active, k.balance, k.key_group, k.bonus_pct, k.created_at, k.removed_at, k.expires_at,
                 (SELECT MAX(u.ts) FROM usage u WHERE u.key_id = k.id) AS last_used FROM keys k ORDER BY k.ref')->fetchAll(\PDO::FETCH_ASSOC) as $r) {
             $rows[] = ['ref' => (string) $r['ref'], 'active' => (bool) $r['active'], 'balance' => (int) $r['balance'],
                 'key_group' => (string) $r['key_group'], 'bonus_pct' => (int) $r['bonus_pct'], 'created_at' => (int) $r['created_at'],
-                'last_used' => $r['last_used'] === null ? null : (int) $r['last_used'], 'removed_at' => $r['removed_at'] === null ? null : (int) $r['removed_at']];
+                'last_used' => $r['last_used'] === null ? null : (int) $r['last_used'], 'removed_at' => $r['removed_at'] === null ? null : (int) $r['removed_at'],
+                'expires_at' => $r['expires_at'] === null ? null : (int) $r['expires_at']];
         }
         return $rows;
     }
@@ -517,12 +530,12 @@ final class Ledger
      * @param array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int} $defaults
      * @return array{ref: string, balance: int, active: bool, in_flight: int, held: int, reserved: int,
      *     overrides: array<string, ?int>, limits: array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int},
-     *     window: array{requests: int, credits: int}, bonus_pct: int, key_group: string}
+     *     window: array{requests: int, credits: int}, bonus_pct: int, key_group: string, expires_at: ?int}
      */
     public function status(string $ref, array $defaults): array
     {
         $now = time();
-        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.bonus_pct, k.key_group, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
+        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.bonus_pct, k.key_group, k.expires_at, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held,
                 (SELECT COALESCE(SUM(l.reserved), 0) FROM leases l WHERE l.key_id = k.id AND l.settled = 0) AS reserved
@@ -538,7 +551,8 @@ final class Ledger
         return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
             'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held'], 'reserved' => (int) $row['reserved'],
             'overrides' => $overrides, 'limits' => self::effectiveLimits($overrides, $defaults),
-            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']], 'bonus_pct' => (int) $row['bonus_pct'], 'key_group' => (string) $row['key_group']];
+            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']], 'bonus_pct' => (int) $row['bonus_pct'], 'key_group' => (string) $row['key_group'],
+            'expires_at' => $row['expires_at'] === null ? null : (int) $row['expires_at']];
     }
 
     /**
@@ -590,7 +604,7 @@ final class Ledger
     /**
      * Reserves credits for one request: the prompt bound at the input rate plus max_tokens at the
      * output rate. max_tokens is clamped so the reservation never exceeds the balance. Refusals, in
-     * order: disabled key, concurrency, requests per minute, credits per minute, the server's requests per
+     * order: disabled key, expired key (checked again here: it may have expired since authentication), concurrency, requests per minute, credits per minute, the server's requests per
      * minute, balance, the spend caps.
      * A spend cap holds the request's upper-bound upstream cost (its prompt bound and max_tokens at $costRates) against
      * the window's settled cost plus the bounds of the requests still running that started in it; a request that does
@@ -606,12 +620,15 @@ final class Ledger
     {
         return $this->tx(function () use ($keyId, $promptBound, $requestedMax, $cap, $rates, $defaults, $leaseSeconds, $source, $caps, $costRates): array {
             $now = time();
-            $st = $this->db->prepare('SELECT balance, active, ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
+            $st = $this->db->prepare('SELECT balance, active, expires_at, ' . implode(', ', self::LIMITS) . ' FROM keys WHERE id = ?');
             $st->execute([$keyId]);
             $k = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($k === false || !(int) $k['active']) {
                 throw new HttpError(403, 'key is disabled', 'permission_error', code: 'key_disabled');
+            }
+            if ($k['expires_at'] !== null && (int) $k['expires_at'] <= $now) {
+                throw new HttpError(403, 'key has expired', 'permission_error', code: 'key_expired');
             }
             $limits = self::effectiveLimits(self::overrides($k), $defaults);
 

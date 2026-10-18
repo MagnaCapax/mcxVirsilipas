@@ -20,7 +20,7 @@ final class Admin
         $b = $this->body();
         $ref = self::ref($b);
         $key = $this->ledger->createKey($ref);
-        Log::write('info', 'key_create', ['ref' => $ref]);
+        Log::write('info', 'key_create', ['ref' => $ref, 'expires_at' => null, 'named' => false]); // the admin route makes plain keys only
         Http::json(201, ['ref' => $ref, 'key' => $key]);
     }
 

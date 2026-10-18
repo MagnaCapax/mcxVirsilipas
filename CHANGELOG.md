@@ -2,6 +2,17 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.13.0 (2026-10-18)
+
+Schema 10 to 11: `keys` gains `expires_at` (NULL: never). `init` upgrades a schema-2 to 10 ledger in place; existing keys get NULL and never expire. An older release's `init` refuses a schema-11 ledger.
+
+- **Keys can expire.** `bin/virsilipas key-create <ref> --expires=<when>`, where `<when>` is `+N` followed by `m`, `h` or `d` (N from 1 to 999999) or a UTC time `YYYY-MM-DDTHH:MM:SSZ`, in the future. From then on every client route answers 403 `key_expired` (`permission_error`); the check runs at authentication and again inside the reservation, so a request authenticated just before the expiry is refused when it reserves after it. A request already running finishes.
+- **Named keys.** `key-create <ref> --named` makes `vsk-<ref>-<48 hex>`, the same random part as a plain key with the ref in front; the ref must be 1 to 64 of `A-Z a-z 0-9 _ -`, else 400 and nothing is created.
+- **`key-create --json`** prints `{"ref", "key", "expires_at", "named"}`; without it the bare key is printed, as before. An unknown or repeated option, or a second argument, is refused.
+- `key-rotate` keeps the expiry and always gives a plain key. `keys` and `status` show `expires_at`. `POST /admin/keys` is unchanged (plain keys that never expire); its `key_create` log record gains `expires_at` and `named`.
+- The secret guard's key pattern is now `vsk-[A-Za-z0-9_-]{16,}`, so a named key committed to the tree is caught.
+- **docs/adr/0024:** keys can expire and carry their ref. **README:** CLI, Troubleshooting. **docs/API.md:** `key_expired`.
+
 ## v0.12.1 (2026-10-18)
 
 No schema change.

@@ -132,7 +132,7 @@ function testMigrateUpgradesASchemaFourLedger(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(10, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same([0, 0, 0, 'u'], array_values($db->query('SELECT k.bonus_pct, l.source, u.delay_ms, u.upstream FROM keys k, leases l, usage u')->fetch(\PDO::FETCH_NUM)),
         'old rows get the defaults and keep their values');
     same([], $l->verify()['problems'], 'balances untouched');
