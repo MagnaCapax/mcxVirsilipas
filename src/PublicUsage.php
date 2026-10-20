@@ -18,7 +18,9 @@ final class PublicUsage
     private const DAYS = 30;
     private const TOP = 5;
     private const TOKENS = ['prompt_tokens', 'cached_tokens', 'completion_tokens', 'reasoning_tokens'];
-    private const COUNTS = ['credits', 'requests', 'failed', 'retried', ...self::TOKENS];
+    private const COUNTS = ['credits', 'requests', 'failed', 'retried', ...self::TOKENS, 'gen_tokens', 'gen_ms'];
+    /** Generation time below this (ms) gives no speed: too little to measure. */
+    private const SPEED_MIN_MS = 60000;
 
     /**
      * @param list<array<string, mixed>> $rows `stats('hour', ['key', 'model'], since, until)` rows
@@ -152,7 +154,8 @@ final class PublicUsage
                 + array_intersect_key($v, array_flip(self::TOKENS))
                 + ['credit_share' => self::share($v['credits'], $total['credits']) ?? 0.0,
                    'request_share' => self::share($v['requests'], $total['requests']) ?? 0.0,
-                   'mean_first_byte_ms' => $s['mean_first_byte_ms']];
+                   'mean_first_byte_ms' => $s['mean_first_byte_ms'],
+                   'generation_tokens_per_second' => $v['gen_ms'] >= self::SPEED_MIN_MS ? round($v['gen_tokens'] * 1000 / $v['gen_ms'], 1) : null];
         }
         usort($list, [self::class, 'byCredits']);
         return $list;

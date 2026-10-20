@@ -9,7 +9,8 @@ function puRow(string $bucket, string $key, string $model, int $credits, int $re
 {
     return $extra + ['bucket' => $bucket, 'key' => $key, 'model' => $model, 'credits' => $credits, 'requests' => $requests,
         'prompt_tokens' => 10 * $requests, 'cached_tokens' => 2 * $requests, 'completion_tokens' => 5 * $requests,
-        'reasoning_tokens' => $requests, 'failed' => 0, 'retried' => 0, 'mean_first_byte_ms' => 400, 'upstream_cost' => 999];
+        'reasoning_tokens' => $requests, 'failed' => 0, 'retried' => 0, 'mean_first_byte_ms' => 400, 'upstream_cost' => 999,
+        'gen_tokens' => 0, 'gen_ms' => 0];
 }
 
 function puNow(): int
@@ -140,4 +141,16 @@ function testPublicUsageCliPrintsAndWritesAWorldReadableFile(): void
     same(2, json_decode((string) file_get_contents("$dir/usage.json"), true)['schema_version'] ?? null);
     [$code, ] = $run('public-usage');
     same(1, $code, 'no prefix: refused');
+}
+
+function testPublicUsageGenerationSpeedIsTokenWeightedAndNeedsAMinuteOfMeasuredTime(): void
+{
+    $rows = [
+        puRow('2026-10-17T05', 'cust-1', 'fast', 100, 10, ['gen_tokens' => 2000, 'gen_ms' => 20000]),
+        puRow('2026-10-17T06', 'cust-2', 'fast', 100, 10, ['gen_tokens' => 4000, 'gen_ms' => 40000]),
+        puRow('2026-10-17T07', 'cust-1', 'short', 50, 2, ['gen_tokens' => 900, 'gen_ms' => 59999]),
+        puRow('2026-10-17T08', 'cust-1', 'none', 10, 1),
+    ];
+    $speed = array_column(PublicUsage::build($rows, puNow(), 'cust-')['models_30d'], 'generation_tokens_per_second', 'model');
+    same(['fast' => 100.0, 'short' => null, 'none' => null], $speed, 'summed over hours: 6000 tokens in 60 s; under a minute of measured time: none');
 }

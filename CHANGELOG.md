@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.14.0 (2026-10-20)
+
+No schema change.
+
+- **Generation speed per model in the public usage: `generation_tokens_per_second` in `models_30d`.** Output tokens per second while an answer streams: the output tokens (reasoning included) of the streamed 2xx answers that finished on their own with counted usage, over the time from their first byte to their end, summed over the 30 days (token-weighted, not a mean of per-request rates). Answers that were not streamed are left out (their first byte is the whole answer), and so are hang-ups and estimated charges (an estimate is an upper bound, not a count). `null` with less than one minute of measured time. `schema_version` stays 2: the field is added, nothing else changes. Not the same number as `top`'s output tokens/s, which is the traffic rate (output tokens per second of the window).
+- **`Ledger::stats()` rows carry `gen_tokens` and `gen_ms`**, the two sums behind it, so they add up across buckets.
+- Tests: which rows count (streamed, 2xx, not aborted, not estimated, first byte known and before the end), the token weighting across hours, and the one-minute floor.
+
 ## v0.13.1 (2026-10-20)
 
 No schema change.

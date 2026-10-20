@@ -415,7 +415,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l->migrate(); // re-running init adds nothing
     same(1, (int) $db->query('SELECT COUNT(*) FROM usage')->fetchColumn());
     same([['bucket' => '1970-01-02', 'model' => 'm', 'requests' => 1, 'prompt_tokens' => 7, 'cached_tokens' => 2, 'completion_tokens' => 3, 'reasoning_tokens' => 0,
-        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'computed_cost_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0, 'delayed' => 0, 'mean_delay_ms' => 0, 'mean_first_byte_ms' => null, 'retried' => 0]], $l->stats('day', ['model']));
+        'credits' => 10, 'upstream_cost' => null, 'costed_requests' => 0, 'computed_cost_requests' => 0, 'aborted' => 0, 'estimated' => 0, 'failed' => 0, 'mean_duration_ms' => 0, 'delayed' => 0, 'mean_delay_ms' => 0, 'mean_first_byte_ms' => null, 'retried' => 0, 'gen_tokens' => 0, 'gen_ms' => 0]], $l->stats('day', ['model']));
 }
 
 function testStatsGroupsUsageByTimeAndDimension(): void
@@ -488,4 +488,26 @@ function testAMissingLedgerDirectoryIsNamed(): void
     $path = tempDir() . '/nowhere/ledger.sqlite';
     $msg = throwsRuntime(fn () => new Ledger($path));
     check(str_contains($msg, 'does not exist') && str_contains($msg, $path), $msg);
+}
+
+function testStatsGenerationSumsCountOnlyStreamedAnswersThatFinishedWithCountedUsage(): void
+{
+    [$l, $id] = ledgerWithHandle(100000);
+    $rows = [ // stream, status, completion, duration, first byte, aborted, estimated: only the first two count
+        [true, 200, 100, 3000, 1000, false, false],   // 100 tokens in 2000 ms
+        [true, 200, 50, 1500, 500, false, false],     // 50 tokens in 1000 ms
+        [false, 200, 400, 2000, 1990, false, false],  // not streamed: the first byte is the whole answer
+        [true, 200, 300, 5000, 1000, true, false],    // hung up: cut short
+        [true, 200, 900, 2000, 1000, false, true],    // estimated: an upper bound, not a count
+        [true, 502, 0, 800, 100, false, false],       // failed
+        [true, 200, 70, 900, null, false, false],     // no first byte recorded
+        [true, 200, 60, 1000, 1000, false, false],    // no time after the first byte
+    ];
+    foreach ($rows as [$stream, $status, $out, $ms, $fb, $ab, $est]) {
+        $lease = $l->reserve($id, 300, 1000, 1000, unitRates(), lim(10), 60)['lease_id'];
+        $l->settle($lease, $id, 10 + $out, ['model' => 'm', 'prompt' => 10, 'completion' => $out, 'cached' => 0, 'status' => $status, 'aborted' => $ab,
+            'estimated' => $est, 'stream' => $stream, 'duration_ms' => $ms, 'first_byte_ms' => $fb]);
+    }
+    $all = $l->stats('all')[0];
+    same([150, 3000], [$all['gen_tokens'], $all['gen_ms']], 'generation sums: 100+50 tokens over 2000+1000 ms');
 }

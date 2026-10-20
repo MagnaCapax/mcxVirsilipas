@@ -791,7 +791,9 @@ final class Ledger
      * Usage over time, from the usage rows: one row per time bucket (UTC hour, day or month, or 'all') and
      * per value of each grouping asked for (model alias, upstream, key ref, upstream HTTP status), oldest
      * first, with request counts, token sums, credits charged, the upstream's reported cost (and how many
-     * requests carried one), hang-ups, estimated charges, failed requests and the mean duration.
+     * requests carried one), hang-ups, estimated charges, failed requests and the mean duration, and the generation
+     * sums of the streamed answers that finished on their own with counted usage: their output tokens (gen_tokens) and
+     * the time from first byte to the end (gen_ms). Summable across buckets; their ratio is the generation speed.
      * With $keyId, only that key's rows are counted (a customer's own usage).
      * @param list<string> $groups any of model, upstream, key, status
      * @return list<array<string, int|string|null>>
@@ -819,7 +821,9 @@ final class Ledger
                 COUNT(u.upstream_cost) AS costed_requests, SUM(u.cost_computed) AS computed_cost_requests, SUM(u.aborted) AS aborted, SUM(u.estimated) AS estimated,
                 SUM(u.http_status NOT BETWEEN 200 AND 299) AS failed, CAST(AVG(u.duration_ms) AS INTEGER) AS mean_duration_ms,
                 SUM(u.delay_ms > 0) AS delayed, CAST(AVG(u.delay_ms) AS INTEGER) AS mean_delay_ms,
-                CAST(AVG(u.first_byte_ms) AS INTEGER) AS mean_first_byte_ms, SUM(u.attempts > 1) AS retried
+                CAST(AVG(u.first_byte_ms) AS INTEGER) AS mean_first_byte_ms, SUM(u.attempts > 1) AS retried,
+                SUM(CASE WHEN u.stream = 1 AND u.http_status BETWEEN 200 AND 299 AND u.aborted = 0 AND u.estimated = 0 AND u.first_byte_ms IS NOT NULL AND u.duration_ms > u.first_byte_ms THEN u.completion_tokens ELSE 0 END) AS gen_tokens,
+                SUM(CASE WHEN u.stream = 1 AND u.http_status BETWEEN 200 AND 299 AND u.aborted = 0 AND u.estimated = 0 AND u.first_byte_ms IS NOT NULL AND u.duration_ms > u.first_byte_ms THEN u.duration_ms - u.first_byte_ms ELSE 0 END) AS gen_ms
             FROM usage u JOIN keys k ON k.id = u.key_id WHERE u.ts >= ? AND u.ts < ?" . ($keyId === null ? '' : ' AND u.key_id = ?') . " GROUP BY $group ORDER BY $group");
         $st->execute($keyId === null ? [$since ?? 0, $until ?? PHP_INT_MAX] : [$since ?? 0, $until ?? PHP_INT_MAX, $keyId]);
         $rows = [];
