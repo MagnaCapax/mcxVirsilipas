@@ -18,7 +18,7 @@ Content-Type: application/json
 {
   "email":       "address of the account owner, or of a user of the account who may open tickets",
   "subject":     "one line, 1-200 characters",
-  "message":     "1-20000 characters of text",
+  "message":     "1-20000 characters of text, about 40 KB at most once HTML-encoded",
   "priority":    "Low | Medium | High",            (optional, default Medium)
   "service":     "the service number or the service username",   (optional)
   "attachments": [ {"name": "log.txt", "data": "<base64>"} ]      (optional)
@@ -49,9 +49,11 @@ Content-Type: application/json
 
 ## Limits
 
-- 10 refused attempts per hour per source address (an IPv6 /64 counts as one source).
-- 10 refused attempts per hour per account, however many addresses they come from.
+- 100 refused attempts per hour per source address (an IPv6 /64 counts as one source; set high because many
+  customers can share one server address).
+- 10 attempts per hour per account with a valid key, refused or not, however many addresses they come from.
 - 5 tickets per hour and 20 per day per account.
+- Limits are counted before the request is acted on, so parallel requests cannot slip past them.
 
 ## What the ticket shows
 
