@@ -153,4 +153,6 @@ function testPublicUsageGenerationSpeedIsTokenWeightedAndNeedsAMinuteOfMeasuredT
     ];
     $speed = array_column(PublicUsage::build($rows, puNow(), 'cust-')['models_30d'], 'generation_tokens_per_second', 'model');
     same(['fast' => 100.0, 'short' => null, 'none' => null], $speed, 'summed over hours: 6000 tokens in 60 s; under a minute of measured time: none');
+    $fast = PublicUsage::build($rows, puNow(), 'cust-')['models_30d'][0];
+    same([6000, 60000], [$fast['gen_tokens'], $fast['gen_ms']], 'the sums are published, so a reader can pool aliases');
 }

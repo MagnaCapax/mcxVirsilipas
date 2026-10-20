@@ -155,7 +155,8 @@ final class PublicUsage
                 + ['credit_share' => self::share($v['credits'], $total['credits']) ?? 0.0,
                    'request_share' => self::share($v['requests'], $total['requests']) ?? 0.0,
                    'mean_first_byte_ms' => $s['mean_first_byte_ms'],
-                   'generation_tokens_per_second' => $v['gen_ms'] >= self::SPEED_MIN_MS ? round($v['gen_tokens'] * 1000 / $v['gen_ms'], 1) : null];
+                   'generation_tokens_per_second' => $v['gen_ms'] >= self::SPEED_MIN_MS ? round($v['gen_tokens'] * 1000 / $v['gen_ms'], 1) : null,
+                   'gen_tokens' => $v['gen_tokens'], 'gen_ms' => $v['gen_ms']];
         }
         usort($list, [self::class, 'byCredits']);
         return $list;
