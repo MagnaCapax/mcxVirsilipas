@@ -50,6 +50,7 @@ KISS, DRY, YAGNI. Delete first: question the requirement, delete the part, simpl
 | [0022](docs/adr/0022-architecture-layout-and-languages.md) | Architecture, layout and languages |
 | [0023](docs/adr/0023-public-aggregate-usage.md) | Public aggregate usage is an operator command, never a route |
 | [0024](docs/adr/0024-keys-can-expire-and-carry-their-ref.md) | Keys can expire and carry their ref |
+| [0025](docs/adr/0025-support-tickets-are-opened-by-the-billing-integration.md) | Support tickets with a key are opened by the billing integration, not the proxy |
 
 ## Invariants the tests protect
 

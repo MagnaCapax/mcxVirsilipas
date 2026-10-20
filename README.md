@@ -26,6 +26,7 @@ A small PHP proxy that gives every API key a prepaid credit balance and meters e
 | Run it for real users | [Install](#install), [Configuration](#configuration-the-minimum-then-what-to-add), [php-fpm and nginx](#php-fpm-and-nginx), [Access control](#access-control), [Backups](#backups) |
 | Understand what a request costs and what stops spending | [Credits](#credits), [How metering works](#how-metering-works), [Cost and rate controls at a glance](#cost-and-rate-controls-at-a-glance) |
 | Upgrade a running copy | [Releasing and upgrading](#releasing-and-upgrading) |
+| Open a support ticket with a key (served by the billing integration) | [docs/SUPPORT-TICKETS.md](docs/SUPPORT-TICKETS.md) |
 | See why it is built this way | [docs/adr/](docs/adr/) |
 
 ## Quick start: five minutes on your own machine
