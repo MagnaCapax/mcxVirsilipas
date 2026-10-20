@@ -286,3 +286,16 @@ function testGeminiRequestTranslation(): void
             '/v1beta/models/ok:embedContent' => '/v1beta/models/ok:embedContent', '/v1/models/ok:generateContent' => '/v1/models/ok:generateContent',
             '/v1beta/models/x/y:generateContent' => '/v1beta/models/x/y:generateContent']));
 }
+
+function testGeminiEmptySchemasThroughTheDecoderStayObjects(): void
+{
+    // The request decoder keeps an empty JSON object as an object; a function with no parameters and an empty
+    // response schema must still be translated, as {} and never dropped or sent as [].
+    $raw = '{"contents":[{"parts":[{"text":"hi"}]}],"tools":[{"functionDeclarations":[{"name":"f","parametersJsonSchema":{}},'
+        . '{"name":"g","parameters":{"type":"OBJECT","properties":{}}}]}],"generationConfig":{"responseMimeType":"application/json","responseJsonSchema":{}}}';
+    [$chat] = Gemini::request(MagnaCapax\Virsilipas\Http::decode($raw));
+    $out = json_encode($chat);
+    check(str_contains($out, '{"type":"function","function":{"name":"f","parameters":{}}}'), 'empty parameters kept as {}: ' . $out);
+    check(str_contains($out, '"parameters":{"type":"object","properties":{}}'), 'nested empty properties kept as {}');
+    check(str_contains($out, '"schema":{}'), 'empty response schema kept as {}');
+}

@@ -243,3 +243,16 @@ function testPromptBoundAndEncodeRefuseWhatJsonCannotCarry(): void
     }
     same('{"a":"/é"}', Proxy::encode(['a' => '/é']));
 }
+
+function testEmptyObjectsSurviveTheRoundTrip(): void
+{
+    // A tool schema with no parameters is {} in JSON. Decoded as an associative array it became [] and was forwarded
+    // as "properties":[]; an upstream that validates the schema rejects the whole request (lost turns on failover).
+    $raw = '{"model":"alias","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f",'
+        . '"parameters":{"type":"object","properties":{},"additionalProperties":{},"items":{"enum":[]}}}}]}';
+    $out = Proxy::encode(Proxy::rewrite(MagnaCapax\Virsilipas\Http::decode($raw), 'upstream/model', 10, false, []));
+    check(str_contains($out, '"properties":{}'), 'empty properties stays an object: ' . $out);
+    check(str_contains($out, '"additionalProperties":{}'), 'empty additionalProperties stays an object');
+    check(str_contains($out, '"enum":[]'), 'an empty list stays a list');
+    check(str_contains($out, '"model":"upstream/model"'), 'the rest of the request is rewritten as before');
+}

@@ -10,7 +10,8 @@ while (ob_get_level() > 0) {
     ob_end_flush(); // php.ini output_buffering would otherwise hold the whole stream until the end
 }
 
-$req = json_decode((string) file_get_contents('php://input'), true) ?: [];
+$raw = (string) file_get_contents('php://input');
+$req = json_decode($raw, true) ?: [];
 $dir = getenv('FAKE_UPSTREAM_DIR') ?: sys_get_temp_dir();
 // Only the fields the tests assert on; never the messages.
 $seen = array_intersect_key($req, array_flip(['model', 'n', 'best_of', 'store', 'modalities', 'stream', 'stream_options', 'max_tokens', 'reasoning_effort', 'chat_template_kwargs']));
@@ -29,6 +30,9 @@ $seen['anthropic_beta'] = (string) ($_SERVER['HTTP_ANTHROPIC_BETA'] ?? '');
 $seen['message_shape'] = array_map(static fn ($m): array => [$m['role'] ?? null, array_column($m['tool_calls'] ?? [], 'id'), $m['tool_call_id'] ?? null],
     is_array($req['messages'] ?? null) ? $req['messages'] : []);
 $seen['tool_names'] = array_map(static fn ($t): ?string => $t['function']['name'] ?? null, is_array($req['tools'] ?? null) ? $req['tools'] : []);
+// The tools exactly as they arrived, decoded without turning {} into [] (an assoc decode here would hide the bug it checks).
+$tools = json_decode($raw);
+$seen['tools_json'] = json_encode($tools instanceof stdClass ? ($tools->tools ?? null) : null);
 file_put_contents($dir . '/last-request.json', json_encode($seen));
 // Every request in order, for the retry and failover tests.
 file_put_contents($dir . '/requests.jsonl', json_encode($seen) . "\n", FILE_APPEND | LOCK_EX);

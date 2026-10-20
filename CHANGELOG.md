@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.13.1 (2026-10-20)
+
+No schema change.
+
+- **An empty JSON object in a request is forwarded as `{}`.** Requests were decoded into arrays, so `{}` became `[]` on the way upstream: a tool with no parameters (`"properties": {}`), an empty `items` or `additionalProperties`, or a tool call with no arguments (`"input": {}` on `/v1/messages`) reached the upstream as `[]`, and an upstream that validates the schema refused the whole request with 400. It hit every request of a tools-using client that reached such an upstream, failover included. `Http::decode` now keeps empty objects as objects; the Gemini routes accept them for function parameters and response schemas.
+- **AGENTS.md invariant 7:** forwarded JSON keeps its types.
+- Tests: the request round trip on chat, `/v1/messages` and Gemini, and an end-to-end test whose fake upstream records the tools as they arrived (it decoded them the same lossy way before, so it could not see this).
+
 ## v0.13.0 (2026-10-18)
 
 Schema 10 to 11: `keys` gains `expires_at` (NULL: never). `init` upgrades a schema-2 to 10 ledger in place; existing keys get NULL and never expire. An older release's `init` refuses a schema-11 ledger.

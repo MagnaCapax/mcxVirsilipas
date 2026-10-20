@@ -753,3 +753,13 @@ function testIntegrationReasoningUnderTheNameReasoningIsAnAnswerRelayedAndCounte
     $u = lastUsage($ref);
     same([1, 0, 21, 10], [$u['aborted'], $u['estimated'], $u['charged'], $u['completion_tokens']], 'aborted, exact, the final report');
 }
+
+function testIntegrationEmptyToolSchemaArrivesAsObject(): void
+{
+    [, $key] = fundedKey(10000);
+    $tools = [['type' => 'function', 'function' => ['name' => 'f', 'parameters' => ['type' => 'object', 'properties' => new stdClass()]]]];
+    $r = http('POST', '/v1/chat/completions', msg('ok', false, ['tools' => $tools]), $key);
+    same(200, $r['status']);
+    $up = json_decode((string) file_get_contents(Harness::get()['dir'] . '/last-request.json'), true);
+    check(str_contains($up['tools_json'], '"properties":{}'), 'the upstream receives {} as sent: ' . $up['tools_json']);
+}

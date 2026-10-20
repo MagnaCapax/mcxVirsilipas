@@ -62,8 +62,8 @@ final class Gemini
         }
         if (($g['responseMimeType'] ?? null) === 'application/json') {
             $schema = $g['responseJsonSchema'] ?? $g['responseSchema'] ?? null;
-            $chat['response_format'] = is_array($schema)
-                ? ['type' => 'json_schema', 'json_schema' => ['name' => 'response', 'schema' => self::schema($schema)]] : ['type' => 'json_object'];
+            $chat['response_format'] = is_array($schema) || $schema instanceof \stdClass // {} arrives as an empty object
+                ? ['type' => 'json_schema', 'json_schema' => ['name' => 'response', 'schema' => self::schema((array) $schema)]] : ['type' => 'json_object'];
         }
         $max = $g['maxOutputTokens'] ?? null;
         if ($max !== null && (!is_int($max) || $max < 1)) {
@@ -177,7 +177,7 @@ final class Gemini
                 $schema = $d['parametersJsonSchema'] ?? $d['parameters'] ?? null;
                 $out[] = ['type' => 'function', 'function' => ['name' => $d['name']]
                     + (is_string($d['description'] ?? null) ? ['description' => $d['description']] : [])
-                    + (is_array($schema) ? ['parameters' => self::schema($schema)] : [])];
+                    + (is_array($schema) || $schema instanceof \stdClass ? ['parameters' => self::schema((array) $schema)] : [])];
             }
         }
         return $out;

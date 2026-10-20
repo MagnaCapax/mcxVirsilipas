@@ -64,8 +64,11 @@ final class Http
         if ($raw === false || strlen($raw) > $maxBytes) {
             throw new HttpError(413, 'request body too large', code: 'request_too_large');
         }
-        $body = json_decode($raw, true);
-        // A JSON array decodes to a PHP list too; only an object is a request ({} decodes to []).
+        $body = self::decode($raw);
+        if ($body instanceof \stdClass) {
+            $body = []; // an empty request object: refused below like any request missing its fields
+        }
+        // A JSON array decodes to a PHP list too; only an object is a request.
         if (!is_array($body) || ($body !== [] && array_is_list($body))) {
             throw new HttpError(400, 'request body must be a JSON object', code: 'invalid_json');
         }
@@ -75,5 +78,24 @@ final class Http
             throw new HttpError(400, 'request body has a number out of range', code: 'invalid_json');
         }
         return $body;
+    }
+
+    /**
+     * JSON as arrays, except that an empty object stays an object, so it is forwarded as {} and not as [] (an upstream
+     * that validates a tool schema rejects "properties":[]). Non-empty objects become arrays, so the rest of the code
+     * reads them as before. Null when the text is not JSON.
+     */
+    public static function decode(string $raw): mixed
+    {
+        return self::objectsToArrays(json_decode($raw));
+    }
+
+    private static function objectsToArrays(mixed $v): mixed
+    {
+        if ($v instanceof \stdClass) {
+            $vars = get_object_vars($v);
+            return $vars === [] ? $v : array_map(self::objectsToArrays(...), $vars);
+        }
+        return is_array($v) ? array_map(self::objectsToArrays(...), $v) : $v;
     }
 }

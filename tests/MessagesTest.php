@@ -240,3 +240,14 @@ function testMessagesConfigValidatesMessagesUrl(): void
         }
     }
 }
+
+function testMessagesEmptyObjectsSurviveTheRoundTrip(): void
+{
+    // A tool with no parameters and a tool call with no arguments carry {}; forwarded as [] an upstream rejects them.
+    $raw = '{"model":"a","max_tokens":10,"tools":[{"name":"f","input_schema":{"type":"object","properties":{}}}],"messages":['
+        . '{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},'
+        . '{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}';
+    $out = MagnaCapax\Virsilipas\Proxy::encode(Messages::rewrite(Messages::fields(MagnaCapax\Virsilipas\Http::decode($raw)), 'up', 10, false));
+    check(str_contains($out, '"input_schema":{"type":"object","properties":{}}'), 'empty tool schema properties kept as {}: ' . $out);
+    check(str_contains($out, '"input":{}'), 'empty tool call input kept as {}');
+}
