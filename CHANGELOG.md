@@ -2,6 +2,15 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.15.0 (2026-10-21)
+
+No schema change.
+
+- **Models per window in the public usage: `models_24h` and `models_7d`**, in the same shape as `models_30d` (credits, requests, tokens, shares of that window, first byte, generation speed and its sums), so a page can show the model mix for each window. `schema_version` stays 2: the fields are added, nothing else changes.
+- **`bin/virsilipas public-top <ref-prefix> [file]`: a public top list under anonymous ids ([ADR 0026](docs/adr/0026-public-top-list-under-anonymous-ids.md)).** For the last 24 hours, 7 and 30 days, the 10 keys with the most credits used, each as `rank`, `id`, `credits`, `requests` and `credit_share`. The id is SHA-256 applied 1000 times, first to `<ref>:<sha256 hex of the key>`, then to the previous hex digest, so a key's owner can compute their own and nobody else can tell whose it is. No ref, key digest or model is published; a removed key is not listed. A list shorter than 10 shows how many keys used credits in that window.
+- `Ledger::keyHashes($prefix)`: the current key digest per ref, removed keys left out. The `public-usage` file write is shared with `public-top`.
+- Tests: the id against the published shell recipe run with coreutils `sha256sum`, ranking and windows, the ten-entry cut, removed keys, the leak guard, the CLI; the per-window model lists.
+
 ## v0.14.0 (2026-10-20)
 
 No schema change.

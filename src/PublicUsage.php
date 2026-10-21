@@ -34,7 +34,7 @@ final class PublicUsage
         $asOf = intdiv($now, 3600) * 3600;
         $firstDay = intdiv($asOf - 1, 86400) * 86400 - (self::DAYS - 1) * 86400;
         $win = array_fill_keys(array_keys(self::WINDOWS), ['fb_weighted' => 0, 'fb_requests' => 0] + array_fill_keys(self::COUNTS, 0));
-        $models = [];
+        $models = array_fill_keys(array_keys(self::WINDOWS), []);
         $days = [];
         $hours = [];
         $heat = [];
@@ -56,10 +56,10 @@ final class PublicUsage
             foreach (self::WINDOWS as $name => $n) {
                 if ($start >= $asOf - $n * 3600) {
                     self::add($win[$name], $r, self::COUNTS, $fb);
+                    self::add($models[$name][$model], $r, self::COUNTS, $fb);
                 }
             }
             if ($start >= $asOf - self::WINDOWS['30d'] * 3600) {
-                self::add($models[$model], $r, self::COUNTS, $fb);
                 $cell = gmdate('N', $start) . '-' . gmdate('G', $start);   // ISO weekday 1-7, hour 0-23
                 self::add($heat[$cell], $r, ['credits', 'requests']);
             }
@@ -79,9 +79,11 @@ final class PublicUsage
             'as_of' => gmdate('c', $asOf),
             'unit' => 'credits',
             'windows' => array_map(static fn (array $w): array => self::summary($w), $win),
-            'models_30d' => self::modelList($models, $win['30d']),
+            'models_30d' => self::modelList($models['30d'], $win['30d']),
+            'models_7d' => self::modelList($models['7d'], $win['7d']),
+            'models_24h' => self::modelList($models['24h'], $win['24h']),
             'daily' => self::daily($days, $asOf),
-            'hourly_7d' => self::hourly($hours, $models, $asOf),
+            'hourly_7d' => self::hourly($hours, $models['30d'], $asOf),
             'heatmap_30d' => self::heatmap($heat),
         ];
     }

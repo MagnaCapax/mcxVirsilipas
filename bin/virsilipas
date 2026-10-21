@@ -50,6 +50,10 @@ Usage: virsilipas <command> [args]
                                     for publishing (ADR 0023): windows, models, daily, hourly, heatmap;
                                     no ref, count, upstream, cost or grant. With file: written
                                     atomically, mode 0644
+  public-top <ref-prefix> [file]    the 10 keys with the most credits used in the last 24 hours, 7 and
+                                    30 days, for publishing (ADR 0026): each as an anonymous id (sha256
+                                    1000 times over "<ref>:<sha256 of the key>"), credits, requests and
+                                    share; no ref or key digest. With file: written atomically, mode 0644
   keys                              list every key: ref, active, balance, group, bonus, created, last
                                     used, removed and expires (unix time), one JSON line each
   key-ref <sha256>                  the ref whose current key has this sha256 hex digest, or null
@@ -92,6 +96,7 @@ try {
         'keys' => implode("\n", array_map('json_encode', $ledger->keys())),
         'key-ref' => json_encode(['ref' => $ledger->refForKeyHash(arg($args, 0))]),
         'public-usage' => publicUsage($ledger, $args),
+        'public-top' => publicTop($ledger, $args),
         'top' => top($ledger, $config, $args),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
             ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
@@ -117,10 +122,30 @@ function publicUsage(Ledger $ledger, array $args): string
     $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
     $refs = array_column($ledger->keys(), 'ref');
     $json = \MagnaCapax\Virsilipas\PublicUsage::encode(\MagnaCapax\Virsilipas\PublicUsage::build($rows, $now, arg($args, 0)), $refs);
-    if (!isset($args[1])) {
+    return publish($json, $args[1] ?? null);
+}
+
+/**
+ * Build the public top list under anonymous ids (ADR 0026); print it, or write it atomically to a file anyone may read.
+ * @param list<string> $args
+ */
+function publicTop(Ledger $ledger, array $args): string
+{
+    $now = time();
+    $prefix = arg($args, 0);
+    $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
+    $hashes = $ledger->keyHashes($prefix);
+    $refs = array_column($ledger->keys(), 'ref');
+    $json = \MagnaCapax\Virsilipas\PublicTop::encode(\MagnaCapax\Virsilipas\PublicTop::build($rows, $hashes, $now, $prefix), $refs, $hashes);
+    return publish($json, $args[1] ?? null);
+}
+
+/** Print $json, or write it to $target through a temporary file and a rename, mode 0644 against the private umask. */
+function publish(string $json, ?string $target): string
+{
+    if ($target === null) {
         return rtrim($json, "\n");
     }
-    $target = $args[1];
     $tmp = $target . '.tmp-' . getmypid();
     if (file_put_contents($tmp, $json) !== strlen($json) || !chmod($tmp, 0644) || !rename($tmp, $target)) {
         @unlink($tmp);

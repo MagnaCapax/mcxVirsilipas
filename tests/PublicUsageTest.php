@@ -156,3 +156,13 @@ function testPublicUsageGenerationSpeedIsTokenWeightedAndNeedsAMinuteOfMeasuredT
     $fast = PublicUsage::build($rows, puNow(), 'cust-')['models_30d'][0];
     same([6000, 60000], [$fast['gen_tokens'], $fast['gen_ms']], 'the sums are published, so a reader can pool aliases');
 }
+
+function testPublicUsageListsModelsPerWindow(): void
+{
+    $f = PublicUsage::build(puRows(), puNow(), 'cust-');
+    same(['org/Model-1', 'default'], array_column($f['models_24h'], 'model'), '24h: only the models used in the last 24 complete hours');
+    same([3000, round(3000 / 4000, 4)], [$f['models_24h'][0]['credits'], $f['models_24h'][0]['credit_share']], 'shares of the same window');
+    same(['alt', 'org/Model-1', 'default', 'large'], array_column($f['models_7d'], 'model'));
+    same([100, 150], [$f['models_7d'][3]['credits'], $f['models_30d'][3]['credits']], 'large: 6 days back in 7d, plus 28 days back in 30d');
+    same([], PublicUsage::build([], puNow(), 'cust-')['models_24h'], 'no use: an empty list');
+}

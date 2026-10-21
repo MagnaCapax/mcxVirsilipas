@@ -532,6 +532,23 @@ final class Ledger
      *     overrides: array<string, ?int>, limits: array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int},
      *     window: array{requests: int, credits: int}, bonus_pct: int, key_group: string, expires_at: ?int}
      */
+    /**
+     * The current key digest of every key whose ref starts with $prefix, for the public top list (ADR 0026). A removed key
+     * has no digest left and is not returned. The digests never leave this process: PublicTop hashes them again.
+     *
+     * @return array<string, string> ref => sha256 hex of the current key
+     */
+    public function keyHashes(string $prefix): array
+    {
+        $st = $this->db->prepare("SELECT ref, key_hash FROM keys WHERE substr(ref, 1, length(?)) = ? AND key_hash NOT LIKE 'removed:%'");
+        $st->execute([$prefix, $prefix]);
+        $out = [];
+        foreach ($st->fetchAll(\PDO::FETCH_ASSOC) as $r) {
+            $out[(string) $r['ref']] = (string) $r['key_hash'];
+        }
+        return $out;
+    }
+
     public function status(string $ref, array $defaults): array
     {
         $now = time();

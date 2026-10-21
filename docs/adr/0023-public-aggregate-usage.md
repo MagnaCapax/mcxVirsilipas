@@ -24,5 +24,7 @@ A route was not chosen: a file costs nothing per reader and adds no surface to t
 - Model names are published as configured (aliases or upstream model names), so a deployment that wants them private names its aliases neutrally. Requests refused before a reservation (no credit, a limit, an unknown model) have no usage row and are not counted.
 - From now on: the public usage carries no ref, no count of keys, no upstream, no cost and no grant (tests/PublicUsageTest.php); ADR 0019 is unchanged, as no client endpoint reads another key.
 
+- v0.15.0 (2026-10-21): the models are also listed over the last 24 hours and 7 days (`models_24h`, `models_7d`, the same shape as `models_30d`). The top list of keys is a separate command and file under ADR 0026.
+
 ## References
 src/PublicUsage.php; bin/virsilipas (`public-usage`); tests/PublicUsageTest.php; ADR 0002, ADR 0014, ADR 0018 (metrics in the ledger), ADR 0019; README "CLI".
