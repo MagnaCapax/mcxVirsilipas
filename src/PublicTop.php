@@ -8,8 +8,9 @@ namespace MagnaCapax\Virsilipas;
  * PublicTop: the most active keys per window, published under an anonymous id (ADR 0026). Built from the same
  * `Ledger::stats('hour', ['key', 'model'])` rows as PublicUsage, over the keys whose ref starts with a deployment-chosen
  * prefix. Each key appears as `id` only: SHA-256 applied 1000 times, first to "<ref>:<sha256 of the key>", then each
- * time to the previous digest in lowercase hex. The holder of a key can compute their own id; nobody else can tell
- * whose id it is. The output carries no ref, no key digest, no upstream, no cost and no grant.
+ * time to the previous digest in lowercase hex. The holder of a key can compute their own id; without the key or its
+ * digest nobody can tell whose id it is (the deployment, which holds both, can). The output carries no ref, no key
+ * digest, no upstream, no cost and no grant.
  *
  * Windows end at `as_of`, the end of the last complete UTC hour, as in PublicUsage.
  */
