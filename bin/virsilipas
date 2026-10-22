@@ -119,7 +119,7 @@ try {
 function publicUsage(Ledger $ledger, array $args): string
 {
     $now = time();
-    $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
+    $rows = $ledger->stats('hour', ['key', 'model'], $now - 62 * 86400, null);   // 60 days: rolling_30d needs 30 days behind its first point
     $refs = array_column($ledger->keys(), 'ref');
     $json = \MagnaCapax\Virsilipas\PublicUsage::encode(\MagnaCapax\Virsilipas\PublicUsage::build($rows, $now, arg($args, 0)), $refs);
     return publish($json, $args[1] ?? null);
@@ -133,7 +133,7 @@ function publicTop(Ledger $ledger, array $args): string
 {
     $now = time();
     $prefix = arg($args, 0);
-    $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
+    $rows = $ledger->stats('hour', ['key', 'model'], $now - 62 * 86400, null);   // 60 days: rolling_30d needs 30 days behind its first point
     $hashes = $ledger->keyHashes($prefix);
     $refs = array_column($ledger->keys(), 'ref');
     $json = \MagnaCapax\Virsilipas\PublicTop::encode(\MagnaCapax\Virsilipas\PublicTop::build($rows, $hashes, $now, $prefix), $refs, $hashes);

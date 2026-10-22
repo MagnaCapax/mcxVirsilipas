@@ -2,6 +2,14 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.16.0 (2026-10-22)
+
+No schema change.
+
+- **Rolling sums and heatmaps per window in the public usage.** `rolling_24h` and `rolling_7d`: 168 hourly points over the last 7 days, each the credits of the 24 hours (or 7 days) up to and including its hour; `rolling_30d`: 30 daily points, each the credits of the 30 days up to and including it. Every point has its whole window behind it, so none is drawn low. `heatmap_24h` and `heatmap_7d` join `heatmap_30d` in the same shape. A page can now let its window choice change these views too. `schema_version` stays 2: the fields are added, nothing else changes.
+- `public-usage` and `public-top` read 62 days of hourly stats (was 32): the first 30-day point needs 30 days behind it.
+- Tests: the last rolling point equals its window total, each heatmap adds up to its window, point counts and hours, a row 38 days old counted in the first 30-day point only.
+
 ## v0.15.0 (2026-10-21)
 
 No schema change.

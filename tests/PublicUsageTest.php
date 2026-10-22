@@ -157,6 +157,25 @@ function testPublicUsageGenerationSpeedIsTokenWeightedAndNeedsAMinuteOfMeasuredT
     same([6000, 60000], [$fast['gen_tokens'], $fast['gen_ms']], 'the sums are published, so a reader can pool aliases');
 }
 
+function testPublicUsageRollingSumsAndHeatmapsFollowEachWindow(): void
+{
+    $f = PublicUsage::build(puRows(), puNow(), 'cust-');
+    same([168, 168, 30], [count($f['rolling_24h']), count($f['rolling_7d']), count($f['rolling_30d'])], 'hourly points over 7 days, daily over 30');
+    foreach (['24h', '7d', '30d'] as $w) {
+        $r = $f['rolling_' . $w];
+        same('2026-10-18T09', end($r)['hour'], "$w: the last point names the last complete hour");
+        same($f['windows'][$w]['credits'], end($r)['credits'], "$w: the last rolling point is the window's own total");
+        same($f['windows'][$w]['credits'], array_sum(array_column($f['heatmap_' . $w], 'credits')), "$w: the heatmap adds up to the window");
+        same(168, count($f['heatmap_' . $w]), "$w: a dense 7 x 24 heatmap");
+    }
+    same('2026-10-11T10', $f['rolling_7d'][0]['hour'], '7d points start 167 hours before the last');
+    same(['2026-09-19T09', 9], [$f['rolling_30d'][0]['hour'], $f['rolling_30d'][0]['credits']],
+        'the first 30-day point reaches back 30 more days: the row 38 days old counts there');
+    same(['2026-10-18T08', 7000 + 3000], [$f['rolling_24h'][166]['hour'], $f['rolling_24h'][166]['credits']],
+        'one hour earlier the 24 hours reach back to 2026-10-17T09 (alt) and stop before the 09:00 hour');
+    same([], array_filter(PublicUsage::build([], puNow(), 'cust-')['rolling_7d'], static fn (array $p): bool => $p['credits'] !== 0), 'no use: all zeros');
+}
+
 function testPublicUsageListsModelsPerWindow(): void
 {
     $f = PublicUsage::build(puRows(), puNow(), 'cust-');

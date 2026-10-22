@@ -37,7 +37,8 @@ final class PublicUsage
         $models = array_fill_keys(array_keys(self::WINDOWS), []);
         $days = [];
         $hours = [];
-        $heat = [];
+        $heat = array_fill_keys(array_keys(self::WINDOWS), []);
+        $credits = [];   // credits per hour start, the last 60 days: the rolling sums need a full window behind each point
         foreach ($rows as $r) {
             if (!str_starts_with((string) ($r['key'] ?? ''), $refPrefix)) {
                 continue;
@@ -53,15 +54,16 @@ final class PublicUsage
             }
             $fb = is_int($r['mean_first_byte_ms'] ?? null) ? $r['mean_first_byte_ms'] : null;
             $model = self::model((string) ($r['model'] ?? ''));
+            $cell = gmdate('N', $start) . '-' . gmdate('G', $start);   // ISO weekday 1-7, hour 0-23
             foreach (self::WINDOWS as $name => $n) {
                 if ($start >= $asOf - $n * 3600) {
                     self::add($win[$name], $r, self::COUNTS, $fb);
                     self::add($models[$name][$model], $r, self::COUNTS, $fb);
+                    self::add($heat[$name][$cell], $r, ['credits', 'requests']);
                 }
             }
-            if ($start >= $asOf - self::WINDOWS['30d'] * 3600) {
-                $cell = gmdate('N', $start) . '-' . gmdate('G', $start);   // ISO weekday 1-7, hour 0-23
-                self::add($heat[$cell], $r, ['credits', 'requests']);
+            if ($start >= $asOf - 2 * self::WINDOWS['30d'] * 3600) {
+                $credits[$start] = ($credits[$start] ?? 0) + $r['credits'];
             }
             if ($start >= $asOf - self::WINDOWS['7d'] * 3600) {
                 self::add($hours[$start], $r, ['credits', 'requests']);
@@ -84,8 +86,33 @@ final class PublicUsage
             'models_24h' => self::modelList($models['24h'], $win['24h']),
             'daily' => self::daily($days, $asOf),
             'hourly_7d' => self::hourly($hours, $models['30d'], $asOf),
-            'heatmap_30d' => self::heatmap($heat),
+            'heatmap_30d' => self::heatmap($heat['30d']),
+            'heatmap_7d' => self::heatmap($heat['7d']),
+            'heatmap_24h' => self::heatmap($heat['24h']),
+            'rolling_24h' => self::rolling($credits, $asOf, self::WINDOWS['24h'], 168, 1),
+            'rolling_7d' => self::rolling($credits, $asOf, self::WINDOWS['7d'], 168, 1),
+            'rolling_30d' => self::rolling($credits, $asOf, self::WINDOWS['30d'], 30, 24),
         ];
+    }
+
+    /**
+     * Rolling sums: $points values, $step hours apart, the last one ending at as_of; each is the credits of the
+     * $window hours up to and including its hour. "hour" names that last hour, as in hourly_7d.
+     */
+    private static function rolling(array $credits, int $asOf, int $window, int $points, int $step): array
+    {
+        $out = [];
+        for ($k = $points - 1; $k >= 0; $k--) {
+            $end = $asOf - $k * $step * 3600;
+            $sum = 0;
+            foreach ($credits as $t => $c) {
+                if ($t >= $end - $window * 3600 && $t < $end) {
+                    $sum += $c;
+                }
+            }
+            $out[] = ['hour' => gmdate('Y-m-d\TH', $end - 3600), 'credits' => $sum];
+        }
+        return $out;
     }
 
     /** JSON for publishing, refused when it carries any of the given refs (plain string checks, nothing to fail open). */
@@ -209,7 +236,7 @@ final class PublicUsage
         return $out;
     }
 
-    /** Credits and requests per ISO weekday (1 = Monday) and UTC hour over the last 30 days. */
+    /** Credits and requests per ISO weekday (1 = Monday) and UTC hour over one window (24 h, 7 d or 30 d). */
     private static function heatmap(array $heat): array
     {
         $out = [];

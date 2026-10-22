@@ -28,3 +28,4 @@ A route was not chosen: a file costs nothing per reader and adds no surface to t
 
 ## References
 src/PublicUsage.php; bin/virsilipas (`public-usage`); tests/PublicUsageTest.php; ADR 0002, ADR 0014, ADR 0018 (metrics in the ledger), ADR 0019; README "CLI".
+- v0.16.0 (2026-10-22): rolling sums per window (`rolling_24h`, `rolling_7d`, `rolling_30d`) and heatmaps for the last 24 hours and 7 days (`heatmap_24h`, `heatmap_7d`). Both are totals over the same customer keys, so the rules above are unchanged.
