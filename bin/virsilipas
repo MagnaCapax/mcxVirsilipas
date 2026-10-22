@@ -133,7 +133,7 @@ function publicTop(Ledger $ledger, array $args): string
 {
     $now = time();
     $prefix = arg($args, 0);
-    $rows = $ledger->stats('hour', ['key', 'model'], $now - 62 * 86400, null);   // 60 days: rolling_30d needs 30 days behind its first point
+    $rows = $ledger->stats('hour', ['key', 'model'], $now - 32 * 86400, null);
     $hashes = $ledger->keyHashes($prefix);
     $refs = array_column($ledger->keys(), 'ref');
     $json = \MagnaCapax\Virsilipas\PublicTop::encode(\MagnaCapax\Virsilipas\PublicTop::build($rows, $hashes, $now, $prefix), $refs, $hashes);

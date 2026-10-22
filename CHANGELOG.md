@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.16.1 (2026-10-22)
+
+No schema change.
+
+- `public-top` reads 32 days of hourly stats again. v0.16.0 widened it to 62 days with the reason of the rolling sums, but the top list has none and counts only its own windows, so the wider read changed nothing but its cost. `public-usage` keeps 62 days.
+- ADR 0023 says what the rolling series add up to: with `daily`, `rolling_30d` lets a reader work out the daily totals of 60 days, and with `hourly_7d`, `rolling_7d` the hourly totals of 14 days. They are totals over the same customer keys.
+
 ## v0.16.0 (2026-10-22)
 
 No schema change.
