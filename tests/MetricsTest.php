@@ -120,3 +120,40 @@ function testIntegrationAnUnusableAnswerIsFreeButItsUpstreamUsageIsRecorded(): v
         same([11, $completion, 100, 0, 200], [$u['prompt_tokens'], $u['completion_tokens'], $u['upstream_cost'], $u['charged'], $u['http_status']], "$model: the upstream's usage is kept");
     }
 }
+
+function testHealthBucketsPercentilesAndCounts(): void
+{
+    [$l, $id, $raw] = ledgerWithHandle(1000000);
+    $base = ['model' => 'm', 'cached' => 0, 'aborted' => false, 'estimated' => false, 'attempts' => 1, 'status' => 200, 'stream' => true];
+    $rows = [
+        // prompt, completion, first byte ms, duration ms, overrides
+        [500, 200, 1000, 3000, []],                                                     // lt1k stream, 100 tok/s
+        [500, 100, 3000, 5000, []],                                                     // lt1k stream, 50 tok/s
+        [500, 0, 2000, 2500, ['estimated' => true]],                                    // lt1k stream, answered, no speed
+        [5000, 10, 2000, 2000, ['stream' => false]],                                    // 1k-8k plain
+        [50000, 0, null, 600000, ['status' => 504]],                                    // stall: deadline, no first byte, failed
+        [200000, 5, 500, 900, ['aborted' => true, 'attempts' => 2]],                    // ge128k hung up, retried
+    ];
+    foreach ($rows as $i => [$prompt, $completion, $fb, $duration, $over]) {
+        $lease = $l->reserve($id, 10, 10, 1000, unitRates(), lim(10), 60)['lease_id'];
+        $used = $i === 0 ? 5000 : 5;                                                    // the first one is charged over its reservation
+        $l->settle($lease, $id, $used, $over + ['prompt' => $prompt, 'completion' => $completion, 'first_byte_ms' => $fb, 'duration_ms' => $duration] + $base);
+        $raw->prepare('UPDATE usage SET ts = ? WHERE lease_id = ?')->execute([86400 + $i, $lease]);
+    }
+    $h = $l->health(86400, 2 * 86400, 600);
+    same(['requests' => 6, 'failed' => 1, 'aborted' => 1, 'estimated' => 1, 'retried' => 1, 'over_reservation' => 1, 'deadline_hits' => 1, 'no_first_byte' => 1],
+        $h['counts'], 'counts over the window');
+    $by = [];
+    foreach ($h['buckets'] as $b) {
+        $by[$b['bucket'] . ($b['stream'] ? ':stream' : ':plain')] = $b;
+    }
+    same(['lt1k:stream', '1k-8k:plain', '32k-128k:stream', 'ge128k:stream'], array_keys($by), 'only buckets with requests, in bucket order');
+    same([3, 3, 2000, 3000, 50], [$by['lt1k:stream']['requests'], $by['lt1k:stream']['answered'], $by['lt1k:stream']['first_byte_p50_ms'],
+        $by['lt1k:stream']['first_byte_p95_ms'], $by['lt1k:stream']['tokens_per_second_p50']], 'nearest-rank p50/p95 and the median speed');
+    same([1, 0, null], [$by['32k-128k:stream']['requests'], $by['32k-128k:stream']['answered'], $by['32k-128k:stream']['first_byte_p95_ms']], 'a stall is counted, never timed');
+    same([1, null], [$by['1k-8k:plain']['answered'], $by['1k-8k:plain']['tokens_per_second_p50']], 'plain answers carry no generation speed');
+    same(0, $by['ge128k:stream']['answered'], 'a hung-up stream is not an answer');
+    same(0, $l->health(0, 86400, 600)['counts']['requests'], 'the window bounds the rows');
+    $json = json_encode($h);
+    same(false, str_contains($json, '"m"') || str_contains($json, 'ref'), 'no model, ref or key in the output');
+}

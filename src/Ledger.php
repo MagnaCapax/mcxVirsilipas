@@ -853,6 +853,78 @@ final class Ledger
         return $rows;
     }
 
+    /** health() prompt-size buckets: a request belongs to the first bucket whose bound its prompt tokens are below. */
+    public const HEALTH_BUCKETS = ['lt1k' => 1000, '1k-8k' => 8000, '8k-32k' => 32000, '32k-128k' => 128000, 'ge128k' => PHP_INT_MAX];
+
+    /**
+     * Request health over [since, until), for monitoring: per prompt-size bucket and stream mode the requests, how many
+     * were answered (2xx, not hung up), the first-byte p50 and p95 of those, and the median generation speed of the
+     * streamed ones; plus the counts of failures, hang-ups, estimated usage, retries, charges over the reservation,
+     * requests that ran to the deadline (within 5 s of the upstream timeout) and streamed requests that never got a
+     * first byte. Percentiles are nearest-rank. Metadata only (ADR 0014): no key, ref, model or content.
+     * @return array{counts: array<string, int>, buckets: list<array<string, int|string|bool|null>>}
+     */
+    public function health(int $since, int $until, int $timeoutSeconds): array
+    {
+        $st = $this->db->prepare('SELECT prompt_tokens, completion_tokens, stream, http_status, aborted, estimated, attempts,
+                over_reservation, duration_ms, first_byte_ms FROM usage WHERE ts >= ? AND ts < ?');
+        $st->execute([$since, $until]);
+        $deadlineMs = max(0, $timeoutSeconds * 1000 - 5000);
+        $counts = ['requests' => 0, 'failed' => 0, 'aborted' => 0, 'estimated' => 0, 'retried' => 0,
+            'over_reservation' => 0, 'deadline_hits' => 0, 'no_first_byte' => 0];
+        $groups = [];
+        while (($r = $st->fetch(\PDO::FETCH_ASSOC)) !== false) {
+            $ok = (int) $r['http_status'] >= 200 && (int) $r['http_status'] <= 299;
+            $stream = (int) $r['stream'] === 1;
+            $fb = $r['first_byte_ms'] === null ? null : (int) $r['first_byte_ms'];
+            $counts['requests']++;
+            $counts['failed'] += $ok ? 0 : 1;
+            $counts['aborted'] += (int) $r['aborted'];
+            $counts['estimated'] += (int) $r['estimated'];
+            $counts['retried'] += (int) $r['attempts'] > 1 ? 1 : 0;
+            $counts['over_reservation'] += (int) $r['over_reservation'];
+            $counts['deadline_hits'] += $deadlineMs > 0 && (int) $r['duration_ms'] >= $deadlineMs ? 1 : 0;
+            $counts['no_first_byte'] += $stream && $fb === null ? 1 : 0;
+            $bucket = 'ge128k';
+            foreach (self::HEALTH_BUCKETS as $name => $bound) {
+                if ((int) $r['prompt_tokens'] < $bound) {
+                    $bucket = $name;
+                    break;
+                }
+            }
+            $g = &$groups[$bucket . ($stream ? ':stream' : ':plain')];
+            $g['requests'] = ($g['requests'] ?? 0) + 1;
+            if ($ok && (int) $r['aborted'] === 0 && $fb !== null) {
+                $g['fb'][] = $fb;
+                $gen = (int) $r['duration_ms'] - $fb;
+                if ($stream && (int) $r['completion_tokens'] > 0 && $gen > 0) {
+                    $g['speed'][] = intdiv((int) $r['completion_tokens'] * 1000, $gen);
+                }
+            }
+            unset($g);
+        }
+        $rank = static function (array $v, float $p): ?int {
+            if ($v === []) {
+                return null;
+            }
+            sort($v);
+            return $v[max(0, (int) ceil($p * count($v)) - 1)];
+        };
+        $buckets = [];
+        foreach (array_keys(self::HEALTH_BUCKETS) as $name) {
+            foreach (['stream', 'plain'] as $mode) {
+                $g = $groups["$name:$mode"] ?? null;
+                if ($g === null) {
+                    continue;
+                }
+                $buckets[] = ['bucket' => $name, 'stream' => $mode === 'stream', 'requests' => $g['requests'],
+                    'answered' => count($g['fb'] ?? []), 'first_byte_p50_ms' => $rank($g['fb'] ?? [], 0.5),
+                    'first_byte_p95_ms' => $rank($g['fb'] ?? [], 0.95), 'tokens_per_second_p50' => $rank($g['speed'] ?? [], 0.5)];
+            }
+        }
+        return ['counts' => $counts, 'buckets' => $buckets];
+    }
+
     /**
      * A ref's credit changes, newest first: each row's kind, delta, balance after it and its cause.
      * @return list<array{id: int, ts: int, kind: string, delta: int, balance_after: int, ref: string}>

@@ -46,6 +46,12 @@ Usage: virsilipas <command> [args]
                                     and requests that were retried or failed over;
                                     by = comma list of model,upstream,key,status,source,group (or -); since/until =
                                     YYYY-MM-DD (UTC, until exclusive)
+  health [since] [until]            request health for monitoring, one JSON object: per prompt-size bucket
+                                    (tokens: <1k, 1k-8k, 8k-32k, 32k-128k, >=128k) and stream mode the
+                                    requests, answered, first-byte p50/p95 ms and median tokens per
+                                    second; counts of failed, aborted, estimated, retried,
+                                    over_reservation, deadline_hits and no_first_byte. since/until =
+                                    YYYY-MM-DD (UTC, until exclusive; default yesterday). No ref or content
   public-usage <ref-prefix> [file]  the aggregate usage of the keys whose ref starts with ref-prefix,
                                     for publishing (ADR 0023): windows, models, daily, hourly, heatmap;
                                     no ref, count, upstream, cost or grant. With file: written
@@ -98,6 +104,8 @@ try {
         'public-usage' => publicUsage($ledger, $args),
         'public-top' => publicTop($ledger, $args),
         'top' => top($ledger, $config, $args),
+        'health' => json_encode(['since' => $s = dateArg($args, 0) ?? intdiv(time(), 86400) * 86400 - 86400, 'until' => $u = dateArg($args, 1) ?? $s + 86400]
+            + $ledger->health($s, $u, $config->upstreamTimeout)),
         'stats' => implode("\n", array_map('json_encode', $ledger->stats(arg($args, 0),
             ($args[1] ?? '-') === '-' ? [] : explode(',', $args[1]), dateArg($args, 2), dateArg($args, 3)))),
         default => null,

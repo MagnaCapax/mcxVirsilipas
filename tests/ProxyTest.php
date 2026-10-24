@@ -256,3 +256,24 @@ function testEmptyObjectsSurviveTheRoundTrip(): void
     check(str_contains($out, '"enum":[]'), 'an empty list stays a list');
     check(str_contains($out, '"model":"upstream/model"'), 'the rest of the request is rewritten as before');
 }
+
+function testTheClientIsReleasedInOnePlaceAfterTheSettle(): void
+{
+    // ADR 0027: one release, in serve()'s finally block, after the settle (so the key's limits see a settled lease) and
+    // before the request log and the cap check; only once the response was written (an exception's is written later).
+    $calls = 0;
+    foreach ([...glob(__DIR__ . '/../src/*.php'), ...glob(__DIR__ . '/../public/*.php')] as $file) {
+        $calls += substr_count((string) file_get_contents($file), 'fastcgi_finish_request(');
+    }
+    same(1, $calls, 'fastcgi_finish_request() is called in one place only');
+    $src = (string) file_get_contents(__DIR__ . '/../src/Proxy.php');
+    // Each step is searched from the one before it, so a match elsewhere in the file cannot pass the order.
+    $at = 0;
+    foreach (['the response is written' => '$responded = true;', 'the finally block' => '} finally {', 'the settle' => '$this->ledger->settle($lease[',
+        'the release' => 'fastcgi_finish_request();', 'the request log' => 'self::logRequest($key[', 'the cap check' => '$this->logCapCrossing('] as $step => $needle) {
+        $next = strpos($src, $needle, $at);
+        check($next !== false, "serve(): $step comes after the step before it");
+        $at = (int) $next;
+    }
+    check(str_contains($src, "if (\$responded && function_exists('fastcgi_finish_request')) {"), 'no release on the exception path');
+}

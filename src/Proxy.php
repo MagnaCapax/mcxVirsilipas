@@ -233,7 +233,7 @@ final class Proxy
         }
 
         $result = self::attemptResult(0);
-        [$upstream, $servedHop, $started, $attempts] = ['', $hops[0], hrtime(true), 0];
+        [$upstream, $servedHop, $started, $attempts, $responded] = ['', $hops[0], hrtime(true), 0, false];
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
             // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
@@ -291,7 +291,9 @@ final class Proxy
             if (!$result['delivered']) {
                 self::failure($result)->sendAs($format);
             }
+            $responded = true; // the whole answer or its error is written; on an exception the router writes it later
         } finally {
+            $settleStarted = hrtime(true);
             [$used, $meta] = self::charge($result, $promptBound, $alias, $rates);
             $meta += ['upstream' => $upstream, 'stream' => $stream, 'duration_ms' => intdiv(hrtime(true) - $started, 1_000_000), 'delay_ms' => $delayMs,
                 'first_byte_ms' => $result['first_byte_ns'] === null ? null : intdiv($result['first_byte_ns'] - $started, 1_000_000), 'attempts' => $attempts];
@@ -304,7 +306,13 @@ final class Proxy
                 $meta = array_replace($meta, ['cost' => Credits::of($meta['prompt'], 0, $meta['completion'], $price), 'cost_computed' => true]);
             }
             $this->ledger->settle($lease['lease_id'], $key['id'], $used, $meta);
-            self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered']);
+            $settleMs = intdiv(hrtime(true) - $settleStarted, 1_000_000);
+            // The lease is settled, so the key's limits see what v0.16.1 saw: release the client before the logging and
+            // the cap check below (ADR 0027). Not on an exception: its error response is written after this method returns.
+            if ($responded && function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            }
+            self::logRequest($key['ref'], $lease['lease_id'], $stream, $lease['reserved'], $used, $meta, $result['delivered'], $settleMs);
             $this->logCapCrossing($meta['cost'] ?? 0);
         }
     }
@@ -406,14 +414,15 @@ final class Proxy
      * an estimated charge or usage above the reservation is a warning (it points at the
      * upstream or its configuration); everything else, client hang-ups included, is info.
      * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, reasoning: int, cost: ?int, upstream: string, duration_ms: int} $meta
+     * $settleMs is the time spent charging and settling after the response was written, before the client is released.
      */
-    private static function logRequest(string $ref, int $lease, bool $stream, int $reserved, int $used, array $meta, bool $delivered): void
+    private static function logRequest(string $ref, int $lease, bool $stream, int $reserved, int $used, array $meta, bool $delivered, int $settleMs): void
     {
         $failed = !$delivered && !$meta['aborted'];
         $over = $used > $reserved;
         Log::write($failed || $meta['estimated'] || $over ? 'warn' : 'info', 'request', [
             'ref' => $ref, 'lease' => $lease, 'alias' => $meta['model'], 'upstream' => $meta['upstream'], 'stream' => $stream, 'upstream_status' => $meta['status'],
-            'duration_ms' => $meta['duration_ms'], 'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
+            'duration_ms' => $meta['duration_ms'], 'settle_ms' => $settleMs, 'delivered' => $delivered, 'aborted' => $meta['aborted'], 'estimated' => $meta['estimated'],
             'prompt_tokens' => $meta['prompt'], 'cached_tokens' => $meta['cached'], 'completion_tokens' => $meta['completion'],
             'reasoning_tokens' => $meta['reasoning'], 'upstream_cost' => $meta['cost'],
             'reserved' => $reserved, 'reported' => $used, 'charged' => min($used, $reserved), 'over_reservation' => $over,

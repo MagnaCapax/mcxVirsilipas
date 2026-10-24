@@ -383,6 +383,7 @@ function testIntegrationLogsRecordEventsButNeverBodiesOrKeys(): void
     }
     same(1, count($mine), 'one request record for the request');
     same(['info', 'ok', true, true, false], [$mine[0]['level'], $mine[0]['alias'], $mine[0]['stream'], $mine[0]['delivered'], $mine[0]['estimated']]);
+    check(is_int($mine[0]['settle_ms'] ?? null) && $mine[0]['settle_ms'] >= 0, 'the record times the charge and settle after the answer (settle_ms)');
     check(in_array('admin_auth_failed', array_column($records, 'event'), true), 'a failed admin authentication is logged');
     check(in_array(404, array_column(array_filter($records, static fn ($r) => ($r['event'] ?? '') === 'refused'), 'status'), true), 'the 404 is logged');
     check(!str_contains($log, $secret), 'the prompt never reaches the log');

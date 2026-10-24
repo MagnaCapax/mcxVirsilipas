@@ -2,6 +2,15 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.17.0 (2026-10-24)
+
+No schema change.
+
+- **The client is released once its request has settled ([ADR 0027](docs/adr/0027-the-client-is-released-once-its-request-has-settled.md)).** Under php-fpm the proxy calls `fastcgi_finish_request()` right after the settle, so the client no longer waits for the request log write or the spend-cap check. Its balance and limits are settled before it can send its next request, as before. Releasing it before the settle was tried and rejected on the release acceptance run: the open lease kept counting against `max_concurrent` (429 for the request just finished) and `credits_per_minute`, and under write contention a next request failed with 500.
+- **`settle_ms` in the `request` log record**: the milliseconds the charge and settle took after the answer was written.
+- **`bin/virsilipas health [since] [until]`**: one JSON object for monitoring a span (default yesterday, UTC): counts of requests, failed, aborted, estimated, retried, over the reservation, run to the deadline and streams with no first byte, and per prompt-size bucket and stream mode the requests, answered requests, first-byte p50/p95 and the median generation speed. No ref, model or content. `Ledger::health()` and `Ledger::HEALTH_BUCKETS`.
+- Tests: the health buckets, percentiles and counts on fixture rows; the release called in one place, after the settle and before the request log and the cap check, never on the exception path; `settle_ms` in the log record.
+
 ## v0.16.1 (2026-10-22)
 
 No schema change.
