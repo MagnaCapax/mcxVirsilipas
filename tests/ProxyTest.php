@@ -103,6 +103,9 @@ function testReasoningAndUpstreamCostAreReadForTrackingOnly(): void
     same(100, $u(['estimated_cost' => 0.0001])['cost'], 'cost in millionths');
     same(2, $u(['estimated_cost' => 0.0000015])['cost'], 'rounded to the nearest millionth');
     same(0, $u(['estimated_cost' => 0])['cost'], 'a reported zero is kept');
+    same(50, $u(['cost' => 0.00005])['cost'], 'an upstream that names it cost');
+    same(100, $u(['estimated_cost' => 0.0001, 'cost' => 0.5])['cost'], 'estimated_cost wins when both are present');
+    same(null, $u(['cost' => '0.1'])['cost'], 'a string cost is not a usable cost');
     foreach ([null, -0.1, '0.1', 1e7, INF] as $bad) {
         same(null, $u(['estimated_cost' => $bad])['cost'], 'not a usable cost: ' . var_export($bad, true));
     }

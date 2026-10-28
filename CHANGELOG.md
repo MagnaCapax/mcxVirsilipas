@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.17.1 (2026-10-28)
+
+No schema change.
+
+- **An upstream's own cost is also read from `usage.cost`.** Some upstreams report the request's cost as `cost` rather than `estimated_cost`. The proxy read only `estimated_cost`, so those rows were costed from the route entry's configured prices (`cost_computed = 1`), which overstates the cost when the route pins several backends and a cheaper one answered. `estimated_cost` still wins when both are present; the same bounds apply. Charges are unchanged: the usage a client sees is still built from the counts only.
+- Tests: `cost` alone is read, `estimated_cost` wins over `cost`, a string `cost` is not a cost.
+
 ## v0.17.0 (2026-10-24)
 
 No schema change.

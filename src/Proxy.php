@@ -549,8 +549,8 @@ final class Proxy
      * integer from 0 to prompt_tokens; otherwise it is 0, which prices the whole prompt as fresh input.
      * Two details are kept for tracking only, never for charging: the reasoning part of the output
      * (completion_tokens_details.reasoning_tokens or a top-level reasoning_tokens, an integer from 0 to
-     * completion_tokens, else 0) and the cost the upstream reports itself (estimated_cost, a number from 0
-     * to 10^6, kept in millionths; anything else is null).
+     * completion_tokens, else 0) and the cost the upstream reports itself (estimated_cost, or cost when that
+     * is absent, as some upstreams name it; a number from 0 to 10^6, kept in millionths; anything else is null).
      * @return array{prompt: int, completion: int, total: int, cached: int, reasoning: int, cost: ?int}|null
      */
     public static function validUsage(mixed $u): ?array
@@ -571,7 +571,7 @@ final class Proxy
         $cached = is_int($hit) && $hit >= 0 && $hit <= $p ? $hit : 0;
         $cd = $u['completion_tokens_details'] ?? null;
         $r = (is_array($cd) ? ($cd['reasoning_tokens'] ?? null) : null) ?? ($u['reasoning_tokens'] ?? null);
-        $cost = $u['estimated_cost'] ?? null;
+        $cost = $u['estimated_cost'] ?? $u['cost'] ?? null;
         return ['prompt' => $p, 'completion' => $c, 'total' => $t, 'cached' => $cached,
             'reasoning' => is_int($r) && $r >= 0 && $r <= $c ? $r : 0,
             'cost' => (is_int($cost) || is_float($cost)) && is_finite((float) $cost) && $cost >= 0 && $cost <= 1e6 ? (int) round($cost * 1e6) : null];
