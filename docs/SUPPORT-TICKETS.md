@@ -26,14 +26,16 @@ Content-Type: application/json
 ```
 
 - No query string. JSON only; form uploads are refused.
-- The whole request may be at most 4.5 MiB.
+- The whole request may be at most 32 MiB.
 - `email` is the second factor: it must be the account's own address, or the address of a user who is the owner of
   the account or holds the permission to open tickets. Contacts without a login are not accepted.
 - `service`: name the service the ticket is about. When it is not a service of this account the ticket is still
   opened, without a service, and the ticket says so; the answer is the same either way, so the field cannot be used
   to discover services.
-- `attachments`: at most 3, each at most 1 MiB decoded; names of letters, digits, `.`, `_`, `-` and spaces;
-  types txt, log, png, jpg, jpeg, pdf.
+- `attachments`: any number, each at most 8 MiB decoded, within the 32 MiB request; names of letters, digits, `.`,
+  `_`, `-` and spaces, starting with a letter or digit; types txt, log, png, jpg, jpeg, pdf. A `.log` file is stored
+  as `<name>.log.txt`. A type the support system does not accept is refused with a 400 that names the file, never
+  dropped silently.
 - Fields not listed here are ignored.
 
 ## Answers
