@@ -8,6 +8,7 @@ declare(strict_types=1);
 
 /** Messages raised only from bin/virsilipas, never over HTTP. */
 const CLI_ONLY_MESSAGES = ['limit must be from 1 to 100000', // Ledger::history(), the `history` command
+    'daily target is out of range', 'daily target conflicts with an existing grant', // grant --daily-target
     'named keys need a ref of 1-64 of A-Z a-z 0-9 _ -', 'a key expiry must be a future unix time in seconds']; // Ledger::createKey(), `key-create --named --expires`
 
 /** @return array{routes: list<string>, words: list<string>, messages: list<string>, headers: list<string>} */

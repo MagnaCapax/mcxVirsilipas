@@ -6,6 +6,8 @@ In force since: v0.1.0 (grant `expires_at` stored, not enforced, since v0.9.0)
 ## Status
 Accepted
 
+Extended by [ADR 0028](0028-explicit-daily-target-grants.md): an administrator may explicitly push one CLI target grant per UTC day; ordinary prepaid balances still never reset automatically.
+
 ## Context
 Taking payments is a separate, regulated job with its own systems. The proxy has to know how much a user may spend, but it should not sell anything.
 

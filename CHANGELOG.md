@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## Unreleased
+
+Schema 12, upgraded in place: grants gain nullable `target_credits` and `target_day`, with one daily target per key and UTC day.
+
+- `grant <ref> <credits> --daily-target` sets the net entitlement (available balance plus every unsettled reservation) once per server-derived UTC day. Retries never refill subsequent usage; a different target that day conflicts. It is an explicit administrative push, never an automatic refill. Existing additive grants and HTTP endpoints are unchanged. [ADR 0028](docs/adr/0028-explicit-daily-target-grants.md).
+- Messages requests retain upstream-reported cost for internal tracking, including stream reports and a final same-count report that supplies missing cost. Later repeats cannot replace it or waive delivered-byte bounds. Client responses and credit charges are unchanged.
+
 ## v0.17.1 (2026-10-28)
 
 No schema change.

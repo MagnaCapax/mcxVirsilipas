@@ -28,6 +28,9 @@ Usage: virsilipas <command> [args]
   grant <ref> <credits> <grant_id> [expires_at]
                                     add (or, if negative, remove) credits, once per grant_id;
                                     expires_at (unix seconds) is stored, not enforced
+  grant <ref> <credits> --daily-target
+                                    set balance plus unsettled reservations to this target once per
+                                    server UTC day; same-day retries do not replenish spent credits
   limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
                                     credits_per_minute; 'default' follows the config again
   bonus <ref> <0..300>              set a key's bonus percent, which raises its priority weight
@@ -91,7 +94,7 @@ try {
         'key-disable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), false); return 'disabled'; })(),
         'key-enable' => (function () use ($ledger, $args) { $ledger->setActive(arg($args, 0), true); return 'enabled'; })(),
         'key-remove' => json_encode(['ref' => arg($args, 0)] + $ledger->removeKey(arg($args, 0))),
-        'grant' => json_encode($ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1), isset($args[3]) ? intArg($args, 3) : null)),
+        'grant' => json_encode(grantCli($ledger, $args)),
         'limit' => json_encode($ledger->setLimits(arg($args, 0), [arg($args, 1) => arg($args, 2) === 'default' ? null : intArg($args, 2)])),
         'bonus' => json_encode(['ref' => arg($args, 0), 'bonus_pct' => $ledger->setBonus(arg($args, 0), intArg($args, 1))]),
         'group' => json_encode(['ref' => arg($args, 0), 'key_group' => $ledger->setGroup(arg($args, 0), arg($args, 1) === '-' ? '' : arg($args, 1))]),
@@ -118,6 +121,18 @@ try {
 } catch (HttpError | \InvalidArgumentException | \RuntimeException $e) {
     fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
     exit(1);
+}
+
+/** The explicit target mode shares the guarded grant verb; ordinary additive grants keep their arguments. */
+function grantCli(Ledger $ledger, array $args): array
+{
+    if (in_array('--daily-target', $args, true)) {
+        if (count($args) !== 3 || $args[2] !== '--daily-target') {
+            throw new \InvalidArgumentException('grant <ref> <credits> --daily-target takes no grant_id, expiry or date');
+        }
+        return $ledger->grantDailyTarget(arg($args, 0), intArg($args, 1));
+    }
+    return $ledger->grant(arg($args, 0), arg($args, 2), intArg($args, 1), isset($args[3]) ? intArg($args, 3) : null);
 }
 
 /**

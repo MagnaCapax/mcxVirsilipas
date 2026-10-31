@@ -55,7 +55,7 @@ function testMigrateUpgradesASchemaEightLedgerKeepingItsGrants(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v8.sqlite");
-    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['inv-1', 70, 1000, null], array_map(static fn ($v) => is_numeric($v) ? (int) $v : $v,
         $db->query('SELECT grant_id, credits, created_at, expires_at FROM grants')->fetch(\PDO::FETCH_NUM)), 'an old grant keeps its values and never expires');
     same(null, $db->query('SELECT removed_at FROM keys')->fetchColumn(), 'an old key is not removed');
@@ -207,7 +207,7 @@ function testMigrateUpgradesASchemaNineLedgerAddingTheGrantsIndexAndTheReplaceTr
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v9.sqlite");
-    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['credit_log_no_delete', 'credit_log_no_replace', 'credit_log_no_update'],
         $db->query("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")->fetchAll(\PDO::FETCH_COLUMN));
     $plan = implode(' ', $db->query("EXPLAIN QUERY PLAN SELECT grant_id FROM grants WHERE key_id = 1 ORDER BY rowid DESC LIMIT 5")->fetchAll(\PDO::FETCH_COLUMN, 3));

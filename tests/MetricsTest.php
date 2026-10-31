@@ -101,7 +101,7 @@ function testMigrateUpgradesASchemaFiveLedger(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v5.sqlite");
-    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['0', '0', '9'], array_values(array_map('strval', $db->query('SELECT source, cost_computed, upstream_cost FROM usage')->fetch(\PDO::FETCH_ASSOC))), 'old rows: external, reported cost kept');
     $s = $l->status('old', lim());
     same([7, 50, ''], [$s['balance'], $s['bonus_pct'], $s['key_group']], 'balance and bonus kept, no group');

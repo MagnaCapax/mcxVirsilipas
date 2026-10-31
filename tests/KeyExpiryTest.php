@@ -122,7 +122,7 @@ function testMigrateUpgradesASchemaTenLedgerWhoseKeysNeverExpire(): void
     $l->migrate();
     $l->migrate();
     $db = new \PDO("sqlite:$dir/v10.sqlite");
-    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same([null], $db->query('SELECT expires_at FROM keys')->fetchAll(\PDO::FETCH_COLUMN), 'an old key never expires');
     $k = $l->findKey('vsk-old');
     same([1, null, null, null], [$k['id'], $k['expires_at'], $l->keys()[0]['expires_at'], $l->status('old', lim())['expires_at']]);

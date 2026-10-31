@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use MagnaCapax\Virsilipas\Config;
 use MagnaCapax\Virsilipas\Messages;
+use MagnaCapax\Virsilipas\Proxy;
 
 // POST /v1/messages and /v1/messages/count_tokens: the Anthropic Messages pass-through, metered like chat.
 
@@ -194,6 +195,10 @@ function testMessagesCountTokensIsAFreeConservativeEstimate(): void
 
 function testMessagesUsageMapping(): void
 {
+    foreach ([['cost' => 0.001, 'expected' => 1000], ['estimated_cost' => 0.002, 'expected' => 2000],
+        ['cost' => -1, 'expected' => null], ['cost' => '0.1', 'expected' => null], ['cost' => INF, 'expected' => null]] as $case) {
+        same($case['expected'], Messages::usage(['input_tokens' => 1, 'output_tokens' => 1] + $case)['cost']);
+    }
     same(['prompt' => 950, 'completion' => 40, 'total' => 990, 'cached' => 800, 'reasoning' => 0, 'cost' => null, 'input' => 100, 'creation' => 50],
         Messages::usage(['input_tokens' => 100, 'cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800, 'output_tokens' => 40]));
     same(['prompt' => 11, 'completion' => 0, 'total' => 11, 'cached' => 0, 'reasoning' => 0, 'cost' => null, 'input' => 11, 'creation' => 0],
@@ -204,6 +209,61 @@ function testMessagesUsageMapping(): void
         same(null, Messages::usage($u), json_encode($u));
     }
     same(Messages::usage(['input_tokens' => 1, 'output_tokens' => 0, 'cache_read_input_tokens' => 9])['prompt'], 10, 'a full cache hit still has a prompt');
+}
+
+function testMessagesStreamReportedCostSurvivesEventsChargeAndSettlement(): void
+{
+    foreach ([['cost', 'advance', 0.001, 1000], ['estimated_cost', 'repeat', 0.002, 2000], ['cost', 'repeat', 0, 0]] as [$field, $when, $cost, $expected]) {
+        [$ledger, $id] = fundedLedger(1000);
+        $lease = $ledger->reserve($id, 20, 100, 1000, unitRates(), lim(), 60);
+        // The state and public calls are the production forward -> event -> charge -> settle path, without HTTP.
+        $state = ['started' => false, 'start' => false, 'done' => false, 'failed' => false, 'bad' => false,
+            'raw' => [], 'usage' => null, 'unmetered' => 0, 'over' => false, 'held' => '', 'aborted' => false, 'bytes' => 0];
+        $client = '';
+        $send = static function (array $event) use (&$state, &$client, $lease): void {
+            $out = Messages::event($state, Messages::sse($event['type'], $event), 'alias', unitRates(), $lease['reserved']);
+            if ($out !== '') $state['started'] = true; // forward() marks the stream when the held start is released
+            $client .= $out;
+        };
+        $send(['type' => 'message_start', 'message' => ['id' => 'fixture-message', 'type' => 'message',
+            'usage' => ['input_tokens' => 10, 'output_tokens' => 0]]]);
+        $send(['type' => 'content_block_start', 'index' => 0, 'content_block' => ['type' => 'text', 'text' => 'hello']]);
+        $advance = ['output_tokens' => 4] + ($when === 'advance' ? [$field => $cost] : []);
+        $send(['type' => 'message_delta', 'usage' => $advance]);
+        same(0, $state['unmetered'], 'an advancing report still covers earlier delivered bytes');
+        $send(['type' => 'content_block_delta', 'index' => 0, 'delta' => ['type' => 'text_delta', 'text' => 'tail']]);
+        same(14, $state['unmetered'], 'the later delivered strings retain their byte bound');
+        $send(['type' => 'message_delta', 'usage' => ['output_tokens' => 4, $field => $when === 'repeat' ? $cost : 99.0]]);
+        same([$expected, 14], [$state['usage']['cost'], $state['unmetered']], 'repeat fills only missing cost and covers no new bytes');
+        foreach ([['output_tokens' => 4, $field => 99.0], ['output_tokens' => 4, $field => null],
+            ['output_tokens' => 4, $field => 'invalid'], ['output_tokens' => 3, $field => 99.0]] as $repeat) {
+            $send(['type' => 'message_delta', 'usage' => $repeat]);
+            same([$expected, 4, 14], [$state['usage']['cost'], $state['usage']['completion'], $state['unmetered']],
+                'equal or lower reports cannot replace accepted cost or waive delivered bytes');
+        }
+        $send(['type' => 'message_stop']);
+        [$used, $meta] = Proxy::charge(['status' => 200, 'usage' => $state['usage'], 'aborted' => false,
+            'delivered' => true, 'completion_bound' => $state['bytes'], 'unmetered' => $state['unmetered']], 20, 'alias', unitRates());
+        same([28, $expected, true], [$used, $meta['cost'], $meta['estimated']], 'cost metadata never changes the token and byte-bound charge');
+        same(true, $ledger->settle($lease['lease_id'], $id, $used, ['stream' => true] + $meta));
+        $stats = $ledger->stats('all')[0];
+        same([972, 28, $expected, 0], [$ledger->status('a', lim())['balance'], $stats['credits'], $stats['upstream_cost'], $stats['computed_cost_requests']],
+            'settlement persists reported cost independently of charged credits');
+        same([], $ledger->verify()['problems']);
+        check(!str_contains($client, 'estimated_cost') && !str_contains($client, '"cost"'), 'reported cost never reaches the client stream');
+        check(str_contains($client, 'hello') && str_contains($client, 'tail'), 'the actual content was relayed');
+    }
+}
+
+function testMessagesAdvancingReportDoesNotInheritAnEarlierCost(): void
+{
+    $state = ['started' => true, 'start' => true, 'done' => false, 'failed' => false, 'bad' => false,
+        'raw' => ['input_tokens' => 10, 'output_tokens' => 1],
+        'usage' => Messages::usage(['input_tokens' => 10, 'output_tokens' => 1, 'cost' => 0.1]),
+        'unmetered' => 7, 'over' => false, 'held' => '', 'aborted' => false, 'bytes' => 7];
+    Messages::event($state, Messages::sse('message_delta', ['type' => 'message_delta', 'usage' => ['output_tokens' => 2]]), 'alias', unitRates(), 100);
+    same([12, null, 0], [$state['usage']['total'], $state['usage']['cost'], $state['unmetered']],
+        'a new cumulative total needs its own cost report, matching chat adoption');
 }
 
 function testMessagesConfigValidatesMessagesUrl(): void

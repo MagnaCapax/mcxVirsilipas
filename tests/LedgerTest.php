@@ -408,7 +408,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(11, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');

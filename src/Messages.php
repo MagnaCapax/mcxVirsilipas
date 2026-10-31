@@ -111,7 +111,8 @@ final class Messages
      * side has at least one token. The prompt is input + cache_creation_input_tokens + cache_read_input_tokens; only the
      * cache reads are cached input, cache writes are priced as fresh input. Reasoning is inside output_tokens and not
      * reported apart (0). The raw split is kept for the client's view.
-     * @return array{prompt: int, completion: int, total: int, cached: int, reasoning: int, cost: null, input: int, creation: int}|null
+     * An upstream-reported cost is tracking metadata only, in the same micro-unit as chat; it never sets the charge.
+     * @return array{prompt: int, completion: int, total: int, cached: int, reasoning: int, cost: ?int, input: int, creation: int}|null
      */
     public static function usage(mixed $u): ?array
     {
@@ -128,7 +129,10 @@ final class Messages
         if ($prompt < 1 || $prompt > Credits::MAX_COUNT) {
             return null;
         }
-        return ['prompt' => $prompt, 'completion' => $out, 'total' => $prompt + $out, 'cached' => $read, 'reasoning' => 0, 'cost' => null,
+        $cost = $u['estimated_cost'] ?? $u['cost'] ?? null;
+        $cost = (is_int($cost) || is_float($cost)) && is_finite((float) $cost) && $cost >= 0 && $cost <= 1e6
+            ? (int) round($cost * 1e6) : null;
+        return ['prompt' => $prompt, 'completion' => $out, 'total' => $prompt + $out, 'cached' => $read, 'reasoning' => 0, 'cost' => $cost,
             'input' => $in, 'creation' => $write];
     }
 
@@ -251,11 +255,16 @@ final class Messages
                     $s['raw'][$k] = $usage[$k]; // later counts replace earlier ones; message_delta's are cumulative
                 }
             }
-            $u = self::usage($s['raw']);
+            // Counts accumulate across events; cost belongs only to this report, never to a previous token total.
+            $u = self::usage($s['raw'] + array_intersect_key($usage, ['estimated_cost' => true, 'cost' => true]));
             if ($u !== null && ($s['usage'] === null || $u['total'] > $s['usage']['total'])) {
                 $s['usage'] = $u;
                 $s['unmetered'] = 0;
                 $s['over'] = Proxy::usageCredits($u, 0, $rates) > $reserved;
+            } elseif ($u !== null && [$u['prompt'], $u['completion'], $u['total']]
+                === [$s['usage']['prompt'], $s['usage']['completion'], $s['usage']['total']]) {
+                // As on chat, a final repeat may supply missing cost once. It covers no newly delivered bytes.
+                $s['usage']['cost'] ??= $u['cost'];
             }
         }
         if ($type === 'message_start') {

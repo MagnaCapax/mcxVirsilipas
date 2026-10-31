@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace MagnaCapax\Virsilipas;
 
 /**
- * The credit ledger: keys with one never-resetting balance each, idempotent grants,
+ * The credit ledger: keys with one balance each (no automatic reset), idempotent grants,
  * per-request leases (reserve -> settle), per-key limits and a metadata-only usage log.
  *
  * Every balance change is a short BEGIN IMMEDIATE transaction; creating a key is a single statement,
@@ -30,12 +30,12 @@ final class Ledger
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
     /** The latest expires_at accepted: 9999-12-31T23:59:59Z. */
     private const MAX_TIME = 253_402_300_799;
-    private const SCHEMA_VERSION = 11;
+    private const SCHEMA_VERSION = 12;
     /**
-     * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 10 gain the columns below, and every older
+     * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 11 gain the columns below, and every older
      * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
      */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9, 10];
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -51,6 +51,8 @@ final class Ledger
      * when a key was removed for good (NULL while it lives), and a grant's expiry time, stored for a future expiry
      * policy and not enforced (NULL: never expires; every grant written before schema 9). Schema 11: when a key expires
      * (ADR 0024), enforced at authentication and at reserve (NULL: never; every key created before schema 11).
+     * Schema 12: a CLI daily target grant records its target and server-derived UTC day (ADR 0028); older additive
+     * grants keep both NULL and retain their existing retry identity.
      */
     private const ADDED_COLUMNS = [
         'usage' => ['upstream' => "TEXT NOT NULL DEFAULT ''", 'stream' => 'INTEGER NOT NULL DEFAULT 0',
@@ -60,7 +62,7 @@ final class Ledger
             'attempts' => 'INTEGER NOT NULL DEFAULT 0'],
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''",
             'removed_at' => 'INTEGER', 'expires_at' => 'INTEGER'],
-        'grants' => ['expires_at' => 'INTEGER'],
+        'grants' => ['expires_at' => 'INTEGER', 'target_credits' => 'INTEGER', 'target_day' => 'INTEGER'],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
     /** The largest bonus percent a key can carry (also the CHECK in ADDED_COLUMNS). */
@@ -139,6 +141,7 @@ final class Ledger
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_source_open ON leases(source, settled, expires_at)');
             $this->db->exec('CREATE INDEX IF NOT EXISTS leases_created ON leases(created_at)');
             $this->db->exec('CREATE INDEX IF NOT EXISTS usage_key ON usage(key_id, ts)'); // keys(): a key's last use
+            $this->db->exec('CREATE UNIQUE INDEX IF NOT EXISTS grants_daily_target ON grants(key_id, target_day) WHERE target_day IS NOT NULL');
             // Credits charged and upstream cost per UTC hour, kept by settle, so spend pacing and the spend caps read at
             // most one row per hour of their window however busy it was. Both are rebuilt from the usage rows when added.
             $newHourly = (int) $this->db->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'spend_hourly'")->fetchColumn() === 0;
@@ -335,12 +338,12 @@ final class Ledger
         }
         return $this->tx(function () use ($ref, $grantId, $credits, $expiresAt): array {
             $keyId = $this->keyIdByRef($ref);
-            $st = $this->db->prepare('SELECT key_id, credits, expires_at FROM grants WHERE grant_id = ?');
+            $st = $this->db->prepare('SELECT key_id, credits, expires_at, target_day FROM grants WHERE grant_id = ?');
             $st->execute([$grantId]);
             $prior = $st->fetch(\PDO::FETCH_ASSOC);
             $st->closeCursor();
             if ($prior !== false) {
-                if ((int) $prior['key_id'] !== $keyId || (int) $prior['credits'] !== $credits
+                if ($prior['target_day'] !== null || (int) $prior['key_id'] !== $keyId || (int) $prior['credits'] !== $credits
                     || ($prior['expires_at'] === null ? null : (int) $prior['expires_at']) !== $expiresAt) {
                     throw new HttpError(409, 'grant_id was already used for a different ref, amount or expires_at');
                 }
@@ -360,6 +363,51 @@ final class Ledger
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$credits, $keyId]);
             $this->logCredit($keyId, 'grant', $credits, $grantId);
             return ['applied' => true, 'balance' => $new, 'expires_at' => $expiresAt];
+        });
+    }
+
+    /**
+     * One operator-pushed target per ref per UTC day, including every unsettled reservation (expired holds too).
+     * A retry never replenishes subsequent usage; a different target that day conflicts. No automatic refill occurs.
+     * @return array{applied:bool,balance:int,reserved:int,target:int,day:string,credits:int}
+     */
+    public function grantDailyTarget(string $ref, int $target): array
+    {
+        if ($target < 0 || $target > self::MAX_GRANT) {
+            throw new HttpError(400, 'daily target is out of range');
+        }
+        return $this->tx(function () use ($ref, $target): array {
+            $now = time(); // after BEGIN IMMEDIATE: a writer waiting across midnight belongs to the new day
+            $day = intdiv($now, 86400);
+            $keyId = $this->liveKeyId($ref);
+            $grantId = "daily-target:$keyId:$day";
+            $st = $this->db->prepare('SELECT key_id, credits, target_credits, target_day FROM grants WHERE (key_id = ? AND target_day = ?) OR grant_id = ?');
+            $st->execute([$keyId, $day, $grantId]);
+            $prior = $st->fetch(\PDO::FETCH_ASSOC);
+            $st->closeCursor();
+            if ($prior !== false && ((int) $prior['key_id'] !== $keyId || $prior['target_day'] === null
+                || (int) $prior['target_day'] !== $day || (int) $prior['target_credits'] !== $target)) {
+                throw new HttpError(409, 'daily target conflicts with an existing grant');
+            }
+            $st = $this->db->prepare('SELECT COALESCE(SUM(reserved), 0) FROM leases WHERE key_id = ? AND settled = 0');
+            $st->execute([$keyId]);
+            $reserved = (int) $st->fetchColumn();
+            $st->closeCursor();
+            $balance = $this->balanceOf($keyId);
+            $delta = $target - $reserved - $balance;
+            if ($prior === false) {
+                // Retain the existing per-grant and balance bounds; a target is not a larger-grant escape hatch.
+                if (abs($delta) > self::MAX_GRANT || abs($target - $reserved) > self::MAX_BALANCE) {
+                    throw new HttpError(400, 'daily target is out of range');
+                }
+                $this->db->prepare('INSERT INTO grants (grant_id, key_id, credits, created_at, target_credits, target_day) VALUES (?, ?, ?, ?, ?, ?)')
+                    ->execute([$grantId, $keyId, $delta, $now, $target, $day]);
+                $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$delta, $keyId]);
+                $this->logCredit($keyId, 'grant', $delta, $grantId);
+                $balance += $delta;
+            }
+            return ['applied' => $prior === false, 'balance' => $balance, 'reserved' => $reserved, 'target' => $target,
+                'day' => gmdate('Y-m-d', $now), 'credits' => $prior === false ? $delta : (int) $prior['credits']];
         });
     }
 
@@ -977,7 +1025,7 @@ final class Ledger
     private function logCredit(int $keyId, string $kind, int $delta, string $ref): void
     {
         if ($delta === 0) {
-            return; // nothing changed: a refund of a fully used reservation
+            return; // nothing changed: a fully used reservation's refund, or an already-funded daily target
         }
         $this->db->prepare('INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (?, ?, ?, ?, ?, ?)')
             ->execute([time(), $keyId, $kind, $delta, $this->balanceOf($keyId), $ref]);
