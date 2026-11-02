@@ -55,6 +55,23 @@ if (str_ends_with($seen['path'], '/v1/messages')) {
     $slow = $model === 'scenario-anth-slow';
     $in = $slow ? ['input_tokens' => 11] : ['input_tokens' => 100, 'cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800];
     $out = $slow ? 10 : 40;
+    $usageCase = str_starts_with($model, 'scenario-anth-usage-') ? substr($model, strlen('scenario-anth-usage-')) : '';
+    $startUsage = match ($usageCase) {
+        'zero', 'broken' => ['input_tokens' => 0, 'cache_creation_input_tokens' => 0, 'cache_read_input_tokens' => 0, 'output_tokens' => 0],
+        'missing', 'no-usage' => [],
+        'partial' => $in,
+        'cache' => ['input_tokens' => 100, 'output_tokens' => 1],
+        default => $in + ['output_tokens' => $usageCase === 'decreasing' ? 40 : 1],
+    };
+    $finalUsage = match ($usageCase) {
+        'zero', 'missing', 'broken' => $in + ['output_tokens' => $out],
+        'cache' => ['cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800, 'output_tokens' => $out],
+        'invalid' => ['input_tokens' => 'invalid', 'output_tokens' => $out],
+        'decreasing' => ['input_tokens' => 1, 'cache_creation_input_tokens' => 0, 'cache_read_input_tokens' => 0, 'output_tokens' => 1],
+        'bad-cache' => ['cache_read_input_tokens' => -1, 'output_tokens' => $out],
+        'no-usage' => [],
+        default => ['output_tokens' => $out],
+    };
     $private = ['service_tier' => 'PRIVATE-DETAIL', 'estimated_cost' => 0.5];
     if (empty($req['stream'])) {
         header('Content-Type: application/json');
@@ -69,7 +86,7 @@ if (str_ends_with($seen['path'], '/v1/messages')) {
         flush();
     };
     $sse('message_start', ['message' => ['id' => 'msg_1', 'type' => 'message', 'role' => 'assistant', 'model' => $model, 'provider' => 'PRIVATE-DETAIL',
-        'content' => [], 'stop_reason' => null, 'stop_sequence' => null, 'usage' => $in + ['output_tokens' => 1] + $private]]);
+        'content' => [], 'stop_reason' => null, 'stop_sequence' => null, 'usage' => $startUsage + $private]]);
     $sse('ping', []);
     $sse('content_block_start', ['index' => 0, 'content_block' => ['type' => 'text', 'text' => '']]);
     for ($i = 1; $i <= $chunks; $i++) {
@@ -77,8 +94,10 @@ if (str_ends_with($seen['path'], '/v1/messages')) {
         usleep($slow ? 200000 : 10000);
     }
     $sse('content_block_stop', ['index' => 0]);
-    $sse('message_delta', ['delta' => ['stop_reason' => 'end_turn', 'stop_sequence' => null], 'usage' => ['output_tokens' => $out] + $private]);
-    $sse('message_stop', []);
+    $sse('message_delta', ['delta' => ['stop_reason' => 'end_turn', 'stop_sequence' => null], 'usage' => $finalUsage + $private]);
+    if ($usageCase !== 'broken') {
+        $sse('message_stop', []);
+    }
     exit;
 }
 // scenario-no-cost is an upstream that reports no cost of its own.

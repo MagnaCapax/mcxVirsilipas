@@ -301,7 +301,8 @@ final class Messages
             'content_block_start' => ['type' => $type] + $int('index') + ['content_block' => self::isObject($j['content_block'] ?? null) ? $j['content_block'] : new \stdClass()],
             'content_block_delta' => ['type' => $type] + $int('index') + ['delta' => self::isObject($j['delta'] ?? null) ? $j['delta'] : new \stdClass()],
             'content_block_stop' => ['type' => $type] + $int('index'),
-            'message_delta' => ['type' => $type, 'delta' => self::stopFields($j['delta'] ?? null), 'usage' => ['output_tokens' => $s['usage']['completion'] ?? 0]],
+            // Input/cache counts can arrive after message_start; clients need the same adopted report as settlement.
+            'message_delta' => ['type' => $type, 'delta' => self::stopFields($j['delta'] ?? null), 'usage' => self::usageView($s['usage'])],
             default => ['type' => $type], // message_stop, ping
         };
         if ($block) {

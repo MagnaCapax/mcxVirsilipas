@@ -114,6 +114,10 @@ function configArrayFor(string $dir, array $overrides = []): array
     // Anthropic Messages aliases: the 'msgs' upstream has a messages_url (and its own key); 'primary' has none, so only
     // the second entry of anth-mixed serves /v1/messages. anth is priced like 'weighted', for the cached-input test.
     $models['anth'] = ['route' => [$hop('msgs', 'scenario-anth-ok')], 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    foreach (['zero', 'missing', 'partial', 'cache', 'preserve', 'invalid', 'decreasing', 'bad-cache', 'no-usage', 'broken'] as $case) {
+        $models['anth-usage-' . $case] = ['route' => [$hop('msgs', 'scenario-anth-usage-' . $case)]]
+            + array_intersect_key($models['anth'], unitRates());
+    }
     $models['anth-slow'] = ['route' => [$hop('msgs', 'scenario-anth-slow')]] + unitRates();
     $models['anth-overloaded'] = ['route' => [$hop('msgs', 'scenario-anth-529')]] + unitRates();
     $models['anth-mixed'] = ['route' => [$hop('primary', 'scenario-ok'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();

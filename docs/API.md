@@ -206,13 +206,13 @@ event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
 event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":11,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":3}}
 
 event: message_stop
 data: {"type":"message_stop"}
 ```
 
-- `message_start` is rebuilt like a non-streamed message (no content yet). `content_block_start`, `content_block_delta` and `content_block_stop` keep `index` and their `content_block` or `delta` as the upstream sent them. `message_delta` keeps `stop_reason`, `stop_sequence` and, as `usage.output_tokens`, the output count the request is charged by. `message_stop` and `ping` are relayed as they are; any other event is dropped.
+- `message_start` is rebuilt like a non-streamed message (no content yet). `content_block_start`, `content_block_delta` and `content_block_stop` keep `index` and their `content_block` or `delta` as the upstream sent them. `message_delta` keeps `stop_reason`, `stop_sequence` and all four standard usage counts from the adopted report, including input or cache counts that arrive after `message_start`; absent fields do not erase earlier accepted counts. `message_stop` and `ping` are relayed as they are; any other event is dropped.
 - The 200 is sent at the first content block event after a `message_start`, which is held until then. Until then, an upstream failure is a normal error response and costs nothing.
 - `message_stop` ends the stream; nothing after it is relayed or charged. After the 200, an upstream error, or a stream that ends without `message_stop`, ends it with an error event; the output already relayed is charged:
 

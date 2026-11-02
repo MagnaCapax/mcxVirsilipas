@@ -75,11 +75,47 @@ function testMessagesStreamIsRelayedAndMeteredExactly(): void
     $text = implode('', array_map(static fn (array $e): string => $e[1]['delta']['text'] ?? '', $events));
     same('t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 ', $text, 'content deltas relayed unchanged');
     same(['index' => 0, 'delta' => ['type' => 'text_delta', 'text' => 't1 ']], array_diff_key($events[2][1], ['type' => 1]));
-    same(['type' => 'message_delta', 'delta' => ['stop_reason' => 'end_turn', 'stop_sequence' => null], 'usage' => ['output_tokens' => 40]], $events[count($events) - 2][1]);
+    same(['type' => 'message_delta', 'delta' => ['stop_reason' => 'end_turn', 'stop_sequence' => null],
+        'usage' => ['input_tokens' => 100, 'cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800, 'output_tokens' => 40]], $events[count($events) - 2][1]);
     same(100000 - 1020, settled($ref)['balance']);
     $u = lastUsage($ref);
     same([950, 800, 40, 1020, 0, 0, 1], [$u['prompt_tokens'], $u['cached_tokens'], $u['completion_tokens'], $u['charged'], $u['estimated'], $u['aborted'], $u['stream']]);
     check($u['first_byte_ms'] !== null, 'time to the first relayed byte recorded');
+}
+
+function testMessagesStreamClientReceivesTheAdoptedInputAndCacheCounts(): void
+{
+    foreach (['zero', 'missing', 'partial', 'cache', 'preserve', 'invalid', 'decreasing', 'bad-cache', 'no-usage', 'broken'] as $case) {
+        [$ref, $key] = fundedKey(100000);
+        $r = http('POST', '/v1/messages', anthBody('anth-usage-' . $case, true), $key);
+        same(200, $r['status'], $case . ': stream starts with usable content');
+        checkNoUpstreamDetails($r['body']);
+        $events = anthEvents($r['body']);
+        $deltas = array_values(array_filter($events, static fn (array $e): bool => $e[0] === 'message_delta'));
+        same(1, count($deltas), $case . ': one final usage delta reaches the client');
+        $expected = ['input_tokens' => 100, 'cache_creation_input_tokens' => 50, 'cache_read_input_tokens' => 800,
+            'output_tokens' => in_array($case, ['invalid', 'bad-cache'], true) ? 1 : 40];
+        if ($case === 'no-usage') {
+            $expected = array_fill_keys(array_keys($expected), 0);
+        }
+        same($expected, $deltas[0][1]['usage'], $case . ': all four standard counts use the adopted report');
+        $u = lastUsage($ref);
+        $exact = !in_array($case, ['invalid', 'decreasing', 'bad-cache', 'no-usage'], true);
+        if ($exact) {
+            same([950, 800, 40, 1020, 0], [$u['prompt_tokens'], $u['cached_tokens'], $u['completion_tokens'], $u['charged'], $u['estimated']],
+                $case . ': ledger and client see the same accepted report');
+        } else {
+            same(1, $u['estimated'], $case . ': invalid/missing/non-advancing usage keeps the output byte bound');
+            check($u['charged'] > 0, $case . ': missing usage cannot become free output');
+            if ($case !== 'no-usage') {
+                same([950, 800], [$u['prompt_tokens'], $u['cached_tokens']], $case . ': invalid later reports preserve accepted input');
+            }
+        }
+        same(100000 - $u['charged'], settled($ref)['balance'], $case . ': balance charged exactly once');
+        same($case !== 'broken', in_array('message_stop', array_column($events, 0), true), $case . ': terminal marker reflects stream completion');
+        same($case === 'broken', in_array('error', array_column($events, 0), true), $case . ': broken stream remains an in-band error');
+        echo "ok   messages-stream-usage-case:$case\n";
+    }
 }
 
 function testMessagesHangUpMidStreamIsChargedTheUpstreamCount(): void
