@@ -193,12 +193,12 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
     }
 }
 
-function testMessagesPassesImagesAndDocumentsWithTheMediaOverhead(): void
+function testMessagesBoundsImagesByTheirUpstreamTokenCount(): void
 {
     [$ref, $key] = fundedKey(1000000);
-    $image = ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => 'image/png', 'data' => 'AAAA'], 'extra' => 1];
+    $image = ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => 'image/png', 'data' => str_repeat('A', 100000)], 'extra' => 1];
     $doc = ['type' => 'document', 'source' => ['type' => 'url', 'url' => 'https://example.com/a.pdf']];
-    $body = anthBody('anth', false, ['messages' => [['role' => 'user', 'content' => [$image, $doc]],
+    $body = anthBody('anth', false, ['messages' => [['role' => 'user', 'content' => [$image]],
         ['role' => 'assistant', 'content' => [['type' => 'tool_use', 'id' => 't1', 'name' => 'Read', 'input' => new stdClass()]]],
         ['role' => 'user', 'content' => [['type' => 'tool_result', 'tool_use_id' => 't1', 'content' => [$image]]]]]]);
     $r = http('POST', '/v1/messages', $body, $key);
@@ -207,8 +207,16 @@ function testMessagesPassesImagesAndDocumentsWithTheMediaOverhead(): void
     $fields = Messages::fields($body);
     $plain = $fields;
     $plain['messages'] = [['role' => 'user', 'content' => 'x']];
-    check(Messages::promptBound($fields) >= 3 * Proxy::MEDIA_OVERHEAD, 'each image and document, tool results included, adds the overhead');
-    check(Messages::promptBound($plain) < Proxy::MEDIA_OVERHEAD, 'text alone adds none');
+    $bound = Messages::promptBound($fields, 1000);
+    check($bound >= 2 * 1000 && $bound < 2 * 1000 + 2000, 'each image, tool results included, counts as the upstream token count, not its base64 bytes');
+    same(Messages::promptBound($plain, null), Messages::promptBound($plain, 1000), 'text alone: no image term');
+    $count = static fn (string $alias): int => json_decode(http('POST', '/v1/messages/count_tokens', ['model' => $alias] + $body, $key)['body'], true)['input_tokens'] ?? 0;
+    same($bound, $count('anth'), 'count_tokens answers the bound');
+    same(Messages::promptBound($fields, 3000), $count('vision-two'), 'the route bound is the larger of its upstreams');
+    foreach ([['anth', [$doc], 'documents are not enabled for this model'], ['anth-overloaded', [$image], 'images are not enabled for this model']] as [$alias, $content, $message]) {
+        $r = http('POST', '/v1/messages', anthBody($alias, false, ['messages' => [['role' => 'user', 'content' => $content]]]), $key);
+        same([400, $message], [$r['status'], anthError($r)['message']], $alias);
+    }
 }
 
 function testMessagesInsufficientBalanceIsAnAnthropicError(): void
@@ -238,7 +246,7 @@ function testMessagesCountTokensIsAFreeConservativeEstimate(): void
     $r = http('POST', '/v1/messages/count_tokens', $body, null, 0, ["x-api-key: $key"]);
     same(200, $r['status'], $r['body']);
     $n = json_decode($r['body'], true)['input_tokens'] ?? null;
-    same(Messages::promptBound(Messages::fields($body)), $n, 'the prompt bound a request would reserve for');
+    same(Messages::promptBound(Messages::fields($body), 1000), $n, 'the prompt bound a request would reserve for');
     check($n > Messages::TOOLS_OVERHEAD, 'it covers the tool-use prompt the upstream adds');
     same(1000, settled($ref)['balance'], 'nothing reserved or charged');
     $db = new \PDO('sqlite:' . Harness::get()['dir'] . '/ledger.sqlite');

@@ -21,13 +21,6 @@ final class Proxy
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
     /** Message fields forwarded upstream. */
     private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
-    /** Content part types a chat message may carry besides text, with the field each keeps. */
-    private const MEDIA_PARTS = ['image_url' => 'image_url', 'file' => 'file'];
-    /**
-     * Prompt tokens added to the bound for each image or document: what an upstream bills for one is not bounded by its
-     * bytes (a small, well-compressed picture still costs a full image), so each counts as this many on top of them.
-     */
-    public const MEDIA_OVERHEAD = 4096;
     private const MAX_COUNT = Credits::MAX_COUNT;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -117,7 +110,7 @@ final class Proxy
         $req['messages'] = self::normalizeMessages($req['messages'] ?? null);
         $stream = ($req['stream'] ?? false) === true;
         // Every forwarded byte counts, the operator's params included; one bound must cover whichever upstream answers.
-        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params']), $this->config->routes[$alias]));
+        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($req, $h['params'], $h['image_tokens']), $this->config->routes[$alias]));
         $build = static fn (array $route, int $maxTokens): array => [$route['url'], ['Content-Type: application/json', 'Authorization: Bearer ' . $route['key']],
             self::encode(self::rewrite($req, $route['model'], $maxTokens, $stream, $route['stream_options'], $route['params']))];
         $this->serve($key, $alias, array_keys($this->config->routes[$alias]), $promptBound, $req, $stream, 'chat', $build);
@@ -141,7 +134,7 @@ final class Proxy
         $count = $method === 'countTokens';
         [$chat, $maxReq] = Gemini::request($count && is_array($req['generateContentRequest'] ?? null) ? $req['generateContentRequest'] : $req);
         $chat['messages'] = self::normalizeMessages($chat['messages']);
-        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($chat, $h['params']), $this->config->routes[$alias]));
+        $promptBound = max(array_map(static fn (array $h): int => self::promptBound($chat, $h['params'], $h['image_tokens']), $this->config->routes[$alias]));
         if ($count) {
             Http::json(200, ['totalTokens' => $promptBound]);
             return;
@@ -169,7 +162,7 @@ final class Proxy
         $stream = ($req['stream'] ?? false) === true;
         $build = static fn (array $route, int $maxTokens): array => [(string) $route['messages_url'], Messages::headers($route['key']),
             self::encode(Messages::rewrite($fields, $route['model'], $maxTokens, $stream))];
-        $this->serve($key, $alias, $hops, Messages::promptBound($fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, 'messages', $build);
+        $this->serve($key, $alias, $hops, $this->messagesBound($alias, $hops, $fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, 'messages', $build);
     }
 
     /**
@@ -181,8 +174,19 @@ final class Proxy
     {
         $this->authenticate(Http::apiKey());
         $req = Http::jsonBody(self::MAX_BODY_BYTES);
-        $this->messagesAlias($req);
-        Http::json(200, ['input_tokens' => Messages::promptBound(Messages::fields($req))]);
+        [$alias, $hops] = $this->messagesAlias($req);
+        Http::json(200, ['input_tokens' => $this->messagesBound($alias, $hops, Messages::fields($req))]);
+    }
+
+    /**
+     * The Messages prompt bound of a request on the alias's route entries $hops: the largest over them, as each upstream
+     * may count its images differently.
+     * @param list<int> $hops
+     * @param array<string, mixed> $fields from Messages::fields()
+     */
+    private function messagesBound(string $alias, array $hops, array $fields): int
+    {
+        return max(array_map(fn (int $i): int => Messages::promptBound($fields, $this->config->routes[$alias][$i]['image_tokens']), $hops));
     }
 
     /**
@@ -438,8 +442,8 @@ final class Proxy
 
     /**
      * Validates and rebuilds the messages: a non-empty list of objects with a role, whose content
-     * is a string, null, or a list of text, image_url and file parts, keeping only the known message
-     * fields. Each image or file adds MEDIA_OVERHEAD to the prompt bound.
+     * is a string, null, or a list of text and image_url parts, keeping only the known message fields.
+     * A file part answers 400: no route entry publishes what a document costs.
      * @return list<array<string, mixed>>
      */
     public static function normalizeMessages(mixed $messages): array
@@ -468,10 +472,12 @@ final class Proxy
                     $type = is_array($part) ? ($part['type'] ?? null) : null;
                     if ($type === 'text' && is_string($part['text'] ?? null)) {
                         $parts[] = ['type' => 'text', 'text' => $part['text']];
-                    } elseif (is_string($type) && isset(self::MEDIA_PARTS[$type]) && is_array($part[self::MEDIA_PARTS[$type]] ?? null)) {
-                        $parts[] = ['type' => $type, self::MEDIA_PARTS[$type] => $part[self::MEDIA_PARTS[$type]]];
+                    } elseif ($type === 'image_url' && is_array($part['image_url'] ?? null)) {
+                        $parts[] = ['type' => 'image_url', 'image_url' => $part['image_url']];
+                    } elseif ($type === 'file') {
+                        throw new HttpError(400, 'documents are not enabled for this model', code: 'unsupported_content', param: 'messages');
                     } else {
-                        throw new HttpError(400, 'only text, image and file content is supported', code: 'unsupported_content', param: 'messages');
+                        throw new HttpError(400, 'only text and image content is supported', code: 'unsupported_content', param: 'messages');
                     }
                 }
                 $m['content'] = $parts;
@@ -505,24 +511,39 @@ final class Proxy
     }
 
     /**
-     * Upper bound on the prompt tokens: the byte length of every forwarded prompt field.
-     * A token is at least one byte, and the JSON quoting outweighs chat-template tokens.
+     * Upper bound on the prompt tokens: the byte length of every forwarded prompt field (a token is at least one byte, and
+     * the JSON quoting outweighs chat-template tokens), except that an image counts as the tokens its upstream model
+     * charges for one at most ($imageTokens, the route entry's image_tokens) instead of its URL's bytes.
      * @param array<string, mixed> $req
      */
-    public static function promptBound(array $req, array $params = []): int
+    public static function promptBound(array $req, array $params = [], ?int $imageTokens = null): int
     {
-        // An image counts as MEDIA_OVERHEAD instead of its data URL's bytes; a file keeps its bytes too (pages are unbounded).
-        [$media, $imageBytes] = [0, 0];
+        [$images, $imageBytes] = [0, 0];
         foreach (is_array($req['messages'] ?? null) ? $req['messages'] : [] as $m) {
             foreach (is_array($m['content'] ?? null) ? $m['content'] : [] as $part) {
-                if (isset(self::MEDIA_PARTS[$part['type'] ?? ''])) {
-                    $media++;
-                    $url = $part['type'] === 'image_url' ? ($part['image_url']['url'] ?? null) : null;
+                if (($part['type'] ?? null) === 'image_url') {
+                    $images++;
+                    $url = $part['image_url']['url'] ?? null;
                     $imageBytes += is_string($url) ? strlen($url) : 0;
                 }
             }
         }
-        return strlen(self::encode(array_replace(self::promptFields($req), $params))) - $imageBytes + 16 + self::MEDIA_OVERHEAD * $media;
+        return strlen(self::encode(array_replace(self::promptFields($req), $params))) - $imageBytes + 16 + self::imageBound($images, $imageTokens);
+    }
+
+    /**
+     * The prompt tokens $images images cost at most on an upstream whose model charges at most $imageTokens per image, or a
+     * 400 when it takes images and the route entry publishes no count (an image whose price is unknown is not sent).
+     */
+    public static function imageBound(int $images, ?int $imageTokens): int
+    {
+        if ($images === 0) {
+            return 0;
+        }
+        if ($imageTokens === null) {
+            throw new HttpError(400, 'images are not enabled for this model', code: 'unsupported_content', param: 'messages');
+        }
+        return $images * $imageTokens;
     }
 
     /**

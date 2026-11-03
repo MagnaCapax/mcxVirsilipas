@@ -45,6 +45,10 @@ return [
                 // 'cost': this upstream's own prices in millionths of its currency unit per million tokens (0.30 = 300000),
                 // recorded as the usage row's upstream cost when the upstream reports none itself. Never shown to clients.
                 ['upstream' => 'spare', 'model' => 'example-org/example-model', 'cost' => ['input' => 300000, 'cached_input' => 30000, 'output' => 1200000]]]],
+        // 'image_tokens' on a route entry: the most prompt tokens that upstream's model charges for one image, from the
+        // model's published figure. An image counts as that in the reservation; a route entry without it takes no images.
+        // 'vision' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000,
+        //     'route' => [['upstream' => 'main', 'model' => 'example-org/example-vision-model', 'image_tokens' => 1024]]],
         // 'default-think' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000, 'params' => ['reasoning_effort' => 'high'],
         //     'route' => [['upstream' => 'main', 'model' => 'example-org/example-model']]],
     ],

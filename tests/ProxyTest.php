@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use MagnaCapax\Virsilipas\Config;
+use MagnaCapax\Virsilipas\HttpError;
 use MagnaCapax\Virsilipas\Proxy;
 
 function testRewriteForwardsOnlyAllowlistedFields(): void
@@ -19,15 +20,30 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
     check(!isset($plain['stream_options']), 'no stream_options on a non-streaming request');
 }
 
-function testImageAndFilePartsPassWithTheMediaOverhead(): void
+function testImagesAreBoundedByTheirUpstreamTokenCount(): void
 {
-    $img = ['type' => 'image_url', 'image_url' => ['url' => 'data:image/png;base64,AAAA', 'detail' => 'low'], 'extra' => 1];
-    $file = ['type' => 'file', 'file' => ['file_data' => 'data:application/pdf;base64,AAAA']];
-    $msgs = [['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], $img, $file]]];
-    $norm = Proxy::normalizeMessages($msgs);
-    same([['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => $img['image_url']], $file], $norm[0]['content'], 'media parts kept, unknown part fields dropped');
-    $text = Proxy::promptBound(['messages' => [['role' => 'user', 'content' => 'look']]]);
-    check(Proxy::promptBound(['messages' => $norm]) >= $text + 2 * Proxy::MEDIA_OVERHEAD, 'each image or file adds the overhead');
+    $data = 'data:image/png;base64,' . str_repeat('A', 200000);
+    $img = ['type' => 'image_url', 'image_url' => ['url' => $data, 'detail' => 'low'], 'extra' => 1];
+    $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], $img, $img]]]);
+    same([['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => $img['image_url']], ['type' => 'image_url', 'image_url' => $img['image_url']]], $norm[0]['content'], 'image parts kept, unknown part fields dropped');
+    $empty = Proxy::normalizeMessages([['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => ['url' => '', 'detail' => 'low']], ['type' => 'image_url', 'image_url' => ['url' => '', 'detail' => 'low']]]]]);
+    $base = Proxy::promptBound(['messages' => $empty], [], 1024);
+    same($base, Proxy::promptBound(['messages' => $norm], [], 1024), 'the base64 bytes are not counted');
+    same($base + 2 * (777 - 1024), Proxy::promptBound(['messages' => $norm], [], 777), 'each image counts as its upstream token count');
+    $text = ['messages' => [['role' => 'user', 'content' => 'look']]];
+    same(Proxy::promptBound($text), Proxy::promptBound($text, [], 1024), 'text alone: no image term');
+    try {
+        Proxy::promptBound(['messages' => $norm]);
+        throw new \RuntimeException('an image was bounded on an upstream without image_tokens');
+    } catch (HttpError $e) {
+        same([400, 'images are not enabled for this model'], [$e->status, $e->getMessage()]);
+    }
+    try {
+        Proxy::normalizeMessages([['role' => 'user', 'content' => [['type' => 'file', 'file' => ['file_data' => 'data:application/pdf;base64,AAAA']]]]]);
+        throw new \RuntimeException('a file part was admitted');
+    } catch (HttpError $e) {
+        same([400, 'documents are not enabled for this model'], [$e->status, $e->getMessage()]);
+    }
 }
 
 function testOnlyTextContentIsAdmitted(): void

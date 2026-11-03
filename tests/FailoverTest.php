@@ -228,6 +228,10 @@ function testConfigRoutesAndParams(): void
         ['models' => ['m' => $model + ['model' => 'x', 'description' => 5]]],
         ['models' => ['m' => $model + ['route' => [['upstream' => 'a', 'model' => 'x', 'url' => 'https://c.example.com/v1']]]]],
         ['models' => ['m' => $model + ['stream_options' => ['include_usage' => true], 'route' => [['upstream' => 'a', 'model' => 'x']]]]],
+        ['models' => ['m' => $model + ['route' => [['upstream' => 'a', 'model' => 'x', 'image_tokens' => 0]]]]],
+        ['models' => ['m' => $model + ['route' => [['upstream' => 'a', 'model' => 'x', 'image_tokens' => '1024']]]]],
+        ['models' => ['m' => $model + ['image_tokens' => 1024, 'route' => [['upstream' => 'a', 'model' => 'x']]]]],
+        ['models' => ['m' => $model + ['model' => 'x', 'image_tokens' => -1]]],
         ['retries' => 3],
         ['retries' => -1],
         ['upstreams' => ['a' => ['url' => 'http://a.example.com/v1', 'key_file' => '/k']]],   // plain http off this machine

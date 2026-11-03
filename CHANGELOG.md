@@ -4,6 +4,13 @@ Versions are git tags `vX.Y.Z`. A release that changes the database schema says 
 
 ## Unreleased
 
+## v0.20.0 (2026-11-03)
+
+No schema change. Config: a new optional route-entry key, `image_tokens`.
+
+- **Images are reserved at their model's own token count.** `Proxy::MEDIA_OVERHEAD`, a flat 4096 tokens per image with no source, is gone. A route entry's `image_tokens` (an integer from 1) holds the most prompt tokens its upstream's model charges for one image, from the model's published figure; an image counts as that in the prompt bound instead of its encoded bytes, and the bound of a route is the largest over its entries (Messages included, which used one bound before). The charge stays the upstream's reported count. A route entry without `image_tokens` answers 400 `images are not enabled for this model`, since an image with no published bound cannot be reserved for.
+- **Documents are not enabled.** Messages document blocks, chat `file` parts and Gemini non-image data answer 400 `documents are not enabled for this model`: no upstream publishes a bound for a document's pages.
+
 ## v0.19.0 (2026-11-03)
 
 No schema change.

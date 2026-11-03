@@ -160,7 +160,9 @@ function testGeminiInlineImagesBecomeChatImageParts(): void
     $r = gem('ok', 'generateContent', $body, $key);
     same(200, $r['status'], $r['body']);
     $n = json_decode(gem('ok', 'countTokens', $body, $key)['body'], true)['totalTokens'] ?? 0;
-    check($n >= 2 * Proxy::MEDIA_OVERHEAD, 'each image adds the media overhead to the bound');
+    check($n >= 2 * 1000 && $n < 2 * 1000 + 600, 'each image counts as its upstream token count (1000 on ok), its bytes not at all');
+    $r = gem('final-only', 'generateContent', $body, $key);
+    same([400, 'images are not enabled for this model'], [$r['status'], gemError($r)['message']], 'an upstream without image_tokens takes no images');
 }
 
 function testGeminiRefusesWhatCannotBeBounded(): void
@@ -170,6 +172,7 @@ function testGeminiRefusesWhatCannotBeBounded(): void
         gemBody(['contents' => [['role' => 'user', 'parts' => [['text' => 'look', 'inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'user', 'parts' => [['inlineData' => ['data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'user', 'parts' => [['fileData' => ['mimeType' => 'application/pdf', 'fileUri' => 'https://example.com/a.pdf']]]]]]),
+        gemBody(['contents' => [['role' => 'user', 'parts' => [['inlineData' => ['mimeType' => 'application/pdf', 'data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'model', 'parts' => [['inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'user', 'parts' => [['functionCall' => ['name' => 'f']]]]]]),
         gemBody(['contents' => [['role' => 'model', 'parts' => [['functionCall' => ['name' => 'f', 'args' => [1, 2]]]]]]]),

@@ -5,7 +5,7 @@ declare(strict_types=1);
 // Live smoke test, run on the proxy host as the PHP user after a deploy:
 //
 //   runuser -u www-data -- env VIRSILIPAS_CONFIG=/etc/virsilipas/config.php \
-//       php tools/smoke.php --url https://proxy.example.com --model default
+//       php tools/smoke.php --url https://proxy.example.com --model default [--image screenshot.png]
 //
 // Creates a key smoke-<UTC time>-<random>, grants it --credits, sends one small non-streaming request
 // through the public endpoint, and checks the ledger: the credit log holds the grant, the
@@ -20,7 +20,7 @@ use MagnaCapax\Virsilipas\Ledger;
 
 require dirname(__DIR__) . '/src/bootstrap.php';
 
-$opt = ['url' => '', 'model' => '', 'credits' => '1000000'];
+$opt = ['url' => '', 'model' => '', 'credits' => '1000000', 'image' => ''];
 for ($i = 1; $i < $argc; $i++) {
     $name = substr($argv[$i], 2);
     if (!str_starts_with($argv[$i], '--') || !array_key_exists($name, $opt) || !isset($argv[$i + 1])) {
@@ -29,8 +29,10 @@ for ($i = 1; $i < $argc; $i++) {
     }
     $opt[$name] = $argv[++$i];
 }
-if ($opt['url'] === '' || $opt['model'] === '' || !ctype_digit($opt['credits']) || (int) $opt['credits'] < 1) {
-    fwrite(STDERR, "Usage: php tools/smoke.php --url <base url> --model <alias> [--credits N]\n");
+$image = $opt['image'] === '' ? null : @file_get_contents($opt['image']);
+$mime = is_string($image) ? (getimagesizefromstring($image)['mime'] ?? null) : null;
+if ($opt['url'] === '' || $opt['model'] === '' || !ctype_digit($opt['credits']) || (int) $opt['credits'] < 1 || ($opt['image'] !== '' && !is_string($mime))) {
+    fwrite(STDERR, "Usage: php tools/smoke.php --url <base url> --model <alias> [--credits N] [--image <image file>]\n");
     exit(2);
 }
 $credits = (int) $opt['credits'];
@@ -50,11 +52,13 @@ try {
     curl_setopt_array($c, [CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 120,
         CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $key, 'Content-Type: application/json'],
         CURLOPT_POSTFIELDS => json_encode(['model' => $opt['model'], 'max_tokens' => 64,
-            'messages' => [['role' => 'user', 'content' => 'Reply with the single word: ok']]])]);
+            'messages' => [['role' => 'user', 'content' => $image === null ? 'Reply with the single word: ok' : [['type' => 'text', 'text' => 'Name the main colour of this image in one word.'],
+                ['type' => 'image_url', 'image_url' => ['url' => "data:$mime;base64," . base64_encode($image)]]]]]])]);
     $body = curl_exec($c);
     $code = (int) curl_getinfo($c, CURLINFO_RESPONSE_CODE);
     $answer = is_string($body) ? json_decode($body, true) : null;
-    $check($code === 200 && is_array($answer), "$ref: request answered $code");
+    $check($code === 200 && is_array($answer), "$ref: request answered $code" . ($image === null ? '' : ' with an image: ' . json_encode($answer['choices'][0]['message']['content'] ?? $body)
+        . ', prompt_tokens ' . json_encode($answer['usage']['prompt_tokens'] ?? null)));
     $charged = (int) ($answer['usage']['credits'] ?? -1);
 
     $rows = array_reverse($ledger->history($ref)); // oldest first

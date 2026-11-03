@@ -18,9 +18,9 @@ final class Config
     private const KEYS = ['db_path', 'upstream_url', 'upstream_key_file', 'upstream_timeout', 'max_tokens_cap', 'max_concurrent_per_key', 'lease_seconds',
         'requests_per_minute', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
         'upstreams', 'models', 'caps'];
-    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'description', 'context_length'];
+    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'description', 'context_length', 'image_tokens'];
     private const UPSTREAM_KEYS = ['url', 'messages_url', 'key_file', 'stream_options'];
-    private const ROUTE_KEYS = ['upstream', 'model', 'params', 'cost'];
+    private const ROUTE_KEYS = ['upstream', 'model', 'params', 'cost', 'image_tokens'];
 
     public readonly string $dbPath;
     public readonly ?string $upstreamUrl;
@@ -259,8 +259,8 @@ final class Config
     private function hops(string $alias, array $m, array $upstreams, array $params): array
     {
         if (isset($m['route'])) {
-            if (isset($m['model']) || isset($m['url']) || isset($m['messages_url']) || isset($m['key_file']) || isset($m['stream_options'])) {
-                throw new \InvalidArgumentException("config: models.$alias has a route, so its model belongs in the route entries and url, messages_url, key_file and stream_options in upstreams");
+            if (isset($m['model']) || isset($m['url']) || isset($m['messages_url']) || isset($m['key_file']) || isset($m['stream_options']) || isset($m['image_tokens'])) {
+                throw new \InvalidArgumentException("config: models.$alias has a route, so its model and image_tokens belong in the route entries and url, messages_url, key_file and stream_options in upstreams");
             }
             if (!is_array($m['route']) || $m['route'] === [] || !array_is_list($m['route'])) {
                 throw new \InvalidArgumentException("config: models.$alias.route must be a non-empty list of upstream and model entries");
@@ -272,7 +272,8 @@ final class Config
                     throw new \InvalidArgumentException("config: {$at}upstream must name an entry of upstreams");
                 }
                 self::known($h, self::ROUTE_KEYS, $at);
-                $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params, 'cost' => self::cost($h, $at)];
+                $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params, 'cost' => self::cost($h, $at),
+                    'image_tokens' => self::imageTokens($h, $at)];
             }
             return $hops;
         }
@@ -295,7 +296,24 @@ final class Config
         }
         $u['messages_url'] = self::messagesUrl($m, "models.$alias.");
         $u['stream_options'] = isset($m['stream_options']) ? self::streamOptions($m, 'stream_options', "models.$alias.") : $this->streamOptions;
-        return [$u + ['model' => $m['model'], 'params' => $params, 'cost' => null]];
+        return [$u + ['model' => $m['model'], 'params' => $params, 'cost' => null, 'image_tokens' => self::imageTokens($m, "models.$alias.")]];
+    }
+
+    /**
+     * The tokens one image costs at most on this upstream model, as its provider publishes it, or null when the model takes
+     * no images (or publishes no count): such a model answers images with 400. It bounds the reservation and, when the
+     * upstream reports no usage, the charge (ADR 0008); a reported count is what is charged.
+     * @param array<string, mixed> $c
+     */
+    private static function imageTokens(array $c, string $at): ?int
+    {
+        if (!array_key_exists('image_tokens', $c)) {
+            return null;
+        }
+        if (!is_int($c['image_tokens']) || $c['image_tokens'] < 1 || $c['image_tokens'] > Credits::MAX_COUNT) {
+            throw new \InvalidArgumentException("config: {$at}image_tokens must be an integer from 1 to " . Credits::MAX_COUNT);
+        }
+        return $c['image_tokens'];
     }
 
     /**

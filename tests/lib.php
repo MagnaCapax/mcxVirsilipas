@@ -83,6 +83,8 @@ function configArrayFor(string $dir, array $overrides = []): array
     foreach (SCENARIOS as $alias => $scenario) {
         $models[$alias] = ['model' => $scenario] + unitRates();
     }
+    // The upstream model of 'ok' publishes at most 1000 tokens per image; the other aliases take no images.
+    $models['ok']['image_tokens'] = 1000;
     // Round example weights for the credit tests: cached input a quarter of fresh, output four times fresh.
     $models['weighted'] = ['model' => 'scenario-cached', 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
     // The same counts in the other usage shape (top-level cache-hit count, usage only at the end of a stream).
@@ -113,7 +115,7 @@ function configArrayFor(string $dir, array $overrides = []): array
         'params' => ['reasoning_effort' => 'low'], 'description' => 'fast, little reasoning', 'context_length' => 128000] + unitRates();
     // Anthropic Messages aliases: the 'msgs' upstream has a messages_url (and its own key); 'primary' has none, so only
     // the second entry of anth-mixed serves /v1/messages. anth is priced like 'weighted', for the cached-input test.
-    $models['anth'] = ['route' => [$hop('msgs', 'scenario-anth-ok')], 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
+    $models['anth'] = ['route' => [$hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 1000]], 'input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000];
     foreach (['zero', 'missing', 'partial', 'cache', 'preserve', 'invalid', 'decreasing', 'bad-cache', 'no-usage', 'broken'] as $case) {
         $models['anth-usage-' . $case] = ['route' => [$hop('msgs', 'scenario-anth-usage-' . $case)]]
             + array_intersect_key($models['anth'], unitRates());
@@ -121,6 +123,8 @@ function configArrayFor(string $dir, array $overrides = []): array
     $models['anth-slow'] = ['route' => [$hop('msgs', 'scenario-anth-slow')]] + unitRates();
     $models['anth-overloaded'] = ['route' => [$hop('msgs', 'scenario-anth-529')]] + unitRates();
     $models['anth-mixed'] = ['route' => [$hop('primary', 'scenario-ok'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();
+    // Two upstreams whose models count an image differently: the bound takes the larger.
+    $models['vision-two'] = ['route' => [$hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 500], $hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 3000]]] + unitRates();
     return $overrides + [
         'upstreams' => [
             'primary' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],

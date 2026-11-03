@@ -76,7 +76,7 @@ final class Gemini
      * The contents as chat messages. A user content's function responses become tool messages and its text one user
      * message; a model content's text and function calls become one assistant message. Function calls without an id get
      * one (call_N), and a response without an id answers the oldest unanswered call of its name. Thought parts are not
-     * replayed. A user content's inline data and file data become chat image_url (image types) or file parts next to
+     * replayed. A user content's inline data and file data of an image type become chat image_url parts next to
      * its text. Any other part (code execution, ...) is refused.
      * @return list<array<string, mixed>>
      */
@@ -130,7 +130,7 @@ final class Gemini
 
     /**
      * An inline data ({mimeType, data}: base64) or file data ({mimeType, fileUri}) part as a chat part: image_url for an
-     * image type, file otherwise; a 400 when the mime type or the data is missing.
+     * image type; a 400 for any other type (documents are not enabled) or when the mime type or the data is missing.
      * @return array<string, mixed>
      */
     private static function media(mixed $d, bool $inline): array
@@ -141,14 +141,10 @@ final class Gemini
             throw new HttpError(400, 'inline data needs a mimeType and data, file data a mimeType and fileUri', code: 'invalid_messages', param: 'contents');
         }
         $url = $inline ? "data:$mime;base64,$value" : $value;
-        if (str_starts_with($mime, 'image/')) {
-            return ['type' => 'image_url', 'image_url' => ['url' => $url]];
+        if (!str_starts_with($mime, 'image/')) {
+            throw new HttpError(400, 'documents are not enabled for this model', code: 'unsupported_content', param: 'contents');
         }
-        if (!$inline) {
-            // Chat has no part that takes a file by URI except an image.
-            throw new HttpError(400, 'file data by URI is supported for images only; send other files as inline data', code: 'unsupported_content', param: 'contents');
-        }
-        return ['type' => 'file', 'file' => ['file_data' => $url]];
+        return ['type' => 'image_url', 'image_url' => ['url' => $url]];
     }
 
     /**
