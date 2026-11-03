@@ -4,6 +4,12 @@ Versions are git tags `vX.Y.Z`. A release that changes the database schema says 
 
 ## Unreleased
 
+## v0.20.1 (2026-11-03)
+
+No schema change.
+
+- **A request over the key's `max_concurrent` gets `Retry-After` 2 to 8 s at random, not 1.** Clients honour a positive Retry-After exactly and with no jitter. At 1 s, every client refused at once came back in the same second, and a client allowed 10 retries gave up after about 10 s, which is shorter than a typical request takes to free a slot. A random 2 to 8 s spreads those retries out, and 10 of them last about as long as the client's own backoff would.
+
 ## v0.20.0 (2026-11-03)
 
 No schema change. Config: a new optional route-entry key, `image_tokens`.

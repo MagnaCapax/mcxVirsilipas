@@ -32,6 +32,13 @@ final class Ledger
     private const MAX_TIME = 253_402_300_799;
     private const SCHEMA_VERSION = 12;
     /**
+     * Retry-After bounds in seconds for a request over the key's max_concurrent. A slot frees whenever any of the
+     * key's requests ends, which no one can predict, so the wait is drawn at random: clients refused together come
+     * back apart, and a client that retries up to 10 times keeps trying for about as long as its own backoff would.
+     */
+    private const CONCURRENCY_RETRY_MIN = 2;
+    private const CONCURRENCY_RETRY_MAX = 8;
+    /**
      * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 11 gain the columns below, and every older
      * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
      */
@@ -700,7 +707,8 @@ final class Ledger
             $st = $this->db->prepare('SELECT COUNT(*) FROM leases WHERE key_id = ? AND settled = 0 AND expires_at > ?');
             $st->execute([$keyId, $now]);
             if ((int) $st->fetchColumn() >= $limits['max_concurrent']) {
-                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error', 1, 'rate_limit_exceeded');
+                throw new HttpError(429, 'too many concurrent requests for this key', 'rate_limit_error',
+                    random_int(self::CONCURRENCY_RETRY_MIN, self::CONCURRENCY_RETRY_MAX), 'rate_limit_exceeded');
             }
 
             if ($limits['requests_per_minute'] !== null || $limits['credits_per_minute'] !== null) {

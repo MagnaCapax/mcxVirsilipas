@@ -491,7 +491,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat · gemini |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model, or not served in the Messages format; see /v1/models | | messages |
 | 413 | `invalid_request_error` | `request_too_large` | request body too large | | all POST routes |
-| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 1 for concurrency; else until the oldest request in the key's window is a minute old | chat · messages · gemini |
+| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 2 to 8 at random for concurrency; else until the oldest request in the key's window is a minute old | chat · messages · gemini |
 | 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat · messages · gemini |
 | 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat · messages · gemini, from the upstream |
 | 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat · messages · gemini, from the upstream |

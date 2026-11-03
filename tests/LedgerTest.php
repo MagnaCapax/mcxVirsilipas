@@ -129,6 +129,16 @@ function testConcurrencyLimitPerKey(): void
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(2), 60);
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(2), 60);
     same(429, throwsHttp(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(2), 60))[0]);
+    $waits = [];
+    for ($i = 0; $i < 200; $i++) {
+        try {
+            $l->reserve($id, 10, 10, 1000, unitRates(), lim(2), 60);
+        } catch (\MagnaCapax\Virsilipas\HttpError $e) {
+            $waits[$e->retryAfter] = true;
+        }
+    }
+    check(min(array_keys($waits)) >= 2 && max(array_keys($waits)) <= 8, 'concurrency Retry-After stays within 2 to 8 s');
+    check(count($waits) > 1, 'concurrency Retry-After varies, so clients refused together do not retry together');
 }
 
 function testExpiredLeaseStaysChargedAndALateSettleCorrectsItOnce(): void
