@@ -4,6 +4,13 @@ Versions are git tags `vX.Y.Z`. A release that changes the database schema says 
 
 ## Unreleased
 
+## v0.18.1 (2026-11-03)
+
+No schema change.
+
+- A streamed Messages `message_delta` now carries all four standard usage counts (input, cache creation, cache read, output) from the adopted report, so input and cache counts that arrive after `message_start` reach the client as well as settlement. Before, the delta carried only the output count and a client could not see the late counts the proxy charged for. Charges are unchanged.
+- Tests: ten HTTP stream cases (zero, missing, partial, late cache split, preserved earlier counts, invalid, decreasing, malformed cache, no usage, broken stream).
+
 ## v0.18.0 (2026-10-31)
 
 Schema 12, upgraded in place: grants gain nullable `target_credits` and `target_day`, with one daily target per key and UTC day.
