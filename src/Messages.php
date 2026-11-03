@@ -15,16 +15,21 @@ final class Messages
     /** Request fields forwarded upstream besides model, max_tokens and stream (which the proxy sets). Anything else is dropped. */
     private const FORWARD = ['messages', 'system', 'stop_sequences', 'temperature', 'top_p', 'top_k', 'tools', 'tool_choice', 'thinking', 'metadata'];
     /**
-     * The content block types a request may carry, each with the fields kept. Images and documents are refused, as on
-     * chat: their cost cannot be bounded by their bytes. Server tool blocks are refused with server tools (below).
+     * The content block types a request may carry, each with the fields kept. Images and documents pass (the upstream
+     * decides what its model reads); each adds Proxy::MEDIA_OVERHEAD to the prompt bound. Server tool blocks are
+     * refused with server tools (below).
      */
     private const BLOCKS = [
         'text' => ['type', 'text', 'cache_control'],
+        'image' => ['type', 'source', 'cache_control'],
+        'document' => ['type', 'source', 'title', 'context', 'citations', 'cache_control'],
         'tool_use' => ['type', 'id', 'name', 'input', 'cache_control'],
         'tool_result' => ['type', 'tool_use_id', 'content', 'is_error', 'cache_control'],
         'thinking' => ['type', 'thinking', 'signature'],
         'redacted_thinking' => ['type', 'data'],
     ];
+    /** The block types a tool result's content may hold. */
+    private const RESULT_BLOCKS = ['text', 'image', 'document'];
     /** The fields of a client tool definition. Server tools (any other `type`) are refused: they carry fees no token rate covers. */
     private const TOOL_FIELDS = ['type', 'name', 'description', 'input_schema', 'cache_control'];
     /** Prompt tokens an upstream adds on its own when tools are given (its tool-use system prompt), on top of the bytes. */
@@ -78,7 +83,32 @@ final class Messages
      */
     public static function promptBound(array $fields): int
     {
-        return strlen(Proxy::encode($fields)) + 16 + (isset($fields['tools']) ? self::TOOLS_OVERHEAD : 0);
+        [$count, $imageBytes] = self::media($fields['messages'] ?? []);
+        return strlen(Proxy::encode($fields)) - $imageBytes + 16 + (isset($fields['tools']) ? self::TOOLS_OVERHEAD : 0)
+            + Proxy::MEDIA_OVERHEAD * $count;
+    }
+
+    /**
+     * Image and document blocks in the messages, tool results included, and the bytes of the images' base64 data: an
+     * image is bounded by the overhead, not by its encoding (a screenshot is ~100 kB of base64 for ~2,000 tokens), while
+     * a document keeps its bytes as well, since its pages are not otherwise bounded.
+     * @return array{0: int, 1: int}
+     */
+    private static function media(array $messages): array
+    {
+        [$n, $bytes] = [0, 0];
+        foreach ($messages as $m) {
+            foreach (is_array($m['content'] ?? null) ? $m['content'] : [] as $b) {
+                foreach (array_merge([$b], is_array($b['content'] ?? null) ? $b['content'] : []) as $x) {
+                    if (in_array($x['type'], ['image', 'document'], true)) {
+                        $n++;
+                        $data = $x['type'] === 'image' ? ($x['source']['data'] ?? null) : null;
+                        $bytes += is_string($data) ? strlen($data) : 0;
+                    }
+                }
+            }
+        }
+        return [$n, $bytes];
     }
 
     /**
@@ -360,11 +390,14 @@ final class Messages
         foreach ($blocks as $b) {
             $type = is_array($b) ? ($b['type'] ?? null) : null;
             if (!is_string($type) || !in_array($type, $types, true)) {
-                throw new HttpError(400, 'only text, tool use, tool result and thinking content is supported', code: 'unsupported_content', param: $param);
+                throw new HttpError(400, 'only text, image, document, tool use, tool result and thinking content is supported', code: 'unsupported_content', param: $param);
             }
             $b = array_intersect_key($b, array_flip(self::BLOCKS[$type]));
+            if (($type === 'image' || $type === 'document') && (($b['source'] ?? []) === [] || !self::isObject($b['source']))) {
+                throw new HttpError(400, "an $type block needs a source object", code: 'invalid_messages', param: $param);
+            }
             if ($type === 'tool_result' && array_key_exists('content', $b) && !is_string($b['content'])) {
-                $b['content'] = self::blocks($b['content'], ['text'], $param);
+                $b['content'] = self::blocks($b['content'], self::RESULT_BLOCKS, $param);
             }
             $out[] = $b;
         }

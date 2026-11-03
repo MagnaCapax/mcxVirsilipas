@@ -272,8 +272,9 @@ function testIntegrationRefusals(): void
     [, $key2] = fundedKey(1000);
     same(404, http('POST', '/v1/chat/completions', msg('not-a-model', true), $key2)['status']);
     same(404, http('GET', '/v1/nothing', null, $key2)['status']);
+    [, $key3] = fundedKey(1000000);
     $image = ['model' => 'ok', 'messages' => [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => ['url' => 'https://example.com/a.png']]]]]];
-    same(400, http('POST', '/v1/chat/completions', $image, $key2)['status'], 'images refused');
+    same(200, http('POST', '/v1/chat/completions', $image, $key3)['status'], 'images pass');
     Harness::get()['ledger']->setActive($ref, false);
     same(403, http('GET', '/v1/models', null, $key)['status']);
 }

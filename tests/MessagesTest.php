@@ -180,9 +180,9 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
     same([1000, ['type' => 'enabled', 'budget_tokens' => 999]], [$up['max_tokens'], $up['thinking']], 'max_tokens clamped to the cap, the thinking budget below it');
     same('2023-06-01', $up['anthropic_version'], 'the default version when the client sends none');
     foreach ([
-        ['messages' => [['role' => 'user', 'content' => [['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => 'image/png', 'data' => 'AAAA']]]]]],
-        ['messages' => [['role' => 'user', 'content' => [['type' => 'document', 'source' => ['type' => 'url', 'url' => 'https://example.com/a.pdf']]]]]],
+        ['messages' => [['role' => 'user', 'content' => [['type' => 'image']]]]],
         ['messages' => [['role' => 'user', 'content' => [['type' => 'tool_result', 'tool_use_id' => 't', 'content' => [['type' => 'image', 'source' => []]]]]]]],
+        ['messages' => [['role' => 'user', 'content' => [['type' => 'audio', 'source' => ['type' => 'base64', 'data' => 'AAAA']]]]]],
         ['tools' => [['type' => 'web_search_20250305', 'name' => 'web_search']]],
         ['messages' => []], ['messages' => [['content' => 'no role']]], ['messages' => [['role' => 'user', 'content' => 42]]],
         ['system' => [['type' => 'tool_use', 'id' => 'x', 'name' => 'f', 'input' => []]]],
@@ -191,6 +191,24 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
         $r = http('POST', '/v1/messages', $bad + anthBody('anth', false), $key);
         same([400, 'invalid_request_error'], [$r['status'], anthError($r)['type']], json_encode($bad));
     }
+}
+
+function testMessagesPassesImagesAndDocumentsWithTheMediaOverhead(): void
+{
+    [$ref, $key] = fundedKey(1000000);
+    $image = ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => 'image/png', 'data' => 'AAAA'], 'extra' => 1];
+    $doc = ['type' => 'document', 'source' => ['type' => 'url', 'url' => 'https://example.com/a.pdf']];
+    $body = anthBody('anth', false, ['messages' => [['role' => 'user', 'content' => [$image, $doc]],
+        ['role' => 'assistant', 'content' => [['type' => 'tool_use', 'id' => 't1', 'name' => 'Read', 'input' => new stdClass()]]],
+        ['role' => 'user', 'content' => [['type' => 'tool_result', 'tool_use_id' => 't1', 'content' => [$image]]]]]]);
+    $r = http('POST', '/v1/messages', $body, $key);
+    same(200, $r['status'], $r['body']);
+    same(['type', 'source'], lastUpstreamRequest()['block_keys'], 'an image keeps its type and source, unknown fields dropped');
+    $fields = Messages::fields($body);
+    $plain = $fields;
+    $plain['messages'] = [['role' => 'user', 'content' => 'x']];
+    check(Messages::promptBound($fields) >= 3 * Proxy::MEDIA_OVERHEAD, 'each image and document, tool results included, adds the overhead');
+    check(Messages::promptBound($plain) < Proxy::MEDIA_OVERHEAD, 'text alone adds none');
 }
 
 function testMessagesInsufficientBalanceIsAnAnthropicError(): void

@@ -19,6 +19,17 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
     check(!isset($plain['stream_options']), 'no stream_options on a non-streaming request');
 }
 
+function testImageAndFilePartsPassWithTheMediaOverhead(): void
+{
+    $img = ['type' => 'image_url', 'image_url' => ['url' => 'data:image/png;base64,AAAA', 'detail' => 'low'], 'extra' => 1];
+    $file = ['type' => 'file', 'file' => ['file_data' => 'data:application/pdf;base64,AAAA']];
+    $msgs = [['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], $img, $file]]];
+    $norm = Proxy::normalizeMessages($msgs);
+    same([['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => $img['image_url']], $file], $norm[0]['content'], 'media parts kept, unknown part fields dropped');
+    $text = Proxy::promptBound(['messages' => [['role' => 'user', 'content' => 'look']]]);
+    check(Proxy::promptBound(['messages' => $norm]) >= $text + 2 * Proxy::MEDIA_OVERHEAD, 'each image or file adds the overhead');
+}
+
 function testOnlyTextContentIsAdmitted(): void
 {
     $call = ['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => '{}']];
@@ -29,7 +40,7 @@ function testOnlyTextContentIsAdmitted(): void
         ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => 'ok'], ['role' => 'user', 'content' => [['type' => 'text', 'text' => 'hello']]]], $norm, 'unknown message and part fields dropped');
     $bad = [
         null, [], ['x' => ['role' => 'user', 'content' => 'hi']], [['content' => 'no role']],
-        [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => ['url' => 'https://example.com/a.png']]]]],
+        [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => 'https://example.com/a.png']]]],
         [['role' => 'user', 'content' => [['type' => 'input_audio', 'input_audio' => ['data' => 'AAAA']]]]],
         [['role' => 'user', 'content' => 42]],
         [['role' => 'assistant', 'content' => null, 'tool_calls' => [['id' => 'c1', 'type' => 'function', 'function' => ['name' => 'f', 'arguments' => ['audio' => ['url' => 'external']]]]]]],

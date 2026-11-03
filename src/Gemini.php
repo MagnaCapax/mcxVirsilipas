@@ -18,7 +18,7 @@ final class Gemini
     private const SETTINGS = ['temperature' => 'temperature', 'topP' => 'top_p', 'stopSequences' => 'stop', 'seed' => 'seed',
         'presencePenalty' => 'presence_penalty', 'frequencyPenalty' => 'frequency_penalty'];
     /** The keys a part may have: one of the three kinds below, plus the thought flag and its signature (dropped). */
-    private const PART_KEYS = ['text', 'functionCall', 'functionResponse', 'thought', 'thoughtSignature'];
+    private const PART_KEYS = ['text', 'functionCall', 'functionResponse', 'inlineData', 'fileData', 'thought', 'thoughtSignature'];
     /** Schema keys whose value is a map: an empty one stays {} upstream (a decoded {} is an empty PHP array). */
     private const MAP_KEYS = ['properties', 'patternProperties', '$defs', 'definitions'];
     /** Chat finish reasons in this format; any other is OTHER, and an answer without one is STOP. */
@@ -76,7 +76,8 @@ final class Gemini
      * The contents as chat messages. A user content's function responses become tool messages and its text one user
      * message; a model content's text and function calls become one assistant message. Function calls without an id get
      * one (call_N), and a response without an id answers the oldest unanswered call of its name. Thought parts are not
-     * replayed. Any other part (inline data, files, code execution) is refused, as images are on chat.
+     * replayed. A user content's inline data and file data become chat image_url (image types) or file parts next to
+     * its text. Any other part (code execution, ...) is refused.
      * @return list<array<string, mixed>>
      */
     private static function messages(mixed $contents): array
@@ -91,9 +92,9 @@ final class Gemini
             if (!in_array($role, ['user', 'model', 'function'], true) || !is_array($parts) || $parts === [] || !array_is_list($parts)) {
                 throw new HttpError(400, 'each content needs a role of user or model and a non-empty list of parts', code: 'invalid_messages', param: 'contents');
             }
-            [$texts, $calls] = [[], []];
+            [$texts, $calls, $media] = [[], [], []];
             foreach ($parts as $p) {
-                $kinds = is_array($p) ? array_intersect(array_keys($p), ['text', 'functionCall', 'functionResponse']) : [];
+                $kinds = is_array($p) ? array_intersect(array_keys($p), ['text', 'functionCall', 'functionResponse', 'inlineData', 'fileData']) : [];
                 $kind = count($kinds) === 1 && array_diff(array_keys($p), self::PART_KEYS) === [] ? reset($kinds) : null;
                 if ($kind === 'text' && is_string($p['text'])) {
                     if (($p['thought'] ?? false) !== true) {
@@ -110,17 +111,44 @@ final class Gemini
                     $id = is_string($given) && $given !== '' ? $given : ($pending[$name][0] ?? 'call_' . ++$n);
                     $pending[$name] = array_values(array_diff($pending[$name] ?? [], [$id]));
                     $out[] = ['role' => 'tool', 'tool_call_id' => $id, 'content' => Proxy::encode($response)];
+                } elseif (($kind === 'inlineData' || $kind === 'fileData') && $role !== 'model') {
+                    $media[] = self::media($p[$kind], $kind === 'inlineData');
                 } else {
-                    throw new HttpError(400, 'only text, function call (model) and function response (user) parts are supported', code: 'unsupported_content', param: 'contents');
+                    throw new HttpError(400, 'only text, inline data and file data (user), function call (model) and function response (user) parts are supported', code: 'unsupported_content', param: 'contents');
                 }
             }
             if ($role === 'model' && ($texts !== [] || $calls !== [])) {
                 $out[] = ['role' => 'assistant', 'content' => $texts === [] ? null : implode("\n", $texts)] + ($calls === [] ? [] : ['tool_calls' => $calls]);
+            } elseif ($role !== 'model' && $media !== []) {
+                $out[] = ['role' => 'user', 'content' => array_merge($texts === [] ? [] : [['type' => 'text', 'text' => implode("\n", $texts)]], $media)];
             } elseif ($role !== 'model' && $texts !== []) {
                 $out[] = ['role' => 'user', 'content' => implode("\n", $texts)];
             }
         }
         return $out;
+    }
+
+    /**
+     * An inline data ({mimeType, data}: base64) or file data ({mimeType, fileUri}) part as a chat part: image_url for an
+     * image type, file otherwise; a 400 when the mime type or the data is missing.
+     * @return array<string, mixed>
+     */
+    private static function media(mixed $d, bool $inline): array
+    {
+        $mime = is_array($d) ? ($d['mimeType'] ?? null) : null;
+        $value = is_array($d) ? ($d[$inline ? 'data' : 'fileUri'] ?? null) : null;
+        if (!is_string($mime) || $mime === '' || !is_string($value) || $value === '') {
+            throw new HttpError(400, 'inline data needs a mimeType and data, file data a mimeType and fileUri', code: 'invalid_messages', param: 'contents');
+        }
+        $url = $inline ? "data:$mime;base64,$value" : $value;
+        if (str_starts_with($mime, 'image/')) {
+            return ['type' => 'image_url', 'image_url' => ['url' => $url]];
+        }
+        if (!$inline) {
+            // Chat has no part that takes a file by URI except an image.
+            throw new HttpError(400, 'file data by URI is supported for images only; send other files as inline data', code: 'unsupported_content', param: 'contents');
+        }
+        return ['type' => 'file', 'file' => ['file_data' => $url]];
     }
 
     /**

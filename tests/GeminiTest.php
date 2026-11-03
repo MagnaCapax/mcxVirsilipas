@@ -152,13 +152,25 @@ function testGeminiReasoningIsAThoughtPart(): void
     same([[['text' => 'thinking it over', 'thought' => true]], 'MAX_TOKENS'], [$c['content']['parts'], $c['finishReason']], 'an empty content makes no part');
 }
 
+function testGeminiInlineImagesBecomeChatImageParts(): void
+{
+    [$ref, $key] = fundedKey(1000000);
+    $body = gemBody(['contents' => [['role' => 'user', 'parts' => [['text' => 'look'], ['inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']],
+        ['fileData' => ['mimeType' => 'image/jpeg', 'fileUri' => 'https://example.com/a.jpg']]]]]]);
+    $r = gem('ok', 'generateContent', $body, $key);
+    same(200, $r['status'], $r['body']);
+    $n = json_decode(gem('ok', 'countTokens', $body, $key)['body'], true)['totalTokens'] ?? 0;
+    check($n >= 2 * Proxy::MEDIA_OVERHEAD, 'each image adds the media overhead to the bound');
+}
+
 function testGeminiRefusesWhatCannotBeBounded(): void
 {
     [$ref, $key] = fundedKey(10000);
     foreach ([
-        gemBody(['contents' => [['role' => 'user', 'parts' => [['inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'user', 'parts' => [['text' => 'look', 'inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']]]]]]),
-        gemBody(['contents' => [['role' => 'user', 'parts' => [['fileData' => ['fileUri' => 'https://example.com/a.pdf']]]]]]),
+        gemBody(['contents' => [['role' => 'user', 'parts' => [['inlineData' => ['data' => 'AAAA']]]]]]),
+        gemBody(['contents' => [['role' => 'user', 'parts' => [['fileData' => ['mimeType' => 'application/pdf', 'fileUri' => 'https://example.com/a.pdf']]]]]]),
+        gemBody(['contents' => [['role' => 'model', 'parts' => [['inlineData' => ['mimeType' => 'image/png', 'data' => 'AAAA']]]]]]),
         gemBody(['contents' => [['role' => 'user', 'parts' => [['functionCall' => ['name' => 'f']]]]]]),
         gemBody(['contents' => [['role' => 'model', 'parts' => [['functionCall' => ['name' => 'f', 'args' => [1, 2]]]]]]]),
         gemBody(['tools' => [['googleSearch' => new stdClass()]]]),

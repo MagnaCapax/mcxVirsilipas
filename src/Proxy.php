@@ -21,6 +21,13 @@ final class Proxy
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
     /** Message fields forwarded upstream. */
     private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
+    /** Content part types a chat message may carry besides text, with the field each keeps. */
+    private const MEDIA_PARTS = ['image_url' => 'image_url', 'file' => 'file'];
+    /**
+     * Prompt tokens added to the bound for each image or document: what an upstream bills for one is not bounded by its
+     * bytes (a small, well-compressed picture still costs a full image), so each counts as this many on top of them.
+     */
+    public const MEDIA_OVERHEAD = 4096;
     private const MAX_COUNT = Credits::MAX_COUNT;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -431,8 +438,8 @@ final class Proxy
 
     /**
      * Validates and rebuilds the messages: a non-empty list of objects with a role, whose content
-     * is text (a string, null, or a list of {"type": "text", "text": ...} parts), keeping only the
-     * known message fields. Images, audio and files are refused: their cost cannot be bounded.
+     * is a string, null, or a list of text, image_url and file parts, keeping only the known message
+     * fields. Each image or file adds MEDIA_OVERHEAD to the prompt bound.
      * @return list<array<string, mixed>>
      */
     public static function normalizeMessages(mixed $messages): array
@@ -458,10 +465,14 @@ final class Proxy
             if (is_array($content)) {
                 $parts = [];
                 foreach ($content as $part) {
-                    if (!is_array($part) || ($part['type'] ?? null) !== 'text' || !is_string($part['text'] ?? null)) {
-                        throw new HttpError(400, 'only text content is supported', code: 'unsupported_content', param: 'messages');
+                    $type = is_array($part) ? ($part['type'] ?? null) : null;
+                    if ($type === 'text' && is_string($part['text'] ?? null)) {
+                        $parts[] = ['type' => 'text', 'text' => $part['text']];
+                    } elseif (is_string($type) && isset(self::MEDIA_PARTS[$type]) && is_array($part[self::MEDIA_PARTS[$type]] ?? null)) {
+                        $parts[] = ['type' => $type, self::MEDIA_PARTS[$type] => $part[self::MEDIA_PARTS[$type]]];
+                    } else {
+                        throw new HttpError(400, 'only text, image and file content is supported', code: 'unsupported_content', param: 'messages');
                     }
-                    $parts[] = ['type' => 'text', 'text' => $part['text']];
                 }
                 $m['content'] = $parts;
             } elseif ($content !== null && !is_string($content)) {
@@ -500,7 +511,18 @@ final class Proxy
      */
     public static function promptBound(array $req, array $params = []): int
     {
-        return strlen(self::encode(array_replace(self::promptFields($req), $params))) + 16;
+        // An image counts as MEDIA_OVERHEAD instead of its data URL's bytes; a file keeps its bytes too (pages are unbounded).
+        [$media, $imageBytes] = [0, 0];
+        foreach (is_array($req['messages'] ?? null) ? $req['messages'] : [] as $m) {
+            foreach (is_array($m['content'] ?? null) ? $m['content'] : [] as $part) {
+                if (isset(self::MEDIA_PARTS[$part['type'] ?? ''])) {
+                    $media++;
+                    $url = $part['type'] === 'image_url' ? ($part['image_url']['url'] ?? null) : null;
+                    $imageBytes += is_string($url) ? strlen($url) : 0;
+                }
+            }
+        }
+        return strlen(self::encode(array_replace(self::promptFields($req), $params))) - $imageBytes + 16 + self::MEDIA_OVERHEAD * $media;
     }
 
     /**

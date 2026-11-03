@@ -4,6 +4,12 @@ Versions are git tags `vX.Y.Z`. A release that changes the database schema says 
 
 ## Unreleased
 
+## v0.19.0 (2026-11-03)
+
+No schema change.
+
+- **Images and documents pass.** Messages image and document blocks (also inside tool results), chat `image_url` and `file` parts, and Gemini `inlineData` and image `fileData` parts are forwarded instead of answering 400 `unsupported_content`. The refusal was an agent decision (2026-10-03) the operator never approved; an LLM proxy that refuses screenshots breaks every client that reads one (a Claude Code Read of a PNG ended the session). Each image or document adds `Proxy::MEDIA_OVERHEAD` (4096) tokens to the prompt bound on top of its bytes; `over_reservation` in the request log shows whether an upstream bills more.
+
 ## v0.18.1 (2026-11-03)
 
 No schema change.
