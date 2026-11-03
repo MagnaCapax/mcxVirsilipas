@@ -32,7 +32,7 @@ final class Config
     /** @var array<string, array{description: string, context_length: ?int}> alias => what /v1/models shows about it besides its rates */
     public readonly array $info;
     /**
-     * @var array<string, list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>>
+     * @var array<string, list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>>
      * alias => its upstreams in failover order: where each request goes (`messages_url`: where an Anthropic Messages request
      * goes, null when that upstream serves none), the model id it asks for and the request fields set there
      */
@@ -254,7 +254,7 @@ final class Config
      * @param array<string, mixed> $m
      * @param array<string, array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>}> $upstreams
      * @param array<string, mixed> $params
-     * @return list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}}>
+     * @return list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>
      */
     private function hops(string $alias, array $m, array $upstreams, array $params): array
     {
