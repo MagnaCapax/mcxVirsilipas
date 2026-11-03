@@ -163,6 +163,9 @@ function testGeminiInlineImagesBecomeChatImageParts(): void
     check($n >= 2 * 1000 && $n < 2 * 1000 + 600, 'each image counts as its upstream token count (1000 on ok), its bytes not at all');
     $r = gem('final-only', 'generateContent', $body, $key);
     same([400, 'images are not enabled for this model'], [$r['status'], gemError($r)['message']], 'an upstream without image_tokens takes no images');
+    [, $small] = fundedKey(1500);
+    same(402, gem('ok', 'generateContent', $body, $small)['status'], 'a balance that covers the text but not two images is refused before anything is sent');
+    same(200, gem('ok', 'generateContent', gemBody(), $small)['status'], 'the same balance still serves text');
 }
 
 function testGeminiRefusesWhatCannotBeBounded(): void
