@@ -16,7 +16,7 @@ final class Config
     public const MAX_RETRIES = 2;
     /** Every setting each level of the config may have: anything else is refused, so a misspelt key never silently drops a limit. */
     private const KEYS = ['db_path', 'upstream_url', 'upstream_key_file', 'upstream_timeout', 'max_tokens_cap', 'max_concurrent_per_key', 'lease_seconds',
-        'requests_per_minute', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
+        'requests_per_minute', 'requests_per_hour', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
         'upstreams', 'models', 'caps'];
     private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'description', 'context_length', 'image_tokens'];
     private const UPSTREAM_KEYS = ['url', 'messages_url', 'key_file', 'stream_options'];
@@ -40,8 +40,9 @@ final class Config
     public readonly int $retries;
     public readonly int $maxTokensCap;
     public readonly int $maxConcurrentPerKey;
-    /** Default per-key limits over the last 60 seconds; null = no limit. A key's own setting overrides them. */
+    /** Default per-key limits over the last 60 seconds (and, for requestsPerHour, 3600); null = no limit. A key's own setting overrides them. */
     public readonly ?int $requestsPerMinute;
+    public readonly ?int $requestsPerHour;
     public readonly ?int $creditsPerMinute;
     public readonly int $leaseSeconds;
     /** @var array<string, mixed> merged into every streaming request as stream_options */
@@ -82,9 +83,10 @@ final class Config
         if ($this->maxTokensCap > Credits::MAX_COUNT) {
             throw new \InvalidArgumentException('config: max_tokens_cap must be at most ' . Credits::MAX_COUNT);
         }
-        $this->maxConcurrentPerKey = self::int($c, 'max_concurrent_per_key', 4);
+        $this->maxConcurrentPerKey = self::int($c, 'max_concurrent_per_key', 64);
         $this->leaseSeconds = self::int($c, 'lease_seconds', 900);
         $this->requestsPerMinute = self::limit($c, 'requests_per_minute');
+        $this->requestsPerHour = self::limit($c, 'requests_per_hour');
         $this->creditsPerMinute = self::limit($c, 'credits_per_minute');
         $this->adminTokenSha256 = strtolower(self::str($c, 'admin_token_sha256'));
         $this->logDir = isset($c['log_dir']) ? self::str($c, 'log_dir') : null;
@@ -176,11 +178,12 @@ final class Config
 
     /**
      * The configured per-key limits, used where a key has no setting of its own.
-     * @return array{max_concurrent: int, requests_per_minute: ?int, credits_per_minute: ?int}
+     * @return array{max_concurrent: int, requests_per_minute: ?int, requests_per_hour: ?int, credits_per_minute: ?int}
      */
     public function limitDefaults(): array
     {
-        return ['max_concurrent' => $this->maxConcurrentPerKey, 'requests_per_minute' => $this->requestsPerMinute, 'credits_per_minute' => $this->creditsPerMinute];
+        return ['max_concurrent' => $this->maxConcurrentPerKey, 'requests_per_minute' => $this->requestsPerMinute,
+            'requests_per_hour' => $this->requestsPerHour, 'credits_per_minute' => $this->creditsPerMinute];
     }
 
     /**

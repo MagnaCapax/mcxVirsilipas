@@ -4,6 +4,13 @@ Versions are git tags `vX.Y.Z`. A release that changes the database schema says 
 
 ## Unreleased
 
+## v0.21.0 (2026-11-04)
+
+Schema 13: `keys` gains the nullable column `requests_per_hour`; `bin/virsilipas init` adds it in place (from schema 2 to 12). Config: a new optional setting, `requests_per_hour`.
+
+- **The default `max_concurrent_per_key` is 64, not 4.** The 4 was an unmeasured guess from the first release; one key running a handful of agents hit it at once. A deployment that sets `max_concurrent_per_key` in its config keeps its own value.
+- **Per-key requests per hour.** `requests_per_hour` (config default, unset means no limit; `POST /admin/keys/limits` and `bin/virsilipas limit` per key) refuses a request with 429 `rate_limit_exceeded` `requests per hour limit reached for this key` once the key has started that many requests in the last 3600 seconds, with `Retry-After` until the oldest of them is an hour old. It is checked after the per-minute limits. `GET /v1/balance` and `bin/virsilipas status` show it in `limits` and the hour's count as `window.requests_hour`.
+
 ## v0.20.1 (2026-11-03)
 
 No schema change.

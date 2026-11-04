@@ -122,7 +122,7 @@ data: [DONE]
 6. `max_tokens`: 400 `invalid_value`;
 7. the reservation, in this order:
    - key disabled meanwhile: 403;
-   - the key's concurrency, then its requests per minute, then its credits per minute: 429 `rate_limit_exceeded`;
+   - the key's concurrency, then its requests per minute, then its credits per minute, then its requests per hour: 429 `rate_limit_exceeded`;
    - the server's requests per minute: 429 `server_rate_limit`;
    - the balance: 402;
    - the spend caps: 503 `spend_cap_reached`.
@@ -336,8 +336,8 @@ Without a key this route answers 401, which is the health check: it needs php-fp
 
 ```json
 {"balance": 49999961, "reserved": 0, "in_flight": 0,
- "limits": {"max_concurrent": 5, "requests_per_minute": null, "credits_per_minute": null},
- "window": {"requests": 1, "credits": 39},
+ "limits": {"max_concurrent": 5, "requests_per_minute": null, "requests_per_hour": null, "credits_per_minute": null},
+ "window": {"requests": 1, "credits": 39, "requests_hour": 1},
  "bonus_pct": 0, "weight": 707}
 ```
 
@@ -347,7 +347,7 @@ Without a key this route answers 401, which is the health check: it needs php-fp
 | `reserved` | credits held by running or unsettled requests |
 | `in_flight` | requests running now |
 | `limits` | the limits in force; `null` means no limit |
-| `window` | `requests` and `credits` over the last 60 seconds |
+| `window` | `requests` and `credits` over the last 60 seconds; `requests_hour`, requests started over the last 3600 seconds |
 | `bonus_pct` | the key's loyalty bonus, 0 to 300 |
 | `weight` | the key's priority (1 to 10,000) for this caller's source; see [Priority and throttling](../README.md#priority-and-throttling) |
 
@@ -423,13 +423,13 @@ Disables (`false`) or re-enables (`true`) the key, for suspend and unsuspend. A 
 
 ```json
 {"ref": "customer-42",
- "overrides": {"max_concurrent": null, "requests_per_minute": 60, "credits_per_minute": null},
- "limits": {"max_concurrent": 5, "requests_per_minute": 60, "credits_per_minute": null},
+ "overrides": {"max_concurrent": null, "requests_per_minute": 60, "requests_per_hour": null, "credits_per_minute": null},
+ "limits": {"max_concurrent": 5, "requests_per_minute": 60, "requests_per_hour": null, "credits_per_minute": null},
  "bonus_pct": 50, "key_group": "plan-a"}
 ```
 
 All fields besides `ref` are optional; fields left out are unchanged. If any field is invalid the request answers 400 and nothing changes.
-- `max_concurrent`, `requests_per_minute` and `credits_per_minute` each take an integer from 1 to 10^15, or `null` to follow the config default again.
+- `max_concurrent`, `requests_per_minute`, `requests_per_hour` and `credits_per_minute` each take an integer from 1 to 10^15, or `null` to follow the config default again.
 - `bonus_pct` is an integer from 0 to 300.
 - `key_group` is up to 64 of a-z, 0-9, `.`, `_` and `-`, or empty for none. It groups keys in `bin/virsilipas stats`.
 
@@ -439,7 +439,7 @@ The response shows:
 - `bonus_pct` and `key_group`.
 
 The 400s:
-- `unknown limit; use max_concurrent, requests_per_minute, credits_per_minute` for any other field;
+- `unknown limit; use max_concurrent, requests_per_minute, requests_per_hour, credits_per_minute` for any other field;
 - `<limit> must be null (the default) or an integer from 1 to 1000000000000000`;
 - `bonus_pct must be an integer from 0 to 300`;
 - `key_group must be at most 64 of a-z, 0-9, dot, dash and underscore`.
@@ -491,7 +491,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 404 | `invalid_request_error` | `model_not_found` | unknown model; see /v1/models | | chat · gemini |
 | 404 | `invalid_request_error` | `model_not_found` | unknown model, or not served in the Messages format; see /v1/models | | messages |
 | 413 | `invalid_request_error` | `request_too_large` | request body too large | | all POST routes |
-| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key | 2 to 8 at random for concurrency; else until the oldest request in the key's window is a minute old | chat · messages · gemini |
+| 429 | `rate_limit_error` | `rate_limit_exceeded` | too many concurrent requests for this key · requests per minute limit reached for this key · credits per minute limit reached for this key · requests per hour limit reached for this key | 2 to 8 at random for concurrency; for requests per hour until the oldest request in the key's hour window is an hour old; else until the oldest request in the key's window is a minute old | chat · messages · gemini |
 | 429 | `rate_limit_error` | `server_rate_limit` | the server is at its request rate limit; retry shortly | until the oldest request in the server's window is a minute old | chat · messages · gemini |
 | 429 | `rate_limit_error` | `upstream_busy` | upstream is busy, retry shortly | the upstream's, 1 to 60 | chat · messages · gemini, from the upstream |
 | 502 | `api_error` | `upstream_error` | upstream unavailable or returned an invalid response · upstream response too large | | chat · messages · gemini, from the upstream |

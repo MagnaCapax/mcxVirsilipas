@@ -30,7 +30,7 @@ final class Ledger
     private const MAX_BALANCE = 1_000_000_000_000_000_000;
     /** The latest expires_at accepted: 9999-12-31T23:59:59Z. */
     private const MAX_TIME = 253_402_300_799;
-    private const SCHEMA_VERSION = 12;
+    private const SCHEMA_VERSION = 13;
     /**
      * Retry-After bounds in seconds for a request over the key's max_concurrent. A slot frees whenever any of the
      * key's requests ends, which no one can predict, so the wait is drawn at random: clients refused together come
@@ -42,7 +42,7 @@ final class Ledger
      * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 11 gain the columns below, and every older
      * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
      */
-    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    private const UPGRADABLE_FROM = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
     /**
      * Columns added after the first schema, per table. Schema 4, usage, for tracking over time: the upstream that
      * served the request (the host of its route URL), whether it streamed, how long it took, the reasoning share of
@@ -68,7 +68,8 @@ final class Ledger
             'cost_computed' => 'INTEGER NOT NULL DEFAULT 0 CHECK (cost_computed IN (0, 1))', 'first_byte_ms' => 'INTEGER',
             'attempts' => 'INTEGER NOT NULL DEFAULT 0'],
         'keys' => ['bonus_pct' => 'INTEGER NOT NULL DEFAULT 0 CHECK (bonus_pct BETWEEN 0 AND 300)', 'key_group' => "TEXT NOT NULL DEFAULT ''",
-            'removed_at' => 'INTEGER', 'expires_at' => 'INTEGER'],
+            'removed_at' => 'INTEGER', 'expires_at' => 'INTEGER',
+            'requests_per_hour' => 'INTEGER CHECK (requests_per_hour IS NULL OR requests_per_hour BETWEEN 1 AND 1000000000000000)'],
         'grants' => ['expires_at' => 'INTEGER', 'target_credits' => 'INTEGER', 'target_day' => 'INTEGER'],
         'leases' => ['source' => 'INTEGER NOT NULL DEFAULT 0 CHECK (source IN (0, 1))', 'cost_reserved' => 'INTEGER NOT NULL DEFAULT 0'],
     ];
@@ -83,8 +84,10 @@ final class Ledger
     /** A key group: empty (none) or up to 64 of a-z, 0-9, dot, dash and underscore. */
     private const GROUP_PATTERN = '/^[a-z0-9._-]{0,64}$/';
     /** Per-key limits: the name used by the admin API and CLI => its column. Only these names reach SQL. */
-    private const LIMITS = ['max_concurrent' => 'max_concurrent', 'requests_per_minute' => 'requests_per_minute', 'credits_per_minute' => 'credits_per_minute'];
+    private const LIMITS = ['max_concurrent' => 'max_concurrent', 'requests_per_minute' => 'requests_per_minute',
+        'requests_per_hour' => 'requests_per_hour', 'credits_per_minute' => 'credits_per_minute'];
     private const WINDOW_SECONDS = 60;
+    private const HOUR_SECONDS = 3600;
 
     private \PDO $db;
 
@@ -607,7 +610,7 @@ final class Ledger
     public function status(string $ref, array $defaults): array
     {
         $now = time();
-        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.bonus_pct, k.key_group, k.expires_at, k.max_concurrent, k.requests_per_minute, k.credits_per_minute,
+        $st = $this->db->prepare('SELECT k.id, k.ref, k.balance, k.active, k.bonus_pct, k.key_group, k.expires_at, k.max_concurrent, k.requests_per_minute, k.requests_per_hour, k.credits_per_minute,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at > ?) AS in_flight,
                 (SELECT COUNT(*) FROM leases l WHERE l.key_id = k.id AND l.settled = 0 AND l.expires_at <= ?) AS held,
                 (SELECT COALESCE(SUM(l.reserved), 0) FROM leases l WHERE l.key_id = k.id AND l.settled = 0) AS reserved
@@ -618,12 +621,13 @@ final class Ledger
         if ($row === false) {
             throw new HttpError(404, 'unknown ref');
         }
-        $w = $this->window((int) $row['id'], $now);
+        $w = $this->window((int) $row['id'], $now, self::WINDOW_SECONDS);
+        $hour = $this->window((int) $row['id'], $now, self::HOUR_SECONDS);
         $overrides = self::overrides($row);
         return ['ref' => $row['ref'], 'balance' => (int) $row['balance'], 'active' => (bool) $row['active'],
             'in_flight' => (int) $row['in_flight'], 'held' => (int) $row['held'], 'reserved' => (int) $row['reserved'],
             'overrides' => $overrides, 'limits' => self::effectiveLimits($overrides, $defaults),
-            'window' => ['requests' => $w['requests'], 'credits' => $w['credits']], 'bonus_pct' => (int) $row['bonus_pct'], 'key_group' => (string) $row['key_group'],
+            'window' => ['requests' => $w['requests'], 'credits' => $w['credits'], 'requests_hour' => $hour['requests']], 'bonus_pct' => (int) $row['bonus_pct'], 'key_group' => (string) $row['key_group'],
             'expires_at' => $row['expires_at'] === null ? null : (int) $row['expires_at']];
     }
 
@@ -670,6 +674,7 @@ final class Ledger
     {
         return ['max_concurrent' => $overrides['max_concurrent'] ?? $defaults['max_concurrent'],
             'requests_per_minute' => $overrides['requests_per_minute'] ?? $defaults['requests_per_minute'],
+            'requests_per_hour' => $overrides['requests_per_hour'] ?? $defaults['requests_per_hour'] ?? null,
             'credits_per_minute' => $overrides['credits_per_minute'] ?? $defaults['credits_per_minute']];
     }
 
@@ -712,7 +717,7 @@ final class Ledger
             }
 
             if ($limits['requests_per_minute'] !== null || $limits['credits_per_minute'] !== null) {
-                $w = $this->window($keyId, $now);
+                $w = $this->window($keyId, $now, self::WINDOW_SECONDS);
                 // The earliest moment the window can free: when its oldest request turns 60 seconds old.
                 $retry = max(1, $w['oldest'] + self::WINDOW_SECONDS - $now);
                 if ($limits['requests_per_minute'] !== null && $w['requests'] >= $limits['requests_per_minute']) {
@@ -720,6 +725,13 @@ final class Ledger
                 }
                 if ($limits['credits_per_minute'] !== null && $w['credits'] >= $limits['credits_per_minute']) {
                     throw new HttpError(429, 'credits per minute limit reached for this key', 'rate_limit_error', $retry, 'rate_limit_exceeded');
+                }
+            }
+            if ($limits['requests_per_hour'] !== null) {
+                $h = $this->window($keyId, $now, self::HOUR_SECONDS);
+                if ($h['requests'] >= $limits['requests_per_hour']) {
+                    throw new HttpError(429, 'requests per hour limit reached for this key', 'rate_limit_error',
+                        max(1, $h['oldest'] + self::HOUR_SECONDS - $now), 'rate_limit_exceeded');
                 }
             }
 
@@ -1040,15 +1052,15 @@ final class Ledger
     }
 
     /**
-     * Requests started in the last 60 seconds, the credits they cost (charged if settled, else still
+     * Requests started in the last $seconds, the credits they cost (charged if settled, else still
      * reserved) and when the oldest of them started.
      * @return array{requests: int, credits: int, oldest: int}
      */
-    private function window(int $keyId, int $now): array
+    private function window(int $keyId, int $now, int $seconds): array
     {
         $st = $this->db->prepare('SELECT COUNT(*), COALESCE(SUM(COALESCE(u.charged, l.reserved)), 0), COALESCE(MIN(l.created_at), ?)
             FROM leases l LEFT JOIN usage u ON u.lease_id = l.id WHERE l.key_id = ? AND l.created_at > ?');
-        $st->execute([$now, $keyId, $now - self::WINDOW_SECONDS]);
+        $st->execute([$now, $keyId, $now - $seconds]);
         $r = $st->fetch(\PDO::FETCH_NUM);
         $st->closeCursor();
         return ['requests' => (int) $r[0], 'credits' => (int) $r[1], 'oldest' => (int) $r[2]];

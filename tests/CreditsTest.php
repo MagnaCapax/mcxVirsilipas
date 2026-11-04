@@ -84,8 +84,11 @@ function testConfigValidatesModelRatesAndLimits(): void
     $dir = tempDir();
     $c = new Config(configArrayFor($dir, ['requests_per_minute' => 60, 'credits_per_minute' => 50000]));
     same(['model' => 'scenario-cached'] + weightedRates(), $c->models['weighted']);
-    same(['max_concurrent' => 5, 'requests_per_minute' => 60, 'credits_per_minute' => 50000], $c->limitDefaults());
-    same(['max_concurrent' => 5, 'requests_per_minute' => null, 'credits_per_minute' => null], (new Config(configArrayFor($dir)))->limitDefaults(), 'unset: no limit');
+    same(['max_concurrent' => 5, 'requests_per_minute' => 60, 'requests_per_hour' => null, 'credits_per_minute' => 50000], $c->limitDefaults());
+    same(['max_concurrent' => 5, 'requests_per_minute' => null, 'requests_per_hour' => null, 'credits_per_minute' => null], (new Config(configArrayFor($dir)))->limitDefaults(), 'unset: no limit');
+    $noConcurrency = configArrayFor($dir, ['requests_per_hour' => 3000]);
+    unset($noConcurrency['max_concurrent_per_key']);
+    same(['max_concurrent' => 64, 'requests_per_minute' => null, 'requests_per_hour' => 3000, 'credits_per_minute' => null], (new Config($noConcurrency))->limitDefaults(), 'default concurrency 64; requests_per_hour read');
     $m = static fn (array $entry): array => ['models' => ['a' => $entry]];
     $good = ['model' => 'x', 'input' => 2, 'cached_input' => 1, 'output' => 3];
     new Config(configArrayFor($dir, $m($good)));
@@ -101,6 +104,8 @@ function testConfigValidatesModelRatesAndLimits(): void
         $m(array_diff_key($good, ['output' => 1])),
         ['max_tokens_cap' => Credits::MAX_COUNT + 1],
         ['requests_per_minute' => 0],
+        ['requests_per_hour' => 0],
+        ['requests_per_hour' => '3000'],
         ['credits_per_minute' => 'many'],
         ['credits_per_minute' => 1_000_000_000_000_001],
     ];

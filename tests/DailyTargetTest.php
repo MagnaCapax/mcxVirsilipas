@@ -105,7 +105,7 @@ function testDailyTargetMigrateElevenAndMissedDaysDoNotAccumulate(): void
     $l->migrate();
     $l->migrate();
     $db = new PDO("sqlite:$path");
-    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(13, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same([null, null], $db->query('SELECT target_credits, target_day FROM grants')->fetch(PDO::FETCH_NUM));
     same(['applied' => false, 'balance' => 100, 'expires_at' => null], $l->grant('old', 'old-invoice', 100));
     // Historical fixture: one zero-delta target three days ago. There is no caller clock or date override.

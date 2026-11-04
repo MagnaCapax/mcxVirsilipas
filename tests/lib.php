@@ -71,9 +71,9 @@ function unitRates(): array
 }
 
 /** Limit defaults as Config::limitDefaults() returns them. */
-function lim(int $concurrent = 4, ?int $rpm = null, ?int $cpm = null): array
+function lim(int $concurrent = 4, ?int $rpm = null, ?int $cpm = null, ?int $rph = null): array
 {
-    return ['max_concurrent' => $concurrent, 'requests_per_minute' => $rpm, 'credits_per_minute' => $cpm];
+    return ['max_concurrent' => $concurrent, 'requests_per_minute' => $rpm, 'requests_per_hour' => $rph, 'credits_per_minute' => $cpm];
 }
 
 /** @param array<string, mixed> $overrides */

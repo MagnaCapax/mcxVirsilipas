@@ -62,10 +62,13 @@ return [
     'max_tokens_cap' => 16384,
 
     // Default per-key limits; POST /admin/keys/limits (or bin/virsilipas limit) sets a key's own values.
-    // In-flight requests allowed per key. Keeps one key from using up a shared upstream limit.
-    'max_concurrent_per_key' => 4,
-    // Requests and credits per key over the last 60 seconds. Unset means no limit.
-    // 'requests_per_minute' => 60,
+    // In-flight requests allowed per key (default 64). Keeps one key from using up a shared upstream limit; size it
+    // against pm.max_children and the upstream's own concurrency.
+    'max_concurrent_per_key' => 64,
+    // Requests and credits per key over the last 60 seconds, and requests per key over the last hour. Unset means no limit.
+    // A per-hour limit keeps one key from spending the server's hourly cap (caps.hour) on its own.
+    // 'requests_per_minute' => 300,
+    // 'requests_per_hour' => 3000,
     // 'credits_per_minute' => 2000000,
 
     // Optional soft throttling (see README, Priority and throttling). Leave out to turn it off. It never refuses what

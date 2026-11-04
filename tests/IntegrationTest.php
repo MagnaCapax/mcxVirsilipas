@@ -287,8 +287,8 @@ function testIntegrationModelsAndBalance(): void
     $w = array_values(array_filter($m['data'], static fn ($d) => $d['id'] === 'weighted'))[0];
     same(['input' => 2_000_000, 'cached_input' => 500_000, 'output' => 8_000_000], $w['credits_per_million_tokens'], 'rates are listed per alias');
     check(!str_contains(json_encode($m), 'scenario-'), 'upstream model ids stay hidden');
-    same(['balance' => 777, 'reserved' => 0, 'in_flight' => 0, 'limits' => ['max_concurrent' => 5, 'requests_per_minute' => null, 'credits_per_minute' => null],
-        'window' => ['requests' => 0, 'credits' => 0], 'bonus_pct' => 0, 'weight' => 3], json_decode(http('GET', '/v1/balance', null, $key)['body'], true),
+    same(['balance' => 777, 'reserved' => 0, 'in_flight' => 0, 'limits' => ['max_concurrent' => 5, 'requests_per_minute' => null, 'requests_per_hour' => null, 'credits_per_minute' => null],
+        'window' => ['requests' => 0, 'credits' => 0, 'requests_hour' => 0], 'bonus_pct' => 0, 'weight' => 3], json_decode(http('GET', '/v1/balance', null, $key)['body'], true),
         'weight: 100 x sqrt(777 / 1000000 credits per unit), rounded');
 }
 
@@ -557,8 +557,8 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     same(401, http('POST', '/admin/keys/limits', $set)['status'], 'no token');
     same(401, http('POST', '/admin/keys/limits', $set, $key)['status'], 'a client key is not the admin token');
     $r = json_decode(http('POST', '/admin/keys/limits', $set, 'admin-secret')['body'], true);
-    same(['ref' => $ref, 'overrides' => ['max_concurrent' => null, 'requests_per_minute' => 1, 'credits_per_minute' => null],
-        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'credits_per_minute' => null], 'bonus_pct' => 0, 'key_group' => ''], $r);
+    same(['ref' => $ref, 'overrides' => ['max_concurrent' => null, 'requests_per_minute' => 1, 'requests_per_hour' => null, 'credits_per_minute' => null],
+        'limits' => ['max_concurrent' => 5, 'requests_per_minute' => 1, 'requests_per_hour' => null, 'credits_per_minute' => null], 'bonus_pct' => 0, 'key_group' => ''], $r);
     same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'burst' => 3], 'admin-secret')['status'], 'unknown limit');
     same(404, http('POST', '/admin/keys/limits', ['ref' => 'nobody-' . $ref, 'max_concurrent' => 2], 'admin-secret')['status']);
 
@@ -569,10 +569,10 @@ function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
     check(str_contains($refused['body'], 'requests per minute limit reached'), 'the reason is named');
     check($refused['retry_after'] !== null && $refused['retry_after'] >= 1 && $refused['retry_after'] <= 60, 'Retry-After within the minute');
     $b = json_decode(http('GET', '/v1/balance', null, $key)['body'], true);
-    same([1, ['requests' => 1, 'credits' => 18]], [$b['limits']['requests_per_minute'], $b['window']], 'the client sees its limit and its last minute');
+    same([1, ['requests' => 1, 'credits' => 18, 'requests_hour' => 1]], [$b['limits']['requests_per_minute'], $b['window']], 'the client sees its limit and its last minute');
     [, $other] = fundedKey(10000);
     $o = json_decode(http('GET', '/v1/balance?ref=' . urlencode($ref), null, $other)['body'], true);
-    same([10000, null, ['requests' => 0, 'credits' => 0]], [$o['balance'], $o['limits']['requests_per_minute'], $o['window']], 'another key sees only its own balance, limits and window');
+    same([10000, null, ['requests' => 0, 'credits' => 0, 'requests_hour' => 0]], [$o['balance'], $o['limits']['requests_per_minute'], $o['window']], 'another key sees only its own balance, limits and window');
 
     same(200, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_minute' => null], 'admin-secret')['status']);
     $set = json_decode(http('POST', '/admin/keys/limits', ['ref' => $ref, 'bonus_pct' => 300], 'admin-secret')['body'], true);

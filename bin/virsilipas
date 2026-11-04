@@ -31,11 +31,11 @@ Usage: virsilipas <command> [args]
   grant <ref> <credits> --daily-target
                                     set balance plus unsettled reservations to this target once per
                                     server UTC day; same-day retries do not replenish spent credits
-  limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute or
-                                    credits_per_minute; 'default' follows the config again
+  limit <ref> <name> <N|default>    set a key's max_concurrent, requests_per_minute, requests_per_hour
+                                    or credits_per_minute; 'default' follows the config again
   bonus <ref> <0..300>              set a key's bonus percent, which raises its priority weight
   group <ref> <name|->              set a key's group for stats (- for none): a-z, 0-9, . _ -
-  status <ref>                      show balance, holds, limits and the last minute's use
+  status <ref>                      show balance, holds, limits and the last minute's and hour's use
   history <ref> [N]                 show the last N credit changes (default 100), newest first
   verify                            check every balance against its credit log; exit 1 on a mismatch
   caps                              the server-wide caps in force and their use now: per spend window the

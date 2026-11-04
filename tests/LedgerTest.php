@@ -278,6 +278,50 @@ function testRequestsPerMinuteLimit(): void
     same(1, $l->status('a', lim(10, 2))['window']['requests'], 'requests older than a minute no longer count');
 }
 
+function testRequestsPerHourLimit(): void
+{
+    [$l, $id, $db] = ledgerWithHandle(10000);
+    foreach ([1, 2] as $n) {
+        $r = $l->reserve($id, 10, 10, 1000, unitRates(), lim(10, null, null, 2), 60);
+        $l->settle($r['lease_id'], $id, 5, meta());
+    }
+    [$status, $msg, $retry] = refusal(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(10, null, null, 2), 60));
+    same([429, 'requests per hour limit reached for this key'], [$status, $msg]);
+    check($retry > 60 && $retry <= 3600, "Retry-After $retry until the oldest request is an hour old");
+    same(10000 - 10, $l->status('a', lim())['balance'], 'a refused request reserves nothing');
+    $db->exec('UPDATE leases SET created_at = created_at - 120');
+    same(0, $l->status('a', lim())['window']['requests'], 'out of the minute window');
+    same(2, $l->status('a', lim())['window']['requests_hour'], 'still in the hour window');
+    same(429, refusal(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(10, 100, null, 2), 60))[0], 'a minute later the hour still counts them');
+    $db->exec('UPDATE leases SET created_at = created_at - 3600');
+    $l->reserve($id, 10, 10, 1000, unitRates(), lim(10, null, null, 2), 60);
+    same(1, $l->status('a', lim())['window']['requests_hour'], 'requests older than an hour no longer count');
+    same(['max_concurrent' => null, 'requests_per_minute' => null, 'requests_per_hour' => 1, 'credits_per_minute' => null], $l->setLimits('a', ['requests_per_hour' => 1]));
+    same(429, refusal(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(10, null, null, 50), 60))[0], 'the key\'s own value wins over the default');
+    $l->setLimits('a', ['requests_per_hour' => null]);
+    $l->reserve($id, 10, 10, 1000, unitRates(), lim(10), 60);
+    same(null, $l->status('a', lim(10))['limits']['requests_per_hour'], 'unset: no per-hour limit');
+}
+
+function testMigrateTwelveAddsRequestsPerHour(): void
+{
+    $path = tempDir() . '/ledger.sqlite';
+    $db = new PDO("sqlite:$path");
+    $db->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v12.sql'));
+    $db->exec("INSERT INTO keys (id, ref, key_hash, balance, active, created_at, max_concurrent, requests_per_minute) VALUES (1, 'old', 'digest', 100, 1, 0, 4, 120)");
+    $db->exec("INSERT INTO credit_log (ts, key_id, kind, delta, balance_after, ref) VALUES (1, 1, 'opening', 100, 100, 'fixture')");
+    unset($db);
+    $l = new Ledger($path);
+    $l->migrate();
+    $l->migrate();
+    $db = new PDO("sqlite:$path");
+    same(13, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(['max_concurrent' => 4, 'requests_per_minute' => 120, 'requests_per_hour' => null, 'credits_per_minute' => null], $l->status('old', lim(64))['overrides'], 'old overrides kept, the new one unset');
+    same(['max_concurrent' => 4, 'requests_per_minute' => 120, 'requests_per_hour' => 3000, 'credits_per_minute' => null], $l->status('old', lim(64, null, null, 3000))['limits']);
+    same(100, $l->status('old', lim())['balance']);
+    same([], $l->verify()['problems']);
+}
+
 function testCreditsPerMinuteCountsChargedOrStillReserved(): void
 {
     [$l, $id] = fundedLedger(10000);
@@ -285,10 +329,10 @@ function testCreditsPerMinuteCountsChargedOrStillReserved(): void
     $b = $l->reserve($id, 10, 50, 1000, unitRates(), lim(10, null, 100), 60); // window 60 < 100: admitted, now 120
     [$status, $msg] = refusal(fn () => $l->reserve($id, 10, 50, 1000, unitRates(), lim(10, null, 100), 60));
     same([429, 'credits per minute limit reached for this key'], [$status, $msg]);
-    same(['requests' => 2, 'credits' => 120], $l->status('a', lim())['window']);
+    same(['requests' => 2, 'credits' => 120, 'requests_hour' => 2], $l->status('a', lim())['window']);
     $l->settle($a['lease_id'], $id, 15, meta());
     $l->settle($b['lease_id'], $id, 15, meta());
-    same(['requests' => 2, 'credits' => 30], $l->status('a', lim())['window'], 'settled requests count what they were charged');
+    same(['requests' => 2, 'credits' => 30, 'requests_hour' => 2], $l->status('a', lim())['window'], 'settled requests count what they were charged');
     same(429, refusal(fn () => $l->reserve($id, 10, 50, 1000, unitRates(), lim(10, null, 30), 60))[0], 'a window at the limit is full');
     $l->reserve($id, 10, 50, 1000, unitRates(), lim(10, null, 31), 60);
 }
@@ -296,28 +340,28 @@ function testCreditsPerMinuteCountsChargedOrStillReserved(): void
 function testPerKeyLimitsOverrideTheDefaultsBothWays(): void
 {
     [$l, $id] = fundedLedger(10000);
-    same(['max_concurrent' => 1, 'requests_per_minute' => null, 'credits_per_minute' => null], $l->setLimits('a', ['max_concurrent' => 1]));
+    same(['max_concurrent' => 1, 'requests_per_minute' => null, 'requests_per_hour' => null, 'credits_per_minute' => null], $l->setLimits('a', ['max_concurrent' => 1]));
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(4), 60);
     same(429, refusal(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(4), 60))[0], 'lowered below the default');
     $l->setLimits('a', ['max_concurrent' => 3]);
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(1), 60);
     $l->reserve($id, 10, 10, 1000, unitRates(), lim(1), 60);
     same(429, refusal(fn () => $l->reserve($id, 10, 10, 1000, unitRates(), lim(1), 60))[0], 'raised above the default, up to its own value');
-    same(['max_concurrent' => null, 'requests_per_minute' => 7, 'credits_per_minute' => null], $l->setLimits('a', ['max_concurrent' => null, 'requests_per_minute' => 7]));
-    same(['max_concurrent' => 4, 'requests_per_minute' => 7, 'credits_per_minute' => 9], $l->status('a', lim(4, 5, 9))['limits'], 'null follows the default; a set value wins');
-    same(['max_concurrent' => null, 'requests_per_minute' => 7, 'credits_per_minute' => null], $l->setLimits('a', []), 'nothing given: nothing changed');
+    same(['max_concurrent' => null, 'requests_per_minute' => 7, 'requests_per_hour' => null, 'credits_per_minute' => null], $l->setLimits('a', ['max_concurrent' => null, 'requests_per_minute' => 7]));
+    same(['max_concurrent' => 4, 'requests_per_minute' => 7, 'requests_per_hour' => null, 'credits_per_minute' => 9], $l->status('a', lim(4, 5, 9))['limits'], 'null follows the default; a set value wins');
+    same(['max_concurrent' => null, 'requests_per_minute' => 7, 'requests_per_hour' => null, 'credits_per_minute' => null], $l->setLimits('a', []), 'nothing given: nothing changed');
 }
 
 function testSetLimitsValidation(): void
 {
     $l = freshLedger();
     $l->createKey('a');
-    foreach ([['max_concurrent' => 0], ['requests_per_minute' => -1], ['credits_per_minute' => 1_000_000_000_000_001], ['max_concurrent' => '5'],
+    foreach ([['max_concurrent' => 0], ['requests_per_minute' => -1], ['requests_per_hour' => 0], ['credits_per_minute' => 1_000_000_000_000_001], ['max_concurrent' => '5'],
         ['max_concurrent' => true], ['max_concurrent' => 1.5], ['balance' => 5], ['max_concurrent = 1, balance' => 5], [0 => 5]] as $bad) {
         same(400, refusal(fn () => $l->setLimits('a', $bad))[0], json_encode($bad));
     }
     same(404, refusal(fn () => $l->setLimits('nobody', ['max_concurrent' => 1]))[0]);
-    same(['max_concurrent' => null, 'requests_per_minute' => null, 'credits_per_minute' => null], $l->setLimits('a', []), 'nothing was changed by the refusals');
+    same(['max_concurrent' => null, 'requests_per_minute' => null, 'requests_per_hour' => null, 'credits_per_minute' => null], $l->setLimits('a', []), 'nothing was changed by the refusals');
 }
 
 function testStatusShowsHoldsAndTheWindow(): void
@@ -325,8 +369,8 @@ function testStatusShowsHoldsAndTheWindow(): void
     [$l, $id] = fundedLedger(1000);
     $l->reserve($id, 10, 40, 1000, unitRates(), lim(), 60);
     $s = $l->status('a', lim(4, 100, 5000));
-    same([950, 50, 1, ['requests' => 1, 'credits' => 50]], [$s['balance'], $s['reserved'], $s['in_flight'], $s['window']]);
-    same(['max_concurrent' => 4, 'requests_per_minute' => 100, 'credits_per_minute' => 5000], $s['limits']);
+    same([950, 50, 1, ['requests' => 1, 'credits' => 50, 'requests_hour' => 1]], [$s['balance'], $s['reserved'], $s['in_flight'], $s['window']]);
+    same(['max_concurrent' => 4, 'requests_per_minute' => 100, 'requests_per_hour' => null, 'credits_per_minute' => 5000], $s['limits']);
 }
 
 function testMigrateRefusesALedgerFromAnotherVersion(): void
@@ -418,7 +462,7 @@ function testMigrateUpgradesASchemaThreeLedgerKeepingItsUsageRows(): void
     $l = new Ledger($path);
     $l->migrate();
     $db = new \PDO('sqlite:' . $path);
-    same(12, (int) $db->query('PRAGMA user_version')->fetchColumn());
+    same(13, (int) $db->query('PRAGMA user_version')->fetchColumn());
     same(['', 0, 0, 0, null], array_values($db->query('SELECT upstream, stream, duration_ms, reasoning_tokens, upstream_cost FROM usage')->fetch(\PDO::FETCH_NUM)), 'the old row gets the defaults');
     same([], $l->verify()['problems'], 'balances untouched');
     same(2, (int) $db->query('SELECT COUNT(*) FROM credit_log')->fetchColumn(), 'no opening rows from schema 3');
