@@ -15,7 +15,7 @@ The cost of a request is known only after the upstream answers, and a stream may
 - Reserve an upper bound before forwarding, settle the real cost afterwards.
 
 ## Decision
-Before forwarding, the proxy reserves, in one atomic transaction, the prompt bound (the byte length of everything forwarded, since a token is at least one byte) at the input rate plus `max_tokens` at the output rate, lowering `max_tokens` to what the balance covers. The reservation is a lease. When the response ends the lease is settled exactly once: the reported usage is charged, never more than the reservation, and the rest is returned. A lease whose worker died expires and stays charged at its reservation; a late settle returns the difference once. Tracking fields (upstream cost, reasoning count, source, group) never change a charge.
+Before forwarding, the proxy reserves, in one atomic transaction, the prompt bound (the byte length of everything forwarded, since a token is at least one byte) at the input rate plus `max_tokens` at the output rate, lowering `max_tokens` to what the balance covers. The reservation is a lease. When the response ends the lease is settled exactly once: the reported usage is charged, never more than the reservation, and the rest is returned. A lease whose worker died expires and stays charged at its reservation; a late settle returns the difference once. Amended 2026-11-04 by [ADR 0028](0028-explicit-daily-target-grants.md): an hour after its expiry the reservation is final and a settle returns nothing. Tracking fields (upstream cost, reasoning count, source, group) never change a charge.
 
 ## Consequences
 - A key can never spend past its balance, whatever the concurrency.

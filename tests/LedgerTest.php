@@ -519,7 +519,8 @@ function testMigrateUpgradesASchemaTwoLedgerWithOpeningBalances(): void
     $old->exec((string) file_get_contents(__DIR__ . '/fixtures/schema-v2.sql'));
     // a: 700 left with 100 of it held by an open lease; b: empty; c: overdrawn by a chargeback.
     $old->exec("INSERT INTO keys (id, ref, key_hash, balance, created_at) VALUES (1, 'a', 'h1', 700, 0), (2, 'b', 'h2', 0, 0), (3, 'c', 'h3', -50, 0)");
-    $old->exec('INSERT INTO leases (id, key_id, reserved, created_at, expires_at) VALUES (1, 1, 100, 0, 0)');
+    // Open and not expired: a lease over an hour past its expiry is final and would not settle (ADR 0028).
+    $old->exec('INSERT INTO leases (id, key_id, reserved, created_at, expires_at) VALUES (1, 1, 100, 0, ' . (time() + 60) . ')');
     $old = null;
     chmod($path, 0600);
 

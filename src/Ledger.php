@@ -15,7 +15,8 @@ namespace MagnaCapax\Virsilipas;
  * A lease's reservation is taken from the balance when the request starts and stays
  * taken until the request is settled. A lease that outlives its request (its worker
  * died) stops counting against concurrency when it expires, but its reservation stays
- * charged: the request may already have been answered. A late settle still corrects it.
+ * charged: the request may already have been answered. A late settle still corrects it, until the lease
+ * is HELD_FINAL_SECONDS past its expiry; from then on the reservation is final and no settle returns any of it.
  *
  * Every change to a balance writes one credit_log row in the same transaction: the change, the
  * balance after it, its kind (grant, reserve, refund, or the opening balance carried over by a
@@ -38,6 +39,13 @@ final class Ledger
      */
     private const CONCURRENCY_RETRY_MIN = 2;
     private const CONCURRENCY_RETRY_MAX = 8;
+    /**
+     * How long after its expiry a held lease (its worker died) becomes final at its reservation: settle() then refuses it
+     * and a daily target stops counting it (ADR 0028). Upstream time ends at upstream_timeout, which lease_seconds exceeds,
+     * after a pacing wait of at most 60 s; the rest (writing to the client, the settle's lock wait) ends with the web
+     * server's timeouts, well under an hour. A worker that outlived an hour anyway leaves its request charged at its reservation.
+     */
+    private const HELD_FINAL_SECONDS = 3600;
     /**
      * Older schemas migrate() upgrades in place: 2 gains credit_log, 2 to 11 gain the columns below, and every older
      * schema gains schema 10's index on grants(key_id) and the trigger that refuses an INSERT replacing a credit_log row.
@@ -377,7 +385,8 @@ final class Ledger
     }
 
     /**
-     * One operator-pushed target per ref per UTC day, including every unsettled reservation (expired holds too).
+     * One operator-pushed target per ref per UTC day, including every unsettled reservation except holds that are final
+     * (HELD_FINAL_SECONDS past their expiry): those stay charged and can never be settled, so they no longer shrink each day's target.
      * A retry never replenishes subsequent usage; a different target that day conflicts. No automatic refill occurs.
      * @return array{applied:bool,balance:int,reserved:int,target:int,day:string,credits:int}
      */
@@ -399,8 +408,8 @@ final class Ledger
                 || (int) $prior['target_day'] !== $day || (int) $prior['target_credits'] !== $target)) {
                 throw new HttpError(409, 'daily target conflicts with an existing grant');
             }
-            $st = $this->db->prepare('SELECT COALESCE(SUM(reserved), 0) FROM leases WHERE key_id = ? AND settled = 0');
-            $st->execute([$keyId]);
+            $st = $this->db->prepare('SELECT COALESCE(SUM(reserved), 0) FROM leases WHERE key_id = ? AND settled = 0 AND expires_at > ?');
+            $st->execute([$keyId, $now - self::HELD_FINAL_SECONDS]);
             $reserved = (int) $st->fetchColumn();
             $st->closeCursor();
             $balance = $this->balanceOf($keyId);
@@ -782,15 +791,17 @@ final class Ledger
     /**
      * Settles a request exactly once: charges the credits the request used, never more than the
      * reservation, returns the rest, and writes the usage row in the same transaction.
-     * Settling an already settled lease does nothing and returns false.
+     * Settling an already settled lease, or a held one that is final (HELD_FINAL_SECONDS past its expiry), does nothing and returns false.
      * The tracking fields (upstream, stream, duration_ms, first_byte_ms, attempts, reasoning, cost) are optional and default to empty.
      * @param array{model: string, prompt: int, completion: int, cached: int, status: int, aborted: bool, estimated: bool, upstream?: string, stream?: bool, duration_ms?: int, first_byte_ms?: ?int, attempts?: int, reasoning?: int, cost?: ?int, delay_ms?: int, cost_computed?: bool} $meta
      */
     public function settle(int $leaseId, int $keyId, int $used, array $meta): bool
     {
         return $this->tx(function () use ($leaseId, $keyId, $used, $meta): bool {
-            $st = $this->db->prepare('SELECT reserved, source FROM leases WHERE id = ? AND key_id = ? AND settled = 0');
-            $st->execute([$leaseId, $keyId]);
+            $now = time();
+            // The same bound as grantDailyTarget: a lease a target stopped counting can never return credits.
+            $st = $this->db->prepare('SELECT reserved, source FROM leases WHERE id = ? AND key_id = ? AND settled = 0 AND expires_at > ?');
+            $st->execute([$leaseId, $keyId, $now - self::HELD_FINAL_SECONDS]);
             $lease = $st->fetch(\PDO::FETCH_NUM);
             $st->closeCursor();
             if ($lease === false) {
@@ -803,7 +814,6 @@ final class Ledger
             $this->db->prepare('UPDATE leases SET settled = 1 WHERE id = ?')->execute([$leaseId]);
             $this->db->prepare('UPDATE keys SET balance = balance + ? WHERE id = ?')->execute([$reserved - $charged, $keyId]);
             $this->logCredit($keyId, 'refund', $reserved - $charged, 'lease:' . $leaseId);
-            $now = time();
             $this->db->prepare('INSERT INTO usage (ts, key_id, lease_id, model, prompt_tokens, completion_tokens, cached_tokens, reported, charged, http_status, aborted, estimated, over_reservation, upstream, stream, duration_ms, reasoning_tokens, upstream_cost, delay_ms, source, cost_computed, first_byte_ms, attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
                 ->execute([$now, $keyId, $leaseId, $meta['model'], $meta['prompt'], $meta['completion'], $meta['cached'], $used, $charged, $meta['status'], (int) $meta['aborted'], (int) $meta['estimated'], (int) ($used > $reserved),
                     $meta['upstream'] ?? '', (int) ($meta['stream'] ?? false), max(0, $meta['duration_ms'] ?? 0), $meta['reasoning'] ?? 0, $meta['cost'] ?? null, max(0, $meta['delay_ms'] ?? 0), $source, (int) ($meta['cost_computed'] ?? false),

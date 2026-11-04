@@ -2,7 +2,11 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
-## Unreleased
+## v0.21.1
+
+No schema change.
+
+- **A held lease no longer shrinks every later daily target.** `grant <ref> <credits> --daily-target` counted every unsettled reservation, and a held lease (its worker died) is never settled, so each crash or deploy-cut request took its reservation from every day's target for good. An hour after its expiry a held lease is now final: it stays charged, a settle of it returns nothing and writes no usage row, and the daily target no longer counts it. Within that hour a late settle still returns the unused part, and balance plus counted reservations never rises above the day's target. [ADR 0028](docs/adr/0028-explicit-daily-target-grants.md) amended.
 
 ## v0.21.0 (2026-11-04)
 

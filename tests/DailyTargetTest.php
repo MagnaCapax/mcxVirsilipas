@@ -35,6 +35,34 @@ function testDailyTargetCountsExpiredHoldsAndLateSettlement(): void
     same([], $l->verify()['problems']);
 }
 
+function testDailyTargetStopsCountingAHoldOnceItIsFinal(): void
+{
+    [$l, $id, $db] = ledgerWithHandle(1000);
+    $final = $l->reserve($id, 10, 290, 1000, unitRates(), lim(), 60); // 300
+    $recent = $l->reserve($id, 10, 90, 1000, unitRates(), lim(), 60); // 100
+    $late = $l->reserve($id, 10, 40, 1000, unitRates(), lim(), 60); // 50
+    $expire = $db->prepare('UPDATE leases SET expires_at = ? WHERE id = ?');
+    $expire->execute([time() - 3601, $final['lease_id']]); // its worker died over an hour ago
+    $expire->execute([time() - 600, $recent['lease_id']]); // ten minutes ago: it could still be settled
+    $expire->execute([time() - 1800, $late['lease_id']]); // half an hour ago: still counted
+    $balance = fn (): int => $l->status('a', lim())['balance'];
+    same([550, 3], [$balance(), $l->status('a', lim())['held']]);
+    $reset = $l->grantDailyTarget('a', 1000);
+    same([850, 150, 300], [$reset['balance'], $reset['reserved'], $reset['credits']], 'the final hold no longer shrinks the target; the recent ones still count');
+    same(false, $l->settle($final['lease_id'], $id, 0, meta()), 'a final hold returns nothing');
+    same(850, $balance(), 'its 300 stay charged');
+    same(true, $l->settle($recent['lease_id'], $id, 40, meta()));
+    same(910, $balance(), '1000 target minus 40 charged minus the 50 still held');
+    $expire->execute([time() - 3601, $late['lease_id']]); // an hour on, its worker is certainly gone
+    same(false, $l->settle($late['lease_id'], $id, 0, meta()), 'a hold the target counted returns nothing once final either');
+    same(910, $balance(), 'never above the target');
+    $st = $db->prepare('SELECT COUNT(*) FROM usage WHERE lease_id IN (?, ?)');
+    $st->execute([$final['lease_id'], $late['lease_id']]);
+    same(0, (int) $st->fetchColumn(), 'a refused settle writes no usage row');
+    same([false, 910], [$l->grantDailyTarget('a', 1000)['applied'], $balance()]);
+    same([], $l->verify()['problems']);
+}
+
 function testDailyTargetZeroDeltaStillConsumesThatDaysOperation(): void
 {
     [$l, $id] = fundedLedger(100);
