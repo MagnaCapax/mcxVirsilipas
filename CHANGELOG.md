@@ -2,7 +2,7 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
-## v0.21.1
+## v0.21.1 (2026-11-04)
 
 No schema change.
 
