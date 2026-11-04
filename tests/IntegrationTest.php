@@ -550,6 +550,24 @@ function testIntegrationTheUpstreamReportedCostIsRecordedButNeverRelayed(): void
     }
 }
 
+function testIntegrationRequestsPerHourOverHttp(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = json_decode(http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_hour' => 1], 'admin-secret')['body'], true);
+    same([1, 1, 5], [$r['overrides']['requests_per_hour'], $r['limits']['requests_per_hour'], $r['limits']['max_concurrent']], 'the operator sets it; concurrency keeps its default');
+    same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status']);
+    settled($ref);
+    $refused = http('POST', '/v1/chat/completions', msg('ok', false), $key);
+    same(429, $refused['status']);
+    check(str_contains($refused['body'], 'requests per hour limit reached for this key'), 'the reason is named');
+    check($refused['retry_after'] !== null && $refused['retry_after'] > 60 && $refused['retry_after'] <= 3600, 'Retry-After until the oldest request is an hour old');
+    $b = json_decode(http('GET', '/v1/balance', null, $key)['body'], true);
+    same([1, 1], [$b['limits']['requests_per_hour'], $b['window']['requests_hour']], 'the client sees its hourly limit and its hour');
+    same(400, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_hour' => 0], 'admin-secret')['status'], 'zero refused');
+    same(200, http('POST', '/admin/keys/limits', ['ref' => $ref, 'requests_per_hour' => null], 'admin-secret')['status']);
+    same(200, http('POST', '/v1/chat/completions', msg('ok', false), $key)['status'], 'back on the default (no per-hour limit)');
+}
+
 function testIntegrationOperatorSetsLimitsAndClientsSeeThem(): void
 {
     [$ref, $key] = fundedKey(10000);
