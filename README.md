@@ -187,6 +187,7 @@ claude
 - `max_tokens` is clamped to the server's `max_tokens_cap` and to your balance, and a thinking budget that no longer fits is lowered to fit.
 - Content may be text, images, tool use, tool results (text, images) or thinking, so pasted screenshots and images the CLI reads work on a model whose route sets `image_tokens`; a document (a PDF the CLI reads) answers 400 `documents are not enabled for this model`. A server tool such as web search answers 400 `unsupported_tool`, so a feature that needs one fails.
 - `POST /v1/messages/count_tokens` answers the proxy's own estimate, which counts high (a token per byte), so the context can look fuller than it is. It costs nothing.
+- Auto mode's server-side checks run only on Anthropic's own API, so they never arrive through the proxy (the `safeguards` request field is not forwarded). Set `CLAUDE_CODE_AUTO_MODE_SERVER=0` so Claude Code does not ask for them; its own classifier requests then check each action as before, metered against your balance like any other request.
 - Errors come in the Anthropic error shape; [POST /v1/messages](docs/API.md#post-v1messages) in docs/API.md lists every field, event and error.
 
 ### Gemini CLI
