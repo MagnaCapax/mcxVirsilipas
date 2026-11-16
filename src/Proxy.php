@@ -151,7 +151,8 @@ final class Proxy
     /**
      * POST /v1/messages: the Anthropic Messages format, passed through to the upstreams of the alias's route that have a
      * messages_url (in route order), metered like chat. The key may come as x-api-key or as a bearer token; errors use
-     * that format's shape (public/index.php). The operator's params are not applied: they are chat completions fields.
+     * that format's shape (public/index.php). The operator's params are not applied: they are chat completions fields; the
+     * route entry's messages_params are, and win over the client's fields.
      */
     public function messages(): void
     {
@@ -161,7 +162,7 @@ final class Proxy
         $fields = Messages::fields($req);
         $stream = ($req['stream'] ?? false) === true;
         $build = static fn (array $route, int $maxTokens): array => [(string) $route['messages_url'], Messages::headers($route['key']),
-            self::encode(Messages::rewrite($fields, $route['model'], $maxTokens, $stream))];
+            self::encode(Messages::rewrite($fields, $route['model'], $maxTokens, $stream, $route['messages_params']))];
         $this->serve($key, $alias, $hops, $this->messagesBound($alias, $hops, $fields), ['max_tokens' => $req['max_tokens'] ?? null], $stream, 'messages', $build);
     }
 
@@ -186,7 +187,8 @@ final class Proxy
      */
     private function messagesBound(string $alias, array $hops, array $fields): int
     {
-        return max(array_map(fn (int $i): int => Messages::promptBound($fields, $this->config->routes[$alias][$i]['image_tokens']), $hops));
+        return max(array_map(fn (int $i): int => Messages::promptBound($fields, $this->config->routes[$alias][$i]['image_tokens'],
+            $this->config->routes[$alias][$i]['messages_params']), $hops));
     }
 
     /**
@@ -215,7 +217,7 @@ final class Proxy
      * @param array{id: int, ref: string, balance: int, active: bool, bonus_pct: int} $key
      * @param list<int> $hops
      * @param array<string, mixed> $maxReq
-     * @param \Closure(array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}, int): array{0: string, 1: list<string>, 2: string} $build
+     * @param \Closure(array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, messages_params: array<string, mixed>}, int): array{0: string, 1: list<string>, 2: string} $build
      */
     private function serve(array $key, string $alias, array $hops, int $promptBound, array $maxReq, bool $stream, string $format, \Closure $build): void
     {
@@ -245,6 +247,7 @@ final class Proxy
 
         $result = self::attemptResult(0);
         [$upstream, $servedHop, $started, $attempts, $responded] = ['', $hops[0], hrtime(true), 0, false];
+        $earlier = null; // [hop, result] of the first attempt another upstream might fix (retry or next), kept for failure()
         $deadline = $started + $this->config->upstreamTimeout * 1_000_000_000;
         try {
             // The pacing wait holds the lease, so a waiting request counts as in flight for the busy line and the key's limits.
@@ -285,6 +288,7 @@ final class Proxy
                     if ($result['delivered'] || $result['kind'] === 'final') {
                         break 2;
                     }
+                    $earlier ??= [$hop, $result];
                     Log::write('warn', 'upstream_attempt', ['ref' => $key['ref'], 'lease' => $lease['lease_id'], 'alias' => $alias, 'hop' => $hop,
                         'try' => $try, 'upstream' => $upstream, 'upstream_status' => $result['status'], 'outcome' => $result['kind']]);
                     if ($result['kind'] !== 'retry' || $try === $this->config->retries) {
@@ -300,7 +304,7 @@ final class Proxy
                 }
             }
             if (!$result['delivered']) {
-                self::failure($result)->sendAs($format);
+                self::failure(self::reported($result, $earlier, $servedHop))->sendAs($format);
             }
             $responded = true; // the whole answer or its error is written; on an exception the router writes it later
         } finally {
@@ -398,6 +402,23 @@ final class Proxy
             }
         }
         return null;
+    }
+
+    /**
+     * The attempt the client is told about when no upstream gave a usable answer. Normally the last one. But when an
+     * upstream failed first in a way another could fix (a 429 or 5xx, which clients retry on their own) and a later
+     * upstream then rejected the request as invalid (400, 413 or 422, not an over-long request), the client is told about
+     * the first failure: the later rejection may be that upstream's own limit, and a 400 ends a client's turn where a
+     * 429 or 503 is retried. A request the first upstream itself rejected, or an over-long one, keeps its 400. The usage
+     * row and the charge (none: nothing was delivered) always go by the last attempt.
+     * @param array{status: int, code: ?string} $last
+     * @param ?array{0: int, 1: array<string, mixed>} $earlier the hop and result of the first fixable failure
+     * @return array<string, mixed>
+     */
+    private static function reported(array $last, ?array $earlier, int $lastHop): array
+    {
+        $invalid = in_array($last['status'], [400, 413, 422], true) && $last['code'] !== 'context_length_exceeded';
+        return $earlier !== null && $invalid && $earlier[0] !== $lastHop ? $earlier[1] : $last;
     }
 
     /**

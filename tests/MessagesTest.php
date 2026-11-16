@@ -388,3 +388,181 @@ function testMessagesEmptyObjectsSurviveTheRoundTrip(): void
     check(str_contains($out, '"input_schema":{"type":"object","properties":{}}'), 'empty tool schema properties kept as {}: ' . $out);
     check(str_contains($out, '"input":{}'), 'empty tool call input kept as {}');
 }
+
+/** One Messages request with an empty upstream request log: [response, upstream requests in order]. */
+function messagesAndRequests(string $alias, bool $stream, string $key, array $extra = []): array
+{
+    $dir = Harness::get()['dir'];
+    file_put_contents("$dir/requests.jsonl", '');
+    $r = http('POST', '/v1/messages', anthBody($alias, $stream, $extra), $key);
+    $lines = array_filter(explode("\n", (string) file_get_contents("$dir/requests.jsonl")));
+    return [$r, array_values(array_map(static fn (string $l): array => json_decode($l, true), $lines))];
+}
+
+/** The pin the failover aliases of tests/lib.php carry as messages_params. */
+const MESSAGES_PIN = ['provider' => ['only' => ['pin-a'], 'allow_fallbacks' => false], 'temperature' => 0.25];
+
+function testMessagesFailsOverToTheSecondUpstreamWithItsOwnKeyAndParams(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(100000);
+        [$r, $req] = messagesAndRequests('anth-failover', $stream, $key, ['temperature' => 0.9, 'metadata' => ['user_id' => 'u']]);
+        same(200, $r['status'], $r['body']);
+        checkNoUpstreamDetails($r['body']);
+        // One try plus one retry on the first upstream (503 costs nothing there), then the second one, each with its own key.
+        same([['primary', 'fake-upstream-key'], ['primary', 'fake-upstream-key'], ['backup', 'second-upstream-key']], hops($req), 'attempts in order');
+        same([null, null, MESSAGES_PIN['provider']], array_column($req, 'provider'), 'the pin goes only to the entry that has it');
+        same([0.9, 0.9, 0.25], array_column($req, 'temperature'), 'messages_params win over the client\'s field, on their entry only');
+        foreach ($req as $q) {
+            check(!in_array('metadata', $q['keys'], true), 'the client\'s metadata reaches no upstream');
+        }
+        same(100000 - 990, settled($ref)['balance'], 'one answer, one charge, at the alias rate');
+        $u = lastUsage($ref);
+        same([200, 3, $stream ? 1 : 0], [$u['http_status'], $u['attempts'], $u['stream']], 'the row records the three attempts');
+    }
+}
+
+function testMessagesAnAliasWithOnlyASecondProviderStyleEntryServesTheFormat(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(100000);
+        [$r, $req] = messagesAndRequests('anth-only-second', $stream, $key);
+        same(200, $r['status'], $r['body']);
+        same([['backup', 'second-upstream-key']], hops($req));
+        same([MESSAGES_PIN['provider'], 0.25, 'scenario-anth-ok'], [$req[0]['provider'], $req[0]['temperature'], $req[0]['model']]);
+        same(100000 - 990, settled($ref)['balance']);
+    }
+}
+
+function testMessagesFailoverWorksWithAnImageInAToolResult(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    $image = ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => 'image/png', 'data' => str_repeat('A', 50000)]];
+    $messages = [['role' => 'user', 'content' => 'look'],
+        ['role' => 'assistant', 'content' => [['type' => 'tool_use', 'id' => 't1', 'name' => 'Read', 'input' => new stdClass()]]],
+        ['role' => 'user', 'content' => [['type' => 'tool_result', 'tool_use_id' => 't1', 'content' => [$image]]]]];
+    [$r, $req] = messagesAndRequests('anth-failover-image', true, $key, ['messages' => $messages]);
+    same(200, $r['status'], $r['body']);
+    same(3, count($req), 'the image is bounded by the entry\'s token count, not its bytes, and the failover answers');
+    settled($ref);
+}
+
+function testMessagesParamsCountInThePromptBound(): void
+{
+    $fields = Messages::fields(anthBody('anth', false));
+    $pad = ['padding' => str_repeat('x', 3000)];
+    check(Messages::promptBound($fields, null, $pad) - Messages::promptBound($fields, null) >= 3000, 'every forwarded byte counts, the operator\'s too');
+    same(Messages::promptBound($fields, null), Messages::promptBound($fields, null, []), 'no params, no change');
+    $up = Messages::rewrite($fields, 'm', 100, false, ['temperature' => 0.1, 'padding' => 'p']);
+    same([0.1, 'p', 'm', 100, false], [$up['temperature'], $up['padding'], $up['model'], $up['max_tokens'], $up['stream']]);
+    same(['model' => 'm'] + $fields + ['max_tokens' => 100, 'stream' => false], Messages::rewrite($fields, 'm', 100, false), 'without params the request is what v0.21.2 sent');
+    // Over HTTP: a key that covers the plain request cannot cover the same request with 3000 bytes of messages_params.
+    [$ref, $key] = fundedKey(1000);
+    same(200, http('POST', '/v1/messages', anthBody('anth-only-second', false, ['max_tokens' => 5]), $key)['status'], 'the small pin fits');
+    settled($ref);
+    $r = http('POST', '/v1/messages', anthBody('anth-big-params', false, ['max_tokens' => 5]), $key);
+    same([402, 'billing_error'], [$r['status'], anthError($r)['type']], 'the bound includes messages_params, so the reservation is refused');
+    settled($ref);
+    // count_tokens answers at least what those bytes add, for the route that carries them.
+    $count = static fn (string $alias): int => json_decode(http('POST', '/v1/messages/count_tokens', anthBody($alias, false), $key)['body'], true)['input_tokens'] ?? 0;
+    check($count('anth-only-second') - $count('anth') >= strlen(json_encode(MESSAGES_PIN)) - 40, 'count_tokens counts messages_params');
+    check($count('anth-big-params') - $count('anth') >= 3000, 'count_tokens counts a large messages_params in full');
+}
+
+function testMessagesFailoverGuardAnswersTheEarlierRetryableFailure(): void
+{
+    foreach ([false, true] as $stream) {
+        [$ref, $key] = fundedKey(10000);
+        [$r, $req] = messagesAndRequests('anth-guard', $stream, $key);
+        same(429, $r['status'], 'a 429 first, then the second upstream\'s 400: the client is told about the 429 it can retry');
+        same(2, $r['retry_after'], 'its Retry-After is kept');
+        same(['rate_limit_error'], [anthError($r)['type']]);
+        checkNoUpstreamDetails($r['body']);
+        same([['primary', 'fake-upstream-key'], ['primary', 'fake-upstream-key'], ['backup', 'second-upstream-key']], hops($req), 'both upstreams were asked');
+        same(10000, settled($ref)['balance'], 'nothing delivered, nothing charged');
+        same([400, 3], [lastUsage($ref)['http_status'], lastUsage($ref)['attempts']], 'the usage row still records the last attempt');
+    }
+    // A request the first upstream rejected itself keeps its 400, and the second is never asked.
+    [$ref, $key] = fundedKey(10000);
+    [$r, $req] = messagesAndRequests('anth-first-400', false, $key);
+    same([400, 'invalid_request_error', 1], [$r['status'], anthError($r)['type'], count($req)], 'a 400 from the first upstream alone stays a 400');
+    same('upstream rejected the request (HTTP 400)', anthError($r)['message']);
+    // An over-long request is passed on as such, whatever failed before it.
+    [$ref, $key] = fundedKey(10000);
+    [$r] = messagesAndRequests('anth-guard-context', false, $key);
+    same([400, 'the request is longer than the model accepts'], [$r['status'], anthError($r)['message']], 'context_length_exceeded is not masked');
+    same(10000, settled($ref)['balance']);
+}
+
+function testMessagesAStreamThatBrokeAfterItsFirstByteIsNotFailedOver(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    [$r, $req] = messagesAndRequests('anth-midstream', true, $key);
+    same(200, $r['status']);
+    same(1, count($req), 'the second upstream is never asked once output was relayed (ADR 0011)');
+    check(str_contains($r['body'], 'event: error') && !str_contains($r['body'], 'message_stop'), 'the client gets the in-band error');
+    check(settled($ref)['balance'] < 100000, 'what was delivered is charged');
+}
+
+function testMessagesParamsConfig(): void
+{
+    $dir = tempDir();
+    foreach (['a', 'b'] as $n) {
+        file_put_contents("$dir/$n.key", "key-$n\n");
+    }
+    $model = ['input' => 1, 'cached_input' => 1, 'output' => 1];
+    $base = configArrayFor($dir);
+    $up = ['a' => ['url' => 'https://a.example.com/v1/chat/completions', 'messages_url' => 'https://a.example.com/v1/messages', 'key_file' => "$dir/a.key"],
+        'b' => ['url' => 'https://b.example.com/v1/chat/completions', 'key_file' => "$dir/b.key"]];
+    $c = new Config(['upstreams' => $up, 'models' => [
+        'm' => $model + ['messages_params' => ['x' => 1, 'y' => 1], 'route' => [['upstream' => 'a', 'model' => 'p', 'messages_params' => ['y' => 2]],
+            ['upstream' => 'b', 'model' => 'q'], ['upstream' => 'a', 'model' => 'r']]],
+        'own' => $model + ['model' => 'z', 'url' => 'https://o.example.com/v1/chat/completions', 'messages_url' => 'https://o.example.com/v1/messages',
+            'key_file' => "$dir/a.key", 'messages_params' => ['x' => 3]],
+        'plain' => $model + ['route' => [['upstream' => 'a', 'model' => 'p']]]]] + $base);
+    same(['y' => 2, 'x' => 1], $c->route('m', 0)['messages_params'], 'the entry\'s over the model\'s');
+    same([], $c->route('m', 1)['messages_params'], 'an entry whose upstream serves no Messages format has none');
+    same(['x' => 1, 'y' => 1], $c->route('m', 2)['messages_params'], 'the model\'s default');
+    same(['x' => 3], $c->route('own')['messages_params'], 'a model in the older form');
+    same([], $c->route('plain')['messages_params'], 'none unless configured');
+    same([], (new Config($base))->routes['ok'][0]['messages_params'], 'a config from before this setting loads with none');
+    $good = ['upstreams' => $up, 'models' => ['m' => $model + ['route' => [['upstream' => 'a', 'model' => 'p']]]]];
+    new Config($good + $base);
+    foreach ([
+        ['messages_params' => ['model' => 'z']], ['messages_params' => ['messages' => []]], ['messages_params' => ['max_tokens' => 9]], ['messages_params' => ['stream' => true]],
+        ['messages_params' => ['a', 'b']], ['messages_params' => 'x'], ['messages_params' => ['' => 1]], ['messages_params' => ['x' => NAN]],
+    ] as $bad) {
+        foreach ([['models' => ['m' => $model + $bad + ['route' => [['upstream' => 'a', 'model' => 'p']]]]],
+            ['models' => ['m' => $model + ['route' => [['upstream' => 'a', 'model' => 'p'] + $bad]]]]] as $override) {
+            try {
+                new Config($override + $good + $base);
+                throw new \RuntimeException('accepted bad config: ' . json_encode($bad));
+            } catch (\InvalidArgumentException) {
+            }
+        }
+    }
+    foreach ([
+        ['models' => ['m' => $model + ['route' => [['upstream' => 'b', 'model' => 'p', 'messages_params' => ['x' => 1]]]]]],   // an entry with no messages_url
+        ['models' => ['m' => $model + ['messages_params' => ['x' => 1], 'route' => [['upstream' => 'b', 'model' => 'p']]]]],    // a default that no entry can use
+        ['models' => ['m' => $model + ['model' => 'z', 'messages_params' => ['x' => 1]]]],                                       // a model with no messages_url at all
+    ] as $override) {
+        try {
+            new Config($override + $good + $base);
+            throw new \RuntimeException('accepted a messages_params with no effect: ' . json_encode($override));
+        } catch (\InvalidArgumentException) {
+        }
+    }
+}
+
+/** The old-config upgrade case: a config from v0.21.2 (no messages_params anywhere) sends the Messages request it always sent. */
+function testMessagesWithoutMessagesParamsIsUnchanged(): void
+{
+    [$ref, $key] = fundedKey(100000);
+    [$r, $req] = messagesAndRequests('anth', false, $key);
+    same(200, $r['status']);
+    $keys = $req[0]['keys'];
+    sort($keys);
+    same(['max_tokens', 'messages', 'model', 'stream'], $keys, 'exactly the forwarded fields and the proxy\'s own: nothing is added');
+    same([null, null], [$req[0]['provider'], $req[0]['temperature']]);
+    settled($ref);
+}

@@ -17,6 +17,8 @@ Upstreams fail, and retrying or moving to another upstream improves availability
 ## Decision
 A request is retried on the same upstream, or moved to the next one in its route, only before anything has been relayed and only after an attempt that cannot have produced output: the connection failed before sending, or the upstream refused the request (408, 409, 429, 502, 503, 504, and for failover also 401 to 404 and other 5xx). After a 2xx status, or a sent request that timed out or broke, the request ends. A request the upstream rejected as invalid ends too, since every upstream would reject it. All attempts share one reservation and one deadline, and only the delivered answer is charged.
 
+Amended 2026-11-16 (v0.22.0): a request that ends undelivered tells the client about the last attempt, except when an earlier upstream failed in a way another could fix and a later one then rejected the request as invalid (400, 413 or 422, not `context_length_exceeded`): the client is then told about the earlier failure, which it retries by itself where a 400 would end its turn. The usage row and the charge still go by the last attempt (ADR 0020, amendment).
+
 ## Consequences
 - The proxy never pays twice for one answer.
 - A mid-stream upstream failure reaches the client as an in-band error, not a silent retry.

@@ -12,15 +12,17 @@ final class Config
 {
     /** Request fields a model's params may not set: the proxy owns them (metering, n=1, the alias mapping). */
     public const PARAMS_RESERVED = ['model', 'messages', 'max_tokens', 'max_completion_tokens', 'stream', 'stream_options', 'n'];
+    /** Request fields a route entry's messages_params may not set: the proxy owns them on /v1/messages (the alias mapping, metering). */
+    public const MESSAGES_PARAMS_RESERVED = ['model', 'messages', 'max_tokens', 'stream'];
     /** Extra attempts on the same upstream after a failure that cost nothing upstream. */
     public const MAX_RETRIES = 2;
     /** Every setting each level of the config may have: anything else is refused, so a misspelt key never silently drops a limit. */
     private const KEYS = ['db_path', 'upstream_url', 'upstream_key_file', 'upstream_timeout', 'max_tokens_cap', 'max_concurrent_per_key', 'lease_seconds',
         'requests_per_minute', 'requests_per_hour', 'credits_per_minute', 'admin_token_sha256', 'log_dir', 'log_level', 'throttle', 'stream_options', 'retries',
         'upstreams', 'models', 'caps'];
-    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'description', 'context_length', 'image_tokens'];
+    private const MODEL_KEYS = ['input', 'cached_input', 'output', 'route', 'model', 'url', 'messages_url', 'key_file', 'stream_options', 'params', 'messages_params', 'description', 'context_length', 'image_tokens'];
     private const UPSTREAM_KEYS = ['url', 'messages_url', 'key_file', 'stream_options'];
-    private const ROUTE_KEYS = ['upstream', 'model', 'params', 'cost', 'image_tokens'];
+    private const ROUTE_KEYS = ['upstream', 'model', 'params', 'messages_params', 'cost', 'image_tokens'];
 
     public readonly string $dbPath;
     public readonly ?string $upstreamUrl;
@@ -32,9 +34,10 @@ final class Config
     /** @var array<string, array{description: string, context_length: ?int}> alias => what /v1/models shows about it besides its rates */
     public readonly array $info;
     /**
-     * @var array<string, list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>>
+     * @var array<string, list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, messages_params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>>
      * alias => its upstreams in failover order: where each request goes (`messages_url`: where an Anthropic Messages request
-     * goes, null when that upstream serves none), the model id it asks for and the request fields set there
+     * goes, null when that upstream serves none), the model id it asks for and the request fields set there (`params` on chat
+     * completions, `messages_params` on the Messages format)
      */
     public readonly array $routes;
     public readonly int $retries;
@@ -116,7 +119,11 @@ final class Config
             self::known($m, self::MODEL_KEYS, "models.$alias.");
             $rate = static fn (string $k, int $min): int => is_int($m[$k] ?? null) && $m[$k] >= $min && $m[$k] <= Credits::MAX_RATE ? $m[$k]
                 : throw new \InvalidArgumentException("config: models.$alias.$k must be an integer from $min to " . Credits::MAX_RATE);
-            $hops = $this->hops($alias, $m, $upstreams, self::params($m, "models.$alias."));
+            $messagesParams = self::params($m, "models.$alias.", 'messages_params', self::MESSAGES_PARAMS_RESERVED);
+            $hops = $this->hops($alias, $m, $upstreams, self::params($m, "models.$alias."), $messagesParams);
+            if ($messagesParams !== [] && array_filter($hops, static fn (array $h): bool => $h['messages_url'] !== null) === []) {
+                throw new \InvalidArgumentException("config: models.$alias.messages_params has no effect: no upstream of the model has a messages_url");
+            }
             $p = ['model' => $hops[0]['model'], 'input' => $rate('input', 1), 'cached_input' => $rate('cached_input', 0), 'output' => $rate('output', 1)];
             // Reservations price the whole prompt at the input rate; that bounds the charge only if cached input costs no more.
             if ($p['cached_input'] > $p['input']) {
@@ -189,7 +196,7 @@ final class Config
     /**
      * Where a model alias's requests go on its $hop-th upstream (0 = the first), with that upstream's own
      * key read from its own key file at request time. A missing key fails this upstream; it never borrows another's.
-     * @return array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>}
+     * @return array{url: string, messages_url: ?string, key: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, messages_params: array<string, mixed>}
      */
     public function route(string $alias, int $hop = 0): array
     {
@@ -198,7 +205,8 @@ final class Config
         if ($key === '') {
             throw new \RuntimeException('upstream key file missing or empty');
         }
-        return ['url' => $r['url'], 'messages_url' => $r['messages_url'], 'key' => $key, 'stream_options' => $r['stream_options'], 'model' => $r['model'], 'params' => $r['params']];
+        return ['url' => $r['url'], 'messages_url' => $r['messages_url'], 'key' => $key, 'stream_options' => $r['stream_options'], 'model' => $r['model'], 'params' => $r['params'],
+            'messages_params' => $r['messages_params']];
     }
 
     /**
@@ -252,14 +260,16 @@ final class Config
     /**
      * A model's upstreams in failover order. A model either lists them ('route': upstream name, model id and
      * optional params per entry), or names one model id served by its own url and key_file, or by the global upstream.
-     * Params are merged per entry: the model's, then the entry's on top. A model's own messages_url needs its own key_file,
+     * Params are merged per entry: the model's, then the entry's on top; so are messages_params, the request fields the Messages
+     * format gets instead (an entry whose upstream has no messages_url has none, and may not set any). A model's own messages_url needs its own key_file,
      * as its own url does: the global key never goes to another endpoint.
      * @param array<string, mixed> $m
      * @param array<string, array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>}> $upstreams
      * @param array<string, mixed> $params
-     * @return list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>
+     * @param array<string, mixed> $messagesParams
+     * @return list<array{url: string, messages_url: ?string, key_file: string, stream_options: array<string, mixed>, model: string, params: array<string, mixed>, messages_params: array<string, mixed>, cost: ?array{input: int, cached_input: int, output: int}, image_tokens: ?int}>
      */
-    private function hops(string $alias, array $m, array $upstreams, array $params): array
+    private function hops(string $alias, array $m, array $upstreams, array $params, array $messagesParams = []): array
     {
         if (isset($m['route'])) {
             if (isset($m['model']) || isset($m['url']) || isset($m['messages_url']) || isset($m['key_file']) || isset($m['stream_options']) || isset($m['image_tokens'])) {
@@ -275,7 +285,13 @@ final class Config
                     throw new \InvalidArgumentException("config: {$at}upstream must name an entry of upstreams");
                 }
                 self::known($h, self::ROUTE_KEYS, $at);
-                $hops[] = $upstreams[$h['upstream']] + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params, 'cost' => self::cost($h, $at),
+                $up = $upstreams[$h['upstream']];
+                $own = self::params($h, $at, 'messages_params', self::MESSAGES_PARAMS_RESERVED);
+                if ($own !== [] && $up['messages_url'] === null) {
+                    throw new \InvalidArgumentException("config: {$at}messages_params has no effect: upstream '{$h['upstream']}' has no messages_url");
+                }
+                $hops[] = $up + ['model' => self::str($h, 'model', $at), 'params' => self::params($h, $at) + $params,
+                    'messages_params' => $up['messages_url'] === null ? [] : $own + $messagesParams, 'cost' => self::cost($h, $at),
                     'image_tokens' => self::imageTokens($h, $at)];
             }
             return $hops;
@@ -299,7 +315,7 @@ final class Config
         }
         $u['messages_url'] = self::messagesUrl($m, "models.$alias.");
         $u['stream_options'] = isset($m['stream_options']) ? self::streamOptions($m, 'stream_options', "models.$alias.") : $this->streamOptions;
-        return [$u + ['model' => $m['model'], 'params' => $params, 'cost' => null, 'image_tokens' => self::imageTokens($m, "models.$alias.")]];
+        return [$u + ['model' => $m['model'], 'params' => $params, 'messages_params' => $u['messages_url'] === null ? [] : $messagesParams, 'cost' => null, 'image_tokens' => self::imageTokens($m, "models.$alias.")]];
     }
 
     /**
@@ -321,19 +337,20 @@ final class Config
 
     /**
      * Request fields a model (or one of its upstreams) always sends, such as a reasoning setting; they
-     * override what the client sent. Fields the proxy owns are refused.
+     * override what the client sent. Fields the proxy owns are refused. $name is params (chat completions) or messages_params.
      * @param array<string, mixed> $c
+     * @param list<string> $reserved
      * @return array<string, mixed>
      */
-    private static function params(array $c, string $prefix): array
+    private static function params(array $c, string $prefix, string $name = 'params', array $reserved = self::PARAMS_RESERVED): array
     {
-        $p = $c['params'] ?? [];
+        $p = $c[$name] ?? [];
         if (!is_array($p) || ($p !== [] && array_is_list($p))) {
-            throw new \InvalidArgumentException("config: {$prefix}params must be a map of request field => value");
+            throw new \InvalidArgumentException("config: {$prefix}$name must be a map of request field => value");
         }
         foreach ($p as $k => $v) {
-            if (!is_string($k) || $k === '' || in_array($k, self::PARAMS_RESERVED, true) || json_encode($v) === false) {
-                throw new \InvalidArgumentException("config: {$prefix}params.$k is not allowed (reserved: " . implode(', ', self::PARAMS_RESERVED) . ')');
+            if (!is_string($k) || $k === '' || in_array($k, $reserved, true) || json_encode($v) === false) {
+                throw new \InvalidArgumentException("config: {$prefix}$name.$k is not allowed (reserved: " . implode(', ', $reserved) . ')');
             }
         }
         return $p;

@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.22.0 (2026-11-16)
+
+No schema change. Config: a new optional setting, `messages_params`, on a route entry and on a model; a config without it loads and behaves as v0.21.2.
+
+- **A second upstream can serve `POST /v1/messages`, with its own request settings.** `messages_params` are request fields sent only to that route entry's Messages endpoint (a routing or retention setting that endpoint reads), winning over the client's, counted in the prompt bound, never `model`, `messages`, `max_tokens` or `stream`, and refused on an entry whose upstream has no `messages_url`. Chat `params` still do not apply to this format. With it, a Messages request fails over between the route's entries that have a `messages_url`, as chat does, and an alias whose only upstream is such an entry serves it. [ADR 0020](docs/adr/0020-anthropic-messages-pass-through.md) amended.
+- **A failover no longer turns a retryable failure into a fatal one.** When an earlier upstream failed in a way another could fix (429, 5xx, 401 to 404, no answer) and a later upstream then rejected the request as invalid (400, 413 or 422, not an over-long request), the client got that 400, which ends a client's turn. It now gets the earlier failure (429 or 503, which clients retry). A request the first upstream itself rejects keeps its 400; the usage row and the charge go by the last attempt. Applies to chat, Messages and the Gemini routes.
+
 ## v0.21.2 (2026-11-16)
 
 No schema change.

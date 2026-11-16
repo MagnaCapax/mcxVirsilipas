@@ -123,6 +123,20 @@ function configArrayFor(string $dir, array $overrides = []): array
     $models['anth-slow'] = ['route' => [$hop('msgs', 'scenario-anth-slow')]] + unitRates();
     $models['anth-overloaded'] = ['route' => [$hop('msgs', 'scenario-anth-529')]] + unitRates();
     $models['anth-mixed'] = ['route' => [$hop('primary', 'scenario-ok'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();
+    // Messages failover and messages_params: 'msgs1' serves the format at a path without /second/ (the failover tests tell the two
+    // upstreams apart by it and by their keys). The pin is a routing setting and a field a client could also send.
+    $pin = ['provider' => ['only' => ['pin-a'], 'allow_fallbacks' => false], 'temperature' => 0.25];
+    $models['anth-failover'] = ['route' => [$hop('msgs1', 'scenario-anth-503'), $hop('msgs', 'scenario-anth-ok') + ['messages_params' => $pin]]] + unitRates();
+    $models['anth-only-second'] = ['route' => [$hop('msgs', 'scenario-anth-ok') + ['messages_params' => $pin]]] + unitRates();
+    $models['anth-big-params'] = ['route' => [$hop('msgs', 'scenario-anth-ok') + ['messages_params' => ['padding' => str_repeat('x', 3000)]]]] + unitRates();
+    $models['anth-guard'] = ['route' => [$hop('msgs1', 'scenario-anth-429'), $hop('msgs', 'scenario-anth-400')]] + unitRates();
+    $models['anth-first-400'] = ['route' => [$hop('msgs1', 'scenario-anth-400'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();
+    $models['anth-guard-context'] = ['route' => [$hop('msgs1', 'scenario-anth-429'), $hop('msgs', 'scenario-anth-400-context')]] + unitRates();
+    $models['anth-midstream'] = ['route' => [$hop('msgs1', 'scenario-anth-usage-broken'), $hop('msgs', 'scenario-anth-ok')]] + unitRates();
+    $models['anth-failover-image'] = ['route' => [$hop('msgs1', 'scenario-anth-503') + ['image_tokens' => 1000],
+        $hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 1000, 'messages_params' => $pin]]] + unitRates();
+    // The same guard on chat and the Gemini format: a 429, then a plain 400.
+    $models['guard-chat'] = ['route' => [$hop('primary', 'scenario-429'), $hop('backup', 'scenario-400')]] + unitRates();
     // Two upstreams whose models count an image differently: the bound takes the larger.
     $models['vision-two'] = ['route' => [$hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 500], $hop('msgs', 'scenario-anth-ok') + ['image_tokens' => 3000]]] + unitRates();
     return $overrides + [
@@ -132,6 +146,7 @@ function configArrayFor(string $dir, array $overrides = []): array
             'dead' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/upstream.key"],
             'nokey' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'key_file' => "$dir/missing.key"],
             'msgs' => ['url' => 'http://127.0.0.1:1/second/v1/chat/completions', 'messages_url' => 'http://127.0.0.1:1/second/v1/messages', 'key_file' => "$dir/second.key"],
+            'msgs1' => ['url' => 'http://127.0.0.1:1/v1/chat/completions', 'messages_url' => 'http://127.0.0.1:1/v1/messages', 'key_file' => "$dir/upstream.key"],
         ],
         'db_path' => "$dir/ledger.sqlite",
         'upstream_url' => 'http://127.0.0.1:1/v1/chat/completions',
@@ -179,6 +194,8 @@ final class Harness
         $cfg['upstreams']['backup']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
         $cfg['upstreams']['msgs']['url'] = "http://127.0.0.1:$up/second/v1/chat/completions";
         $cfg['upstreams']['msgs']['messages_url'] = "http://127.0.0.1:$up/second/v1/messages";
+        $cfg['upstreams']['msgs1']['url'] = "http://127.0.0.1:$up/v1/chat/completions";
+        $cfg['upstreams']['msgs1']['messages_url'] = "http://127.0.0.1:$up/v1/messages";
         file_put_contents("$dir/config.php", '<?php return ' . var_export($cfg, true) . ';');
         // php -S queues connections inside a worker, so genuine concurrency needs separate server processes.
         $ports = [];

@@ -145,7 +145,7 @@ curl https://proxy.example/v1/messages \
 ```
 
 - **The key** comes as `x-api-key: <key>` or as `Authorization: Bearer <key>` (when both are sent, `x-api-key` wins). Neither: 401 `missing key: send x-api-key or Authorization: Bearer`.
-- **The model** is an alias whose route has at least one upstream with a `messages_url` (see `config.example.php`). Only those route entries serve this route, in route order, with retries and failover as on chat. Any other alias, or an unknown one: 404 `unknown model, or not served in the Messages format; see /v1/models`.
+- **The model** is an alias whose route has at least one upstream with a `messages_url` (see `config.example.php`). Only those route entries serve this route, in route order, with retries and failover as on chat, so an alias whose route has a second upstream with a `messages_url` fails over on this route too. Any other alias, or an unknown one: 404 `unknown model, or not served in the Messages format; see /v1/models`.
 - **Headers forwarded:** `anthropic-version` (when the client sends none, `2023-06-01`) and `anthropic-beta`, each when it is printable ASCII of at most 1 KiB. The upstream gets its own key as `x-api-key` and as `Authorization: Bearer`.
 - **Errors** use the Anthropic shape, with the same statuses, messages and `Retry-After` as everywhere else, and the `type` chosen by status (400 `invalid_request_error`, 401 `authentication_error`, 402 `billing_error`, 403 `permission_error`, 404 `not_found_error`, 413 `request_too_large`, 429 `rate_limit_error`, 503 `overloaded_error`, 504 `timeout_error`, any other `api_error`). The OpenAI-style `code` and `param` are not part of this shape:
 
@@ -153,7 +153,7 @@ curl https://proxy.example/v1/messages \
   {"type": "error", "error": {"type": "billing_error", "message": "credit balance too low for this request"}}
   ```
 
-**Request fields.** Only these are read or forwarded; any other field (`container`, `mcp_servers`, `service_tier`, `metadata` and so on) is dropped without an error. `metadata` is dropped on purpose: a client such as Claude Code puts a per-install device id and its session id in `metadata.user_id`, and the upstream must not receive them (nothing in the answer depends on it). The deployment's `params` are not applied here: they are chat completions fields.
+**Request fields.** Only these are read or forwarded; any other field (`container`, `mcp_servers`, `service_tier`, `metadata` and so on) is dropped without an error. `metadata` is dropped on purpose: a client such as Claude Code puts a per-install device id and its session id in `metadata.user_id`, and the upstream must not receive them (nothing in the answer depends on it). The deployment's `params` are not applied here: they are chat completions fields. A route entry's `messages_params` are: request fields the deployment sets for that entry's Messages endpoint, such as a routing or retention setting that endpoint reads there. They win over the client's fields, count in the prompt bound, and cannot set `model`, `messages`, `max_tokens` or `stream`; a client can neither send nor override them.
 
 | Field | Rules |
 |---|---|
@@ -507,7 +507,7 @@ Every error the API can answer. The client-route errors have a `code`; the admin
 | 404 | `invalid_request_error` | `null` | not found | | any other method or path (in the Gemini shape under `/v1beta/`) |
 | 500 | `api_error` | `null` | internal error | | any route: an unexpected failure, such as a config that cannot be loaded or a ledger that cannot be read or written |
 
-- **Upstream-derived errors.** The rows marked "from the upstream" are the proxy's own answers (on `POST /v1/messages` too, where an upstream's 529 is a 5xx like any other), chosen from the last failed attempt after retries and failover; the upstream's own text is never relayed. The last attempt decides:
+- **Upstream-derived errors.** The rows marked "from the upstream" are the proxy's own answers (on `POST /v1/messages` too, where an upstream's 529 is a 5xx like any other), chosen from the last failed attempt after retries and failover; the upstream's own text is never relayed. The last attempt decides, with one exception: when an earlier upstream failed in a way another could fix (429, 5xx, 401 to 404, or no answer) and a later upstream then rejected the request as invalid (400, 413 or 422, not an over-long request), the earlier failure is the one reported, because that rejection may be the later upstream's own limit, and clients retry a 429 or 503 where a 400 ends their turn. A request the first upstream itself rejected keeps its 400. The usage row and the charge always go by the last attempt (nothing was delivered, so nothing is charged):
   - an upstream error code `context_length_exceeded`: 400 `context_length_exceeded`;
   - the time limit passed: 504 `upstream_timeout`;
   - a response or stream event too large: 502 `upstream_error`;

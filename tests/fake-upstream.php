@@ -23,6 +23,9 @@ $seen['keys'] = array_keys($req);
 $seen['block_keys'] = is_array($req['messages'][0]['content'] ?? null) ? array_keys($req['messages'][0]['content'][0] ?? []) : [];
 $seen['tool_keys'] = array_keys($req['tools'][0] ?? []);
 $seen['thinking'] = $req['thinking'] ?? null;
+// The operator's messages_params as they arrived (a routing pin and a client field they override).
+$seen['provider'] = $req['provider'] ?? null;
+$seen['temperature'] = $req['temperature'] ?? null;
 $seen['x_api_key'] = (string) ($_SERVER['HTTP_X_API_KEY'] ?? '');
 $seen['anthropic_version'] = (string) ($_SERVER['HTTP_ANTHROPIC_VERSION'] ?? '');
 $seen['anthropic_beta'] = (string) ($_SERVER['HTTP_ANTHROPIC_BETA'] ?? '');
@@ -50,6 +53,17 @@ if (str_ends_with($seen['path'], '/v1/messages')) {
         http_response_code(529);
         header('Content-Type: application/json');
         echo '{"type":"error","error":{"type":"overloaded_error","message":"private upstream detail: overloaded"}}';
+        exit;
+    }
+    // Failing Messages upstreams for the failover tests: a retryable 503, a 429 with Retry-After, a plain 400 and an over-long request.
+    $anthFail = ['scenario-anth-503' => 503, 'scenario-anth-429' => 429, 'scenario-anth-400' => 400, 'scenario-anth-400-context' => 400][$model] ?? null;
+    if ($anthFail !== null) {
+        http_response_code($anthFail);
+        header('Content-Type: application/json');
+        $anthFail === 429 && header('Retry-After: 2');
+        echo $model === 'scenario-anth-400-context'
+            ? '{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"private upstream detail: too long"}}'
+            : '{"type":"error","error":{"type":"api_error","message":"private upstream detail: node 7 said no"}}';
         exit;
     }
     $slow = $model === 'scenario-anth-slow';
@@ -118,11 +132,11 @@ if ($flaky && $model === 'scenario-flaky-hint') {
 if ($flaky) {
     touch($dir . '/flaky-seen');
 }
-$failWith = ['scenario-503' => 503, 'scenario-500' => 500, 'scenario-401' => 401, 'scenario-400-context' => 400][$model] ?? ($flaky ? ($model === 'scenario-flaky-hint' ? 429 : 503) : null);
+$failWith = ['scenario-503' => 503, 'scenario-500' => 500, 'scenario-401' => 401, 'scenario-400-context' => 400, 'scenario-400' => 400][$model] ?? ($flaky ? ($model === 'scenario-flaky-hint' ? 429 : 503) : null);
 if ($failWith !== null) {
     http_response_code($failWith);
     header('Content-Type: application/json');
-    echo $failWith === 400 ? '{"error":{"message":"private upstream detail: 9000 tokens over","type":"invalid_request_error","code":"context_length_exceeded"}}'
+    echo $model === 'scenario-400-context' ? '{"error":{"message":"private upstream detail: 9000 tokens over","type":"invalid_request_error","code":"context_length_exceeded"}}'
         : '{"error":{"message":"private upstream detail: node 7 down"}}';
     exit;
 }

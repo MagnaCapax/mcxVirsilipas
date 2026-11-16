@@ -63,12 +63,14 @@ final class Messages
      * The upstream request: the operator's model id, the forwarded fields, the clamped max_tokens and the stream flag.
      * A thinking budget the clamped max_tokens no longer leaves room for is lowered to fit (the upstream requires
      * budget_tokens below max_tokens), so a request clamped to the balance still runs instead of being rejected upstream.
+     * The route entry's messages_params win over the client's fields, as chat params do (Config refuses the fields the proxy owns).
      * @param array<string, mixed> $fields from fields()
+     * @param array<string, mixed> $params the route entry's messages_params
      * @return array<string, mixed>
      */
-    public static function rewrite(array $fields, string $upstreamModel, int $maxTokens, bool $stream): array
+    public static function rewrite(array $fields, string $upstreamModel, int $maxTokens, bool $stream, array $params = []): array
     {
-        $out = ['model' => $upstreamModel] + $fields + ['max_tokens' => $maxTokens, 'stream' => $stream];
+        $out = ['model' => $upstreamModel] + array_replace($fields, $params) + ['max_tokens' => $maxTokens, 'stream' => $stream];
         if (is_array($out['thinking'] ?? null) && is_int($out['thinking']['budget_tokens'] ?? null) && $out['thinking']['budget_tokens'] >= $maxTokens) {
             $out['thinking']['budget_tokens'] = max(1, $maxTokens - 1);
         }
@@ -78,13 +80,15 @@ final class Messages
     /**
      * Upper bound on the prompt tokens: the byte length of every forwarded field, plus the tool-use system prompt an
      * upstream adds when tools are given, with each image counted as the upstream's per-image tokens ($imageTokens,
-     * see Proxy::imageBound) instead of its base64 bytes. Also the answer of POST /v1/messages/count_tokens.
+     * see Proxy::imageBound) instead of its base64 bytes, and the route entry's messages_params, which are forwarded too.
+     * Also the answer of POST /v1/messages/count_tokens.
      * @param array<string, mixed> $fields from fields()
+     * @param array<string, mixed> $params the route entry's messages_params
      */
-    public static function promptBound(array $fields, ?int $imageTokens): int
+    public static function promptBound(array $fields, ?int $imageTokens, array $params = []): int
     {
         [$count, $imageBytes] = self::images($fields['messages'] ?? []);
-        return strlen(Proxy::encode($fields)) - $imageBytes + 16 + (isset($fields['tools']) ? self::TOOLS_OVERHEAD : 0)
+        return strlen(Proxy::encode(array_replace($fields, $params))) - $imageBytes + 16 + (isset($fields['tools']) ? self::TOOLS_OVERHEAD : 0)
             + Proxy::imageBound($count, $imageTokens);
     }
 

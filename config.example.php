@@ -11,6 +11,10 @@ return [
     // 'messages_url' (optional, same scheme rule): the upstream's own Anthropic Messages endpoint, for POST /v1/messages
     // (Claude Code). It is called with the same key_file; only the aliases routed to an upstream that has one can be used
     // there, and only on those route entries. For a model in the older form below, set it beside the model's own key_file.
+    // A route entry (or a model) may set 'messages_params' on top: request fields sent only to that Messages endpoint,
+    // winning over the client's (not model, messages, max_tokens, stream). The model's 'params' do not apply there, so
+    // repeat in 'messages_params' every routing or retention setting the entry's 'params' carry, as the endpoint reads it.
+    // It is refused on an entry whose upstream has no 'messages_url'.
     'upstreams' => [
         'main' => ['url' => 'https://llm.example.com/v1/chat/completions', 'key_file' => '/etc/virsilipas/main.key'],
         // 'main' => ['url' => 'https://llm.example.com/v1/chat/completions', 'messages_url' => 'https://llm.example.com/v1/messages',
@@ -45,6 +49,9 @@ return [
                 // 'cost': this upstream's own prices in millionths of its currency unit per million tokens (0.30 = 300000),
                 // recorded as the usage row's upstream cost when the upstream reports none itself. Never shown to clients.
                 ['upstream' => 'spare', 'model' => 'example-org/example-model', 'cost' => ['input' => 300000, 'cached_input' => 30000, 'output' => 1200000]]]],
+        // A second upstream that serves the Messages format too is a failover for Claude Code. If its chat entry carries
+        // 'params' that pin where the request may be served, give its Messages entry the same pin as 'messages_params':
+        // ['upstream' => 'spare', 'model' => 'example-org/example-model', 'params' => ['example_pin' => 'a'], 'messages_params' => ['example_pin' => 'a']]
         // 'image_tokens' on a route entry: the most prompt tokens that upstream's model charges for one image, from the
         // model's published figure. An image counts as that in the reservation; a route entry without it takes no images.
         // 'vision' => ['input' => 1000000, 'cached_input' => 250000, 'output' => 4000000,

@@ -210,7 +210,7 @@ function testConfigRoutesAndParams(): void
     $c = new Config(['upstreams' => $up, 'models' => ['m' => $model + ['params' => ['reasoning_effort' => 'low'],
         'route' => [['upstream' => 'a', 'model' => 'x'], ['upstream' => 'b', 'model' => 'y', 'params' => ['reasoning_effort' => 'high', 'top_k' => 5]]]]]] + $base);
     same(['url' => $up['a']['url'], 'messages_url' => null, 'key' => 'key-a', 'stream_options' => ['include_usage' => true, 'continuous_usage_stats' => true],
-        'model' => 'x', 'params' => ['reasoning_effort' => 'low']], $c->route('m', 0));
+        'model' => 'x', 'params' => ['reasoning_effort' => 'low'], 'messages_params' => []], $c->route('m', 0));
     same(['key-b', 'y', ['reasoning_effort' => 'high', 'top_k' => 5]], [$c->route('m', 1)['key'], $c->route('m', 1)['model'], $c->route('m', 1)['params']],
         'an upstream entry has its own key, model id and params over the model params');
     same('x', $c->models['m']['model'], 'the first upstream model id stays the model field');
@@ -273,4 +273,28 @@ function testFailureMapping(): void
         $e = Proxy::failure($in);
         same([$status, $code, $retry], [$e->status, $e->errorCode, $e->retryAfter], json_encode($in));
     }
+}
+
+function testAFailoverNeverTurnsARetryableFailureIntoAFatalOneOnChat(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    [$r, $req] = chatAndRequests('guard-chat', false, $key);
+    same(429, $r['status'], 'the first upstream\'s 429, not the second\'s 400: a client retries the one and stops at the other');
+    same('upstream_busy', errorOf($r)['code']);
+    same(1, $r['retry_after']);
+    same([['primary', 'fake-upstream-key'], ['primary', 'fake-upstream-key'], ['backup', 'second-upstream-key']], hops($req), 'the second upstream was asked');
+    same(10000, settled($ref)['balance'], 'nothing charged');
+    same([400, 3], [lastUsage($ref)['http_status'], lastUsage($ref)['attempts']], 'the usage row records the last attempt');
+    // Without an earlier failure the 400 stays: the second entry alone, and a first entry that rejected the request itself.
+    [$ref, $key] = fundedKey(10000);
+    [$r] = chatAndRequests('context', false, $key);
+    same('context_length_exceeded', errorOf($r)['code'], 'an over-long request keeps its code');
+}
+
+function testAFailoverNeverTurnsARetryableFailureIntoAFatalOneOnTheGeminiFormat(): void
+{
+    [$ref, $key] = fundedKey(10000);
+    $r = gem('guard-chat', 'generateContent', gemBody(), $key);
+    same([429, 'RESOURCE_EXHAUSTED'], [$r['status'], gemError($r)['status']]);
+    same(10000, settled($ref)['balance']);
 }
