@@ -13,7 +13,7 @@ namespace MagnaCapax\Virsilipas;
 final class Messages
 {
     /** Request fields forwarded upstream besides model, max_tokens and stream (which the proxy sets). Anything else is dropped. */
-    private const FORWARD = ['messages', 'system', 'stop_sequences', 'temperature', 'top_p', 'top_k', 'tools', 'tool_choice', 'thinking', 'metadata'];
+    private const FORWARD = ['messages', 'system', 'stop_sequences', 'temperature', 'top_p', 'top_k', 'tools', 'tool_choice', 'thinking'];
     /**
      * The content block types a request may carry, each with the fields kept. An image passes to an upstream whose route
      * entry publishes its per-image token count (Proxy::imageBound); a document answers 400, since no route entry publishes

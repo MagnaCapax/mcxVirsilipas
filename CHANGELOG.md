@@ -2,6 +2,12 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.21.2 (2026-11-16)
+
+No schema change.
+
+- **`POST /v1/messages` no longer forwards the client's `metadata` field.** Claude Code sends a per-install device id and its session id in `metadata.user_id`, and the proxy passed them to the upstream, which could link one customer's requests across sessions and days. The field is optional in the format and never echoed back, so no client sees a difference; like `container` or `service_tier` it is now dropped without an error. [ADR 0020](docs/adr/0020-anthropic-messages-pass-through.md) amended.
+
 ## v0.21.1 (2026-11-04)
 
 No schema change.

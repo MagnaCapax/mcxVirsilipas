@@ -174,7 +174,7 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
     $up = lastUpstreamRequest();
     $keys = $up['keys'];
     sort($keys);
-    same(['max_tokens', 'messages', 'metadata', 'model', 'stream', 'system', 'temperature', 'thinking', 'tool_choice', 'tools', 'top_k'], $keys, 'unknown fields dropped');
+    same(['max_tokens', 'messages', 'model', 'stream', 'system', 'temperature', 'thinking', 'tool_choice', 'tools', 'top_k'], $keys, 'unknown fields dropped, the client\'s metadata among them');
     same(['type', 'text', 'cache_control'], $up['block_keys'], 'unknown block fields dropped');
     same(['name', 'description', 'input_schema'], $up['tool_keys'], 'unknown tool fields dropped');
     same([1000, ['type' => 'enabled', 'budget_tokens' => 999]], [$up['max_tokens'], $up['thinking']], 'max_tokens clamped to the cap, the thinking budget below it');
@@ -191,6 +191,21 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
         $r = http('POST', '/v1/messages', $bad + anthBody('anth', false), $key);
         same([400, 'invalid_request_error'], [$r['status'], anthError($r)['type']], json_encode($bad));
     }
+}
+
+/** Claude Code sends metadata.user_id as a JSON string holding a per-install device id and the session id; none of it may reach the upstream. */
+function testMessagesDropsTheClientsMetadata(): void
+{
+    [, $key] = fundedKey(100000);
+    $userId = json_encode(['device_id' => str_repeat('ab', 32), 'account_uuid' => '', 'session_id' => '11111111-2222-3333-4444-555555555555']);
+    foreach ([false, true] as $stream) {
+        same(200, http('POST', '/v1/messages', anthBody('anth', $stream, ['metadata' => ['user_id' => $userId, 'extra' => 'x']]), $key)['status']);
+        $keys = lastUpstreamRequest()['keys'];
+        check(!in_array('metadata', $keys, true), 'metadata does not reach the upstream, stream=' . json_encode($stream));
+        check(in_array('messages', $keys, true), 'the rest of the request does');
+    }
+    $fields = Messages::fields(anthBody('anth', false, ['metadata' => ['user_id' => $userId]]));
+    check(!array_key_exists('metadata', $fields), 'fields() drops metadata');
 }
 
 function testMessagesBoundsImagesByTheirUpstreamTokenCount(): void

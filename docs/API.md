@@ -153,7 +153,7 @@ curl https://proxy.example/v1/messages \
   {"type": "error", "error": {"type": "billing_error", "message": "credit balance too low for this request"}}
   ```
 
-**Request fields.** Only these are read or forwarded; any other field (`container`, `mcp_servers`, `service_tier` and so on) is dropped without an error. The deployment's `params` are not applied here: they are chat completions fields.
+**Request fields.** Only these are read or forwarded; any other field (`container`, `mcp_servers`, `service_tier`, `metadata` and so on) is dropped without an error. `metadata` is dropped on purpose: a client such as Claude Code puts a per-install device id and its session id in `metadata.user_id`, and the upstream must not receive them (nothing in the answer depends on it). The deployment's `params` are not applied here: they are chat completions fields.
 
 | Field | Rules |
 |---|---|
@@ -164,7 +164,7 @@ curl https://proxy.example/v1/messages \
 | `stream` | `true` streams the answer; anything else does not. |
 | `thinking` | forwarded as sent, except that a `budget_tokens` at or above the clamped `max_tokens` is lowered to `max_tokens - 1` (the upstream needs room for an answer). Thinking tokens are part of `output_tokens` and paid at the output rate. |
 | `tools` | a list of client tool definitions, each keeping `type`, `name`, `description`, `input_schema` and `cache_control`. A server tool (a `type` other than `custom`, such as a web search) answers 400 `unsupported_tool` `only client tools are supported`: it carries fees no token rate covers. Not a list: 400 `tools must be a list of tool definitions`. |
-| `stop_sequences`, `temperature`, `top_p`, `top_k`, `tool_choice`, `metadata` | forwarded as sent. |
+| `stop_sequences`, `temperature`, `top_p`, `top_k`, `tool_choice` | forwarded as sent. |
 
 Content blocks keep only their own fields. Image blocks need a non-empty `source` object (otherwise 400 `invalid_messages`) and may also sit inside a tool result's content. An image counts in the prompt bound as the most tokens its upstream model charges for one, which the operator sets per upstream of the route from the model's published figure, not as its encoded bytes; on a route of several upstreams the bound is the largest. A model whose upstreams publish no such figure takes no images: 400 `unsupported_content` `images are not enabled for this model`. Documents are not enabled: 400 `unsupported_content` `documents are not enabled for this model`. Any other block type answers 400 `unsupported_content` `only text, image, tool use, tool result and thinking content is supported`, and content that is neither a string nor a non-empty list of blocks answers 400 `content must be a string or a non-empty list of content blocks`:
 
