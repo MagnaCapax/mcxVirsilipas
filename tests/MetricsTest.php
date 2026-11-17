@@ -54,8 +54,10 @@ function testRouteCostIsValidated(): void
         'models' => ['m' => ['route' => [['upstream' => 'p', 'model' => 'x', 'cost' => $cost]]] + unitRates()]];
     $ok = new Config(configArrayFor(tempDir(), $route(['input' => 1, 'cached_input' => 0, 'output' => 2])));
     same(['input' => 1, 'cached_input' => 0, 'output' => 2], $ok->routes['m'][0]['cost']);
+    $equal = new Config(configArrayFor(tempDir(), $route(['input' => 2, 'cached_input' => 2, 'output' => 2])));
+    same(['input' => 2, 'cached_input' => 2, 'output' => 2], $equal->routes['m'][0]['cost'], 'cached input equal to input is allowed');
     foreach ([['input' => 1, 'output' => 2], ['input' => 1, 'cached_input' => 0, 'output' => 2, 'extra' => 1], ['input' => -1, 'cached_input' => 0, 'output' => 2],
-        ['input' => '1', 'cached_input' => 0, 'output' => 2], 'cheap'] as $bad) {
+        ['input' => '1', 'cached_input' => 0, 'output' => 2], ['input' => 1, 'cached_input' => 2, 'output' => 2], 'cheap'] as $bad) {
         $refused = false;
         try {
             new Config(configArrayFor(tempDir(), $route($bad)));

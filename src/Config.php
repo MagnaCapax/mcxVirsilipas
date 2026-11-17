@@ -254,6 +254,10 @@ final class Config
                 throw new \InvalidArgumentException("config: {$at}cost.$k must be an integer from 0 to " . Credits::MAX_RATE);
             }
         }
+        // Same rule as a model's rates: a cached input priced above fresh input would break the bound that prices the whole prompt at the input rate.
+        if ($c['cached_input'] > $c['input']) {
+            throw new \InvalidArgumentException("config: {$at}cost.cached_input must not exceed input");
+        }
         return ['input' => $c['input'], 'cached_input' => $c['cached_input'], 'output' => $c['output']];
     }
 

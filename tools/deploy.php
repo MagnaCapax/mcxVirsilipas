@@ -95,11 +95,20 @@ foreach (array_merge(glob("$release/{src,public,tools}/*.php", GLOB_BRACE) ?: []
     run(['php', '-l', $f]);
 }
 // The new release must accept the config before anything stops: a setting it refuses fails here, with the old release still serving.
-run(['runuser', '-u', $opt['user'], '--', 'php', '-r', 'require $argv[1]; try { MagnaCapax\Virsilipas\Config::load($argv[2]); }'
-    . ' catch (Throwable $e) { fwrite(STDERR, $e->getMessage() . "\n"); exit(1); }', "$release/src/bootstrap.php", $opt['config']]);
+// The config is PHP code, so only the PHP user runs it: root never requires it, and takes the ledger path from the last line that run prints.
+$loaded = explode("\n", run(['runuser', '-u', $opt['user'], '--', 'php', '-r', 'require $argv[1]; try { echo "\n", MagnaCapax\Virsilipas\Config::load($argv[2])->dbPath, "\n"; }'
+    . ' catch (Throwable $e) { fwrite(STDERR, $e->getMessage() . "\n"); exit(1); }', "$release/src/bootstrap.php", $opt['config']]));
 say('the new release accepts the config');
-$cfg = require $opt['config'];
-$db = is_array($cfg) && is_string($cfg['db_path'] ?? null) ? $cfg['db_path'] : fail('config has no db_path');
+$db = trim((string) end($loaded));
+if ($db === '') {
+    fail('config has no db_path');
+}
+// Root reads, replaces and re-owns this path below, and the config that names it is not root's: act only on the PHP user's own regular file.
+$st = @lstat($db);
+$pw = posix_getpwnam($opt['user']);
+if ($st === false || $pw === false || ($st['mode'] & 0170000) !== 0100000 || $st['uid'] !== $pw['uid'] || realpath($db) !== $db) {
+    fail("$db is not a regular file owned by {$opt['user']} at its real path");
+}
 $previous = is_link($opt['current']) ? (string) readlink($opt['current']) : (is_dir($opt['current']) ? $opt['current'] : '');
 if ($previous === '' || realpath($previous) === realpath($release)) {
     fail($previous === '' ? "{$opt['current']} does not exist; install by hand once (README)" : "$tag is already live");

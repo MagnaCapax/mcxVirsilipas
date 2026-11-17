@@ -181,6 +181,7 @@ function testMessagesForwardsOnlyAllowlistedFields(): void
     same('2023-06-01', $up['anthropic_version'], 'the default version when the client sends none');
     foreach ([
         ['messages' => [['role' => 'user', 'content' => [['type' => 'image']]]]],
+        ['messages' => [['role' => 'user', 'content' => [['type' => 'image', 'source' => ['inner_extra' => 1]]]]]],
         ['messages' => [['role' => 'user', 'content' => [['type' => 'tool_result', 'tool_use_id' => 't', 'content' => [['type' => 'image', 'source' => []]]]]]]],
         ['messages' => [['role' => 'user', 'content' => [['type' => 'audio', 'source' => ['type' => 'base64', 'data' => 'AAAA']]]]]],
         ['tools' => [['type' => 'web_search_20250305', 'name' => 'web_search']]],
@@ -220,6 +221,12 @@ function testMessagesBoundsImagesByTheirUpstreamTokenCount(): void
     same(200, $r['status'], $r['body']);
     same(['type', 'source'], lastUpstreamRequest()['block_keys'], 'an image keeps its type and source, unknown fields dropped');
     $fields = Messages::fields($body);
+    $inner = $image;
+    $inner['source'] += ['inner_extra' => ['x' => 1]];
+    $cleaned = Messages::fields(anthBody('anth', false, ['messages' => [['role' => 'user', 'content' => [$inner]]]]));
+    same($image['source'], $cleaned['messages'][0]['content'][0]['source'], 'an image source keeps only type, media_type, data and url');
+    $bareSource = Messages::fields(anthBody('anth', false, ['messages' => [['role' => 'user', 'content' => [['type' => 'image', 'source' => ['url' => 'https://example.com/a.png', 'inner_extra' => 1]]]]]]));
+    same(['url' => 'https://example.com/a.png'], $bareSource['messages'][0]['content'][0]['source'], 'a url source is kept');
     $plain = $fields;
     $plain['messages'] = [['role' => 'user', 'content' => 'x']];
     $bound = Messages::promptBound($fields, 1000);

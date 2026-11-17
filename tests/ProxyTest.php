@@ -23,9 +23,17 @@ function testRewriteForwardsOnlyAllowlistedFields(): void
 function testImagesAreBoundedByTheirUpstreamTokenCount(): void
 {
     $data = 'data:image/png;base64,' . str_repeat('A', 200000);
-    $img = ['type' => 'image_url', 'image_url' => ['url' => $data, 'detail' => 'low'], 'extra' => 1];
+    $img = ['type' => 'image_url', 'image_url' => ['url' => $data, 'detail' => 'low', 'inner_extra' => 1], 'extra' => 1];
+    $sent = ['url' => $data, 'detail' => 'low'];
     $norm = Proxy::normalizeMessages([['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], $img, $img]]]);
-    same([['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => $img['image_url']], ['type' => 'image_url', 'image_url' => $img['image_url']]], $norm[0]['content'], 'image parts kept, unknown part fields dropped');
+    same([['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => $sent], ['type' => 'image_url', 'image_url' => $sent]], $norm[0]['content'], 'image parts kept, unknown part fields and unknown image_url fields dropped');
+    $onlyUnknown = [['role' => 'user', 'content' => [['type' => 'image_url', 'image_url' => ['inner_extra' => 1]]]]];
+    try {
+        Proxy::normalizeMessages($onlyUnknown);
+        throw new \RuntimeException('an image_url object with no known field was accepted');
+    } catch (HttpError $e) {
+        same(400, $e->status, 'an image_url object with no known field is refused');
+    }
     $empty = Proxy::normalizeMessages([['role' => 'user', 'content' => [['type' => 'text', 'text' => 'look'], ['type' => 'image_url', 'image_url' => ['url' => '', 'detail' => 'low']], ['type' => 'image_url', 'image_url' => ['url' => '', 'detail' => 'low']]]]]);
     $base = Proxy::promptBound(['messages' => $empty], [], 1024);
     same($base, Proxy::promptBound(['messages' => $norm], [], 1024), 'the base64 bytes are not counted');

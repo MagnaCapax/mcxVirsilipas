@@ -21,6 +21,8 @@ final class Proxy
         'seed', 'presence_penalty', 'frequency_penalty', 'response_format', 'reasoning_effort'];
     /** Message fields forwarded upstream. */
     private const MESSAGE_FIELDS = ['role', 'content', 'name', 'tool_calls', 'tool_call_id'];
+    /** The fields of an image part's `image_url` object that go upstream. */
+    private const IMAGE_URL_FIELDS = ['url', 'detail'];
     private const MAX_COUNT = Credits::MAX_COUNT;
     private const MAX_BODY_BYTES = 4 * 1024 * 1024;
     private const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -493,8 +495,9 @@ final class Proxy
                     $type = is_array($part) ? ($part['type'] ?? null) : null;
                     if ($type === 'text' && is_string($part['text'] ?? null)) {
                         $parts[] = ['type' => 'text', 'text' => $part['text']];
-                    } elseif ($type === 'image_url' && is_array($part['image_url'] ?? null)) {
-                        $parts[] = ['type' => 'image_url', 'image_url' => $part['image_url']];
+                    } elseif ($type === 'image_url' && is_array($part['image_url'] ?? null)
+                        && ($image = array_intersect_key($part['image_url'], array_flip(self::IMAGE_URL_FIELDS))) !== []) {
+                        $parts[] = ['type' => 'image_url', 'image_url' => $image];
                     } elseif ($type === 'file') {
                         throw new HttpError(400, 'documents are not enabled for this model', code: 'unsupported_content', param: 'messages');
                     } else {

@@ -29,6 +29,8 @@ final class Messages
     ];
     /** The block types a tool result's content may hold. */
     private const RESULT_BLOCKS = ['text', 'image'];
+    /** The fields of an image block's `source` object that go upstream. */
+    private const SOURCE_FIELDS = ['type', 'media_type', 'data', 'url'];
     /** The fields of a client tool definition. Server tools (any other `type`) are refused: they carry fees no token rate covers. */
     private const TOOL_FIELDS = ['type', 'name', 'description', 'input_schema', 'cache_control'];
     /** Prompt tokens an upstream adds on its own when tools are given (its tool-use system prompt), on top of the bytes. */
@@ -399,8 +401,11 @@ final class Messages
                 throw new HttpError(400, 'only text, image, tool use, tool result and thinking content is supported', code: 'unsupported_content', param: $param);
             }
             $b = array_intersect_key($b, array_flip(self::BLOCKS[$type]));
-            if ($type === 'image' && (($b['source'] ?? []) === [] || !self::isObject($b['source']))) {
-                throw new HttpError(400, "an $type block needs a source object", code: 'invalid_messages', param: $param);
+            if ($type === 'image') {
+                $b['source'] = self::isObject($b['source'] ?? null) ? array_intersect_key($b['source'], array_flip(self::SOURCE_FIELDS)) : [];
+                if ($b['source'] === []) {
+                    throw new HttpError(400, "an $type block needs a source object", code: 'invalid_messages', param: $param);
+                }
             }
             if ($type === 'tool_result' && array_key_exists('content', $b) && !is_string($b['content'])) {
                 $b['content'] = self::blocks($b['content'], self::RESULT_BLOCKS, $param);

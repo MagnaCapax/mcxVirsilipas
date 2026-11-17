@@ -2,6 +2,13 @@
 
 Versions are git tags `vX.Y.Z`. A release that changes the database schema says so here; `bin/virsilipas init` (run by `tools/deploy.php`) upgrades the ledger in place.
 
+## v0.22.1 (2026-11-17)
+
+No schema change. A route entry whose `cost` prices cached input above fresh input no longer loads, as a model's rates already did.
+
+- **`tools/deploy.php` runs the config only as the PHP user.** It takes `db_path` from the pre-check that user runs, and acts only on a `db_path` that is a regular file owned by that user, named by its real path (no symlink in it). [ADR 0017](docs/adr/0017-releases-and-safe-deploys.md) amended.
+- **Image parts forward only their known fields.** A chat `image_url` object keeps `url` and `detail`; a Messages image `source` keeps `type`, `media_type`, `data` and `url`. An image with none of them is refused with a 400 instead of being sent upstream.
+
 ## v0.22.0 (2026-11-16)
 
 No schema change. Config: a new optional setting, `messages_params`, on a route entry and on a model; a config without it loads and behaves as v0.21.2.
